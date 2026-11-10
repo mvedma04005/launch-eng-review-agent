@@ -16,7 +16,7 @@ test('verdict follows policy mode; verifier can demote a blocking finding', () =
   assert.equal(decideVerdict(comment, [f({})]).verdict, 'comment');
   assert.equal(decideVerdict(rc, [f({})]).verdict, 'request_changes');
   assert.equal(decideVerdict(approve, []).verdict, 'approve');
-  assert.equal(decideVerdict(approve, [f({ verified: { real: false, confidence: 0.9, reason: 'guarded upstream' } })]).verdict, 'approve', 'verifier-rejected blocker does not block');
+  assert.equal(decideVerdict(rc, [f({ verified: { real: false, confidence: 0.9, reason: 'guarded upstream' } })]).verdict, 'comment', 'verifier-rejected blocker does not block');
   assert.equal(decideVerdict(comment, []).verdict, 'comment', 'comment mode never approves');
   assert.equal(decideVerdict(approve, [], 'medium').verdict, 'comment', 'medium confidence never approves');
   assert.equal(decideVerdict(rc, [f({})], 'medium').verdict, 'comment', 'medium confidence never requests changes');
@@ -46,7 +46,7 @@ test('render places anchored findings inline, others in the body, and always car
 
 test('an override turns a blocking verdict into a comment', () => {
   const approve = parsePolicy('version: 1\nname: a\nverdict: { mode: approve }', 'a');
-  assert.deepEqual(decideVerdict(approve, [f({})], 'high', 'lee'), { verdict: 'comment', blocking: [] });
+  assert.deepEqual(decideVerdict(approve, [f({})], 'high', 'lee'), { verdict: 'comment', blocking: [], overridden: true });
   assert.equal(decideVerdict(approve, [], 'high', 'lee').verdict, 'approve');
 });
 
@@ -58,4 +58,29 @@ test('an overridden review says who overrode it, and only when something was blo
   assert.equal(blocked.event, 'COMMENT');
   assert.equal(blocked.checkConclusion, 'neutral');
   assert.doesNotMatch(renderReview(rc, meta, out([]), anchors, new Map(), 'lee').body, /overridden/);
+});
+
+test('approve mode never approves past a blocking-severity finding the verifier disputes', () => {
+  const approve = parsePolicy('version: 1\nname: a\nverdict: { mode: approve }', 'a');
+  const out = (findings: Finding[]) => ({ summary: 's', findings, reviewedFiles: ['h.py'], questions: [], confidence: 'high' as const, lenses: ['correctness'] });
+  for (const verified of [{ real: false, confidence: 0.3, reason: 'cannot see callers' }, { real: false, confidence: 0, reason: 'verifier returned no structured result' }]) {
+    const critical = f({ severity: 'critical', verified });
+    assert.equal(decideVerdict(approve, [critical]).verdict, 'comment');
+    const r = renderReview(approve, meta, out([critical]), anchors, new Map());
+    assert.equal(r.event, 'COMMENT');
+    assert.equal(r.checkConclusion, 'neutral');
+    assert.match(r.body, /### Falcon review: Comments only — 1 blocking finding disputed by the verifier/);
+  }
+  const clean = renderReview(approve, meta, out([f({ severity: 'low', blocking: false })]), anchors, new Map());
+  assert.equal(clean.event, 'APPROVE');
+  assert.equal(clean.checkConclusion, 'success');
+});
+
+test('an overridden block says so in the headline and marks the render as overridden', () => {
+  const approve = parsePolicy('version: 1\nname: a\nverdict: { mode: approve }', 'a');
+  const r = renderReview(approve, meta, { summary: 's', findings: [f({})], reviewedFiles: ['h.py'], questions: [], confidence: 'high', lenses: ['correctness'] }, anchors, new Map(), 'lee');
+  assert.match(r.body, /^### Falcon review: Blocking findings overridden by @lee/);
+  assert.doesNotMatch(r.body, /no blocking findings/i);
+  assert.equal(r.overridden, true);
+  assert.equal(r.event, 'COMMENT');
 });

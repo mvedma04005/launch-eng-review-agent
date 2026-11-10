@@ -157,6 +157,8 @@ export interface PendingPublication {
   comments: Array<{ path: string; line: number; side: Side; body: string; findingId: string }>;
   checkConclusion: 'success' | 'neutral' | 'action_required';
   blockingCount: number;
+  /** A team member's approval lifted blocking findings. Absent on reviews rendered before this field existed. */
+  overridden?: boolean;
   summary: string;
   attempts: number;
   renderedAt: string;

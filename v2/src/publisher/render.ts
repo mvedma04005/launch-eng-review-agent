@@ -13,22 +13,27 @@ export interface RenderedReview {
   comments: Array<{ path: string; line: number; side: 'LEFT' | 'RIGHT'; body: string; findingId: string }>;
   checkConclusion: 'success' | 'neutral' | 'action_required';
   blocking: Finding[];
+  /** A team member's approval lifted blocking findings. */
+  overridden: boolean;
 }
 
 const sevLabel: Record<Finding['severity'], string> = { critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low', info: 'Info' };
 
-export function decideVerdict(policy: PolicyPack, findings: Finding[], confidence: ReviewOutput['confidence'] = 'high', override: string | null = null): { verdict: Verdict; blocking: Finding[] } {
-  const blocking = findings.filter((f) => f.blocking && (!policy.verdict.verifyBlocking || f.verified?.real !== false));
-  if (override && blocking.length) return { verdict: 'comment', blocking: [] };
+export function decideVerdict(policy: PolicyPack, findings: Finding[], confidence: ReviewOutput['confidence'] = 'high', override: string | null = null): { verdict: Verdict; blocking: Finding[]; overridden: boolean } {
+  const severe = findings.filter((f) => f.blocking || policy.verdict.blockOn.includes(f.severity));
+  const blocking = severe.filter((f) => f.blocking && (!policy.verdict.verifyBlocking || f.verified?.real !== false));
+  if (override && blocking.length) return { verdict: 'comment', blocking: [], overridden: true };
   // A reviewer that is not sure may ask, never decide: medium confidence is comment-only whatever the policy allows.
-  if (confidence === 'medium') return { verdict: 'comment', blocking };
-  if (blocking.length) return { verdict: policy.verdict.mode === 'comment' ? 'comment' : 'request_changes', blocking };
-  return { verdict: policy.verdict.mode === 'approve' ? 'approve' : 'comment', blocking };
+  if (confidence === 'medium') return { verdict: 'comment', blocking, overridden: false };
+  if (blocking.length) return { verdict: policy.verdict.mode === 'comment' ? 'comment' : 'request_changes', blocking, overridden: false };
+  // A blocking-severity finding the verifier disputes is a human's call: it neither blocks nor lets the PR be approved.
+  if (severe.length) return { verdict: 'comment', blocking, overridden: false };
+  return { verdict: policy.verdict.mode === 'approve' ? 'approve' : 'comment', blocking, overridden: false };
 }
 
 export function renderReview(policy: PolicyPack, meta: PullMeta, output: ReviewOutput, anchors: Anchors, priorOpen: Map<string, Finding>, override: string | null = null): RenderedReview {
-  const { verdict, blocking } = decideVerdict(policy, output.findings, output.confidence, override);
-  const overridden = Boolean(override) && decideVerdict(policy, output.findings, output.confidence).blocking.length > 0;
+  const { verdict, blocking, overridden } = decideVerdict(policy, output.findings, output.confidence, override);
+  const disputed = output.findings.filter((f) => f.blocking).length - blocking.length;
   const ordered = [...output.findings].sort((a, b) => Number(b.blocking) - Number(a.blocking) || sevRank(a) - sevRank(b));
   const comments: RenderedReview['comments'] = [];
   const bodyFindings: string[] = [];
@@ -42,8 +47,11 @@ export function renderReview(policy: PolicyPack, meta: PullMeta, output: ReviewO
     else bodyFindings.push(`#### ${f.path}:${f.line}\n${text}`);
   }
   const headline = verdict === 'approve' ? 'Approved'
+    : overridden ? `Blocking findings overridden by @${override}`
     : output.confidence === 'medium' ? `Comments only (medium confidence)${blocking.length ? `, ${blocking.length} finding${blocking.length === 1 ? '' : 's'} need a decision` : ''}`
-    : blocking.length ? `Changes requested — ${blocking.length} blocking finding${blocking.length === 1 ? '' : 's'}` : 'Reviewed — no blocking findings';
+    : blocking.length ? `Changes requested — ${blocking.length} blocking finding${blocking.length === 1 ? '' : 's'}`
+    : disputed > 0 ? `Comments only — ${disputed} blocking finding${disputed === 1 ? '' : 's'} disputed by the verifier; a human decides`
+    : 'Reviewed — no blocking findings';
   const notice = verdict === 'comment' ? ' This comment-only review does not withdraw earlier approvals or change requests.' : '';
   const lines = [
     `### Falcon review: ${headline}`,
@@ -59,7 +67,7 @@ export function renderReview(policy: PolicyPack, meta: PullMeta, output: ReviewO
     marker(meta.repo, meta.number, meta.headSha),
   ];
   const event: RenderedReview['event'] = verdict === 'approve' ? 'APPROVE' : verdict === 'request_changes' ? 'REQUEST_CHANGES' : 'COMMENT';
-  return { event, verdict, body: lines.join('\n'), comments, checkConclusion: blocking.length && output.confidence === 'high' ? 'action_required' : verdict === 'approve' ? 'success' : 'neutral', blocking };
+  return { event, verdict, body: lines.join('\n'), comments, checkConclusion: blocking.length && output.confidence === 'high' ? 'action_required' : verdict === 'approve' ? 'success' : 'neutral', blocking, overridden };
 }
 
 function sevRank(f: Finding): number { return ['critical', 'high', 'medium', 'low', 'info'].indexOf(f.severity); }

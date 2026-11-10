@@ -11,7 +11,8 @@ import type { CheckConclusion, GitHubPort, Publishable } from './publisher/githu
 import { buildRedactor } from './publisher/redact.ts';
 import { Store } from './queue/store.ts';
 import type { Reviewer } from './reviewer/claude.ts';
-import type { PullMeta } from './types.ts';
+import type { PolicyPack } from './policy/schema.ts';
+import type { PullMeta, ReviewOutput } from './types.ts';
 import { processJob, type WorkerContext } from './worker.ts';
 
 const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } }).trim();
@@ -270,4 +271,68 @@ test('a team approval on the current commit lifts the size block; an approval on
   const { github: ghStale } = await run('0'.repeat(40));
   assert.equal(ghStale.checks.at(-1)?.conclusion, 'action_required');
   assert.equal(ghStale.checks.at(-1)?.title, 'Changes needed');
+});
+
+/** A repository whose base branch opts into approvals; the PR changes only svc.py. */
+function approveFixture(policy = 'version: 1\nname: repo\nverdict: { mode: approve }\nteam: { members: [lee] }\n') {
+  const root = mkdtempSync(join(tmpdir(), 'falcon-approve-'));
+  const origin = join(root, 'origin');
+  mkdirSync(origin);
+  git(origin, 'init', '-q', '-b', 'main');
+  writeFileSync(join(origin, 'svc.py'), 'def handler(user):\n    return user\n');
+  mkdirSync(join(origin, '.falcon'));
+  writeFileSync(join(origin, '.falcon', 'policy.yaml'), policy);
+  git(origin, 'add', '.'); git(origin, 'commit', '-q', '-m', 'base');
+  const baseSha = git(origin, 'rev-parse', 'HEAD');
+  git(origin, 'checkout', '-q', '-b', 'feature');
+  writeFileSync(join(origin, 'svc.py'), 'def handler(user):\n    return user.name\n');
+  git(origin, 'commit', '-qam', 'change');
+  const headSha = git(origin, 'rev-parse', 'HEAD');
+  git(origin, 'update-ref', 'refs/pull/3/head', headSha);
+  git(origin, 'checkout', '-q', 'main');
+  return { root, origin, baseSha, headSha };
+}
+
+type Seen = { changedFiles?: string[]; policy?: PolicyPack; instructionDocs?: Array<{ path: string; text: string }> };
+/** A reviewer that returns a fixed output and records what it was shown. */
+function scriptedReviewer(out: Partial<ReviewOutput> & { severities?: Array<'critical' | 'high' | 'medium'> } = {}, seen: Seen = {}): Reviewer {
+  return {
+    async review(opts) {
+      seen.changedFiles = opts.turn.changedFiles; seen.policy = opts.policy; seen.instructionDocs = opts.turn.instructionDocs;
+      const findings = (out.severities ?? []).map((severity, i) => ({ id: `g${i}`.padEnd(12, '0'), severity, blocking: false, path: 'svc.py', line: 2, side: 'RIGHT' as const, title: `Finding ${i}`, scenario: 's', impact: 'i', evidence: 'user.name', fix: 'guard', fingerprint: `gp${i}` }));
+      return {
+        output: { summary: 'sum', confidence: 'high', reviewedFiles: opts.turn.changedFiles, lenses: ['correctness'], questions: [], findings, ...out },
+        usage: { inputTokens: 1, cachedInputTokens: 0, cacheCreationTokens: 0, outputTokens: 1, toolCalls: 1, modelCalls: 1, wallMs: 1, estimatedCostUsd: 0 },
+      };
+    },
+    async verify() { return { real: true, confidence: 0.9, reason: 'confirmed' }; },
+  };
+}
+
+async function runJob(f: { root: string }, github: FakeGitHub, reviewer: Reviewer, dryRun = false) {
+  const store = new Store(':memory:');
+  const ctx: WorkerContext = { config: configFor(f.root), store, auth, anthropic: {} as Anthropic, reviewer, log, dryRun, githubFor: async () => github };
+  const { job } = store.enqueue({ repo: 'acme/demo', number: 3, headSha: github.meta.headSha, baseSha: github.meta.baseSha, baseRef: github.meta.baseRef, trigger: 'manual', receivedAt: 'now' });
+  const outcome = await processJob(ctx, store.claim('t', 60, { perRepo: 1, global: 1 })!, 't');
+  return { outcome, store, job };
+}
+
+test('approve mode: a clean high-confidence review approves with a success check', async () => {
+  const f = approveFixture();
+  const github = new FakeGitHub(meta(f.origin, f.headSha, f.baseSha));
+  const { outcome } = await runJob(f, github, scriptedReviewer());
+  assert.equal(outcome.status, 'published', outcome.reason);
+  assert.equal(github.posted[0]?.event, 'APPROVE');
+  assert.deepEqual(github.checks.map((c) => `${c.status}:${c.conclusion ?? ''}:${c.title ?? ''}`), ['in_progress::', 'completed:success:Approved']);
+});
+
+test('approve mode: a team approval that lifts a verified block is named in the check title', async () => {
+  const f = approveFixture();
+  const github = new FakeGitHub(meta(f.origin, f.headSha, f.baseSha));
+  github.approversByHead.set(f.headSha, ['lee']);
+  await runJob(f, github, scriptedReviewer({ severities: ['high'] }));
+  assert.equal(github.posted[0]?.event, 'COMMENT');
+  assert.match(github.posted[0]!.body, /^### Falcon review: Blocking findings overridden by @lee/);
+  assert.equal(github.checks.at(-1)?.conclusion, 'neutral');
+  assert.match(github.checks.at(-1)?.title ?? '', /overridden/i);
 });
