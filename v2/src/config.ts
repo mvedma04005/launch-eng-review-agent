@@ -84,6 +84,12 @@ export const ConfigSchema = z.object({
     /** Path inside each repository that may refine the pack. */
     repoPath: z.string().default('.falcon/policy.yaml'),
   }).prefault({}),
+  /** The merge gate: a second check on every open PR, passing only when its owners or Falcon approved the current commit. */
+  gate: z.object({
+    enabled: z.boolean().default(false),
+    /** The CODEOWNERS entry Falcon stands in for, e.g. `@ROKT/launch-engineering`. Required when enabled. */
+    teamOwner: z.string().default(''),
+  }).prefault({}),
   notify: z.object({
     webhookUrlEnv: z.string().default('FALCON_NOTIFY_WEBHOOK'),
   }).prefault({}),

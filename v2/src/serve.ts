@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { AlertState, evaluateAlerts, notify } from './alerts.ts';
 import type { Config } from './config.ts';
 import { buildContext } from './context.ts';
+import { sweepGate } from './gate.ts';
 import { registerStoreGauges, startStatusServer } from './http.ts';
 import { CHAT_SCOPES, GoogleChatApi, PUBSUB_SCOPES, PubSubPuller, flushChatOutbox, handleChatMessage, parseChatEvent, pollChatSpaces, resolvePendingChatRequests, serviceAccountTokens } from './ingress/chat.ts';
 import { pollRepository } from './ingress/github.ts';
@@ -41,6 +42,17 @@ export async function serve(config: Config, signal: AbortSignal): Promise<void> 
   every(config.github.pollSeconds * 1000, 'github_poll', async () => {
     for (const repo of config.github.repos) await pollRepository(ctx.auth, store, repo, log, config);
   });
+
+  // Merge gate: re-read the open PRs whose approvals changed and post the second check.
+  if (config.gate.enabled) {
+    if (!config.gate.teamOwner) throw new Error('gate.enabled requires gate.teamOwner, the CODEOWNERS entry Falcon stands in for');
+    every(config.github.pollSeconds * 1000, 'gate_sweep', async () => {
+      for (const repo of config.github.repos) {
+        const github = new OctokitGitHub(await ctx.auth.octokitFor(repo), await ctx.auth.botLogin());
+        await sweepGate({ github, store, log, teamOwner: config.gate.teamOwner, falcon: await ctx.auth.botLogin(), repoPack: config.policy.repoPath, dryRun: config.dryRun }, repo);
+      }
+    });
+  }
 
   // Chat: the fast path. Events arrive through Pub/Sub within about a second of being posted.
   if (config.chat.enabled) {

@@ -6,6 +6,8 @@ export type CiState = 'none' | 'pending' | 'success' | 'failure';
 export type CheckConclusion = RenderedReview['checkConclusion'];
 export type Publishable = Pick<RenderedReview, 'event' | 'body' | 'comments'>;
 export const CHECK_NAME = 'Falcon review';
+/** The second check: passes only when the PR's owners or Falcon approved the current commit. */
+export const GATE_NAME = 'Merge gate';
 
 /** Minimal GitHub surface the engine needs; a fake implements this in tests. */
 export interface GitHubPort {
@@ -48,7 +50,8 @@ export class OctokitGitHub implements GitHubPort {
       this.octokit.repos.getCombinedStatusForRef({ ...r, ref: sha }),
       this.octokit.paginate(this.octokit.checks.listForRef, { ...r, ref: sha, filter: 'latest', per_page: 100 }),
     ]);
-    const runs = checks.filter((c) => c.name !== CHECK_NAME);
+    // The merge gate waits on approvals, not on CI: counting it would defer every unapproved PR forever.
+    const runs = checks.filter((c) => c.name !== CHECK_NAME && c.name !== GATE_NAME);
     const statuses = combined.data.statuses;
     if (!runs.length && !statuses.length) return 'none';
     if (runs.some((c) => c.status !== 'completed') || (combined.data.state === 'pending' && statuses.length)) return 'pending';
@@ -121,6 +124,26 @@ export class OctokitGitHub implements GitHubPort {
       if (status(error) === 403) return null;
       throw error;
     }
+  }
+
+  /** Open PRs updated at or after `since`, newest first. */
+  async openPulls(repo: string, since: string) {
+    const rows = await this.octokit.paginate(this.octokit.pulls.list, { ...split(repo), state: 'open', sort: 'updated', direction: 'desc', per_page: 100 }, (response, done) => {
+      if (response.data.some((p) => p.updated_at < since)) done();
+      return response.data;
+    });
+    return rows.filter((p) => p.updated_at >= since).map((p) => ({ number: p.number, headSha: p.head.sha, baseRef: p.base.ref, defaultBranch: p.base.repo.default_branch, updatedAt: p.updated_at }));
+  }
+
+  /** Every path the PR changes, old names of renamed files included. GitHub lists at most 3000 files. */
+  async changedPaths(repo: string, number: number): Promise<string[]> {
+    const files = await this.octokit.paginate(this.octokit.pulls.listFiles, { ...split(repo), pull_number: number, per_page: 100 });
+    return files.flatMap((f) => (f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]));
+  }
+
+  /** Posts the merge gate on a commit. A new run each time: GitHub reads the latest run of a name, so a withdrawn pass needs no edit of the old run. */
+  async postGate(repo: string, headSha: string, passed: boolean, title: string, summary: string): Promise<void> {
+    await this.octokit.checks.create({ ...split(repo), name: GATE_NAME, head_sha: headSha, output: { title, summary }, ...(passed ? { status: 'completed' as const, conclusion: 'success' as const } : { status: 'in_progress' as const, started_at: new Date().toISOString() }) });
   }
 
   async fileAtRef(repo: string, ref: string, path: string): Promise<string | null> {

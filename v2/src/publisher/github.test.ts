@@ -17,3 +17,12 @@ test('approvers: only the latest verdict on exactly the head counts', async () =
   const octokit = { paginate: async () => rows, pulls: { listReviews: {} } } as unknown as Octokit;
   assert.deepEqual(await new OctokitGitHub(octokit, null).approvers('acme/demo', 3, HEAD), ['chatty', 'good']);
 });
+
+test('ci: the merge gate check is never counted as CI', async () => {
+  const octokit = {
+    repos: { getCombinedStatusForRef: async () => ({ data: { state: 'pending', statuses: [] } }) },
+    checks: { listForRef: {} },
+    paginate: async () => [{ name: 'Merge gate', status: 'in_progress', conclusion: null }, { name: 'build', status: 'completed', conclusion: 'success' }],
+  } as unknown as Octokit;
+  assert.equal(await new OctokitGitHub(octokit, null).ci('acme/demo', HEAD), 'success');
+});
