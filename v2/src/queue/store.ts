@@ -1,8 +1,8 @@
 import { DatabaseSync } from 'node:sqlite';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { Finding, FindingOutcome, Job, JobStatus, Lesson, PendingPublication, ReviewRequest, ReviewStep, Usage } from '../types.ts';
+import type { ChatRequest, Finding, FindingOutcome, Job, JobStatus, Lesson, PendingPublication, ReviewRequest, ReviewStep, Usage } from '../types.ts';
 
 const SCHEMA = `
 pragma journal_mode = WAL;
@@ -38,12 +38,31 @@ create table if not exists lessons(
   confidence real not null, uses integer not null default 0, created_at text not null, last_used_at text, retired_at text);
 create index if not exists lessons_repo on lessons(repo, retired_at);
 create table if not exists cursors(key text primary key, value text not null);
+create table if not exists chat_requests(
+  id text primary key, message_name text not null unique, space text not null, thread text not null, sender text not null,
+  sender_email text, repo text not null, number integer not null, command text not null, status text not null,
+  job_id text references jobs(id), attempts integer not null default 0, next_attempt_at real not null default 0,
+  created_at text not null, updated_at text not null, note text);
+create index if not exists chat_requests_pending on chat_requests(status, next_attempt_at);
+create index if not exists chat_requests_job on chat_requests(job_id);
+create table if not exists chat_outbox(
+  id text primary key, space text not null, thread text not null, text text not null, status text not null default 'pending',
+  attempts integer not null default 0, next_at real not null default 0, created_at text not null, sent_at text, response_name text);
+create index if not exists chat_outbox_pending on chat_outbox(status, next_at);
 create table if not exists steps(
   job_id text not null references jobs(id), seq integer not null, at text not null, tool text not null,
   input text not null, duration_ms integer not null, outcome text not null, primary key(job_id, seq));
 `;
 
 const now = () => new Date().toISOString();
+/** Deterministic id from a key (UUID v5 over a fixed namespace), so idempotent inserts need no lookups. */
+export function uuid5(key: string): string {
+  const hash = createHash('sha1').update('falcon-outbox:' + key).digest();
+  hash[6] = (hash[6]! & 0x0f) | 0x50; hash[8] = (hash[8]! & 0x3f) | 0x80;
+  const h = hash.subarray(0, 16).toString('hex');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+}
+type SQLInput = string | number | bigint | null | Uint8Array;
 
 export interface ClaimLimits { perRepo: number; global: number }
 
@@ -159,6 +178,63 @@ export class Store {
   lastProgressAt(): string | null {
     const row = this.db.prepare(`select max(updated_at) as at from jobs where status in ('published','skipped','held')`).get() as { at: string | null };
     return row.at;
+  }
+
+  // ---- Chat intake ----
+
+  /** Records a request exactly once per Chat message. Returns null when the message was already recorded. */
+  addChatRequest(r: Omit<ChatRequest, 'id' | 'status' | 'jobId' | 'attempts' | 'nextAttemptAt' | 'createdAt' | 'updatedAt' | 'note'>): ChatRequest | null {
+    const existing = this.db.prepare('select id from chat_requests where message_name=?').get(r.messageName);
+    if (existing) return null;
+    const req: ChatRequest = { ...r, id: randomUUID(), status: 'pending', jobId: null, attempts: 0, nextAttemptAt: 0, createdAt: now(), updatedAt: now(), note: null };
+    this.db.prepare(`insert into chat_requests(id,message_name,space,thread,sender,sender_email,repo,number,command,status,attempts,next_attempt_at,created_at,updated_at)
+      values(?,?,?,?,?,?,?,?,?,?,0,0,?,?)`).run(req.id, req.messageName, req.space, req.thread, req.sender, req.senderEmail, req.repo, req.number, req.command, req.status, req.createdAt, req.updatedAt);
+    return req;
+  }
+
+  pendingChatRequests(nowSec = Date.now() / 1000, limit = 20): ChatRequest[] {
+    return (this.db.prepare(`select * from chat_requests where status='pending' and next_attempt_at<=? order by created_at limit ?`).all(nowSec, limit) as unknown as ChatRequestRow[]).map(toChatRequest);
+  }
+
+  setChatRequest(id: string, patch: Partial<Pick<ChatRequest, 'status' | 'jobId' | 'note' | 'attempts' | 'nextAttemptAt'>>): void {
+    const cols: string[] = []; const vals: unknown[] = [];
+    if (patch.status !== undefined) { cols.push('status=?'); vals.push(patch.status); }
+    if (patch.jobId !== undefined) { cols.push('job_id=?'); vals.push(patch.jobId); }
+    if (patch.note !== undefined) { cols.push('note=?'); vals.push(patch.note); }
+    if (patch.attempts !== undefined) { cols.push('attempts=?'); vals.push(patch.attempts); }
+    if (patch.nextAttemptAt !== undefined) { cols.push('next_attempt_at=?'); vals.push(patch.nextAttemptAt); }
+    cols.push('updated_at=?'); vals.push(now());
+    this.db.prepare(`update chat_requests set ${cols.join(',')} where id=?`).run(...(vals as SQLInput[]), id);
+  }
+
+  chatRequestsForJob(jobId: string): ChatRequest[] {
+    return (this.db.prepare(`select * from chat_requests where job_id=? and status='queued' order by created_at`).all(jobId) as unknown as ChatRequestRow[]).map(toChatRequest);
+  }
+
+  /** Manual Chat rounds already spent on a PR, across threads and heads. */
+  chatRoundsForPr(repo: string, number: number): number {
+    return (this.db.prepare(`select count(distinct coalesce(job_id, id)) as n from chat_requests where repo=? and number=? and status in ('queued','delivered')`).get(repo, number) as { n: number }).n;
+  }
+
+  /** Idempotent by key: the same reply for the same reason is queued once, however often intake sees the event. */
+  queueChatReply(key: string, space: string, thread: string, text: string): string {
+    const id = uuid5(key);
+    this.db.prepare('insert or ignore into chat_outbox(id, space, thread, text, created_at) values(?,?,?,?,?)').run(id, space, thread, text, now());
+    return id;
+  }
+
+  pendingChatReplies(nowSec = Date.now() / 1000, limit = 5): Array<{ id: string; space: string; thread: string; text: string; attempts: number }> {
+    return this.db.prepare(`select id, space, thread, text, attempts from chat_outbox where status='pending' and next_at<=? order by created_at limit ?`).all(nowSec, limit) as unknown as Array<{ id: string; space: string; thread: string; text: string; attempts: number }>;
+  }
+
+  markChatReply(id: string, outcome: 'sent' | 'retry' | 'failed', responseName?: string, nowSec = Date.now() / 1000): void {
+    if (outcome === 'sent') this.db.prepare(`update chat_outbox set status='sent', sent_at=?, response_name=? where id=?`).run(now(), responseName ?? null, id);
+    else if (outcome === 'failed') this.db.prepare(`update chat_outbox set status='failed', attempts=attempts+1 where id=?`).run(id);
+    else {
+      const row = this.db.prepare('select attempts from chat_outbox where id=?').get(id) as { attempts: number } | undefined;
+      const attempts = (row?.attempts ?? 0) + 1;
+      this.db.prepare(`update chat_outbox set attempts=?, next_at=? where id=?`).run(attempts, nowSec + Math.min(300, 5 * 2 ** Math.min(attempts, 6)), id);
+    }
   }
 
   job(id: string): Job | null {
@@ -294,6 +370,16 @@ export interface QueueSnapshot {
   leased: Array<{ id: string; repo: string; number: number; head: string; owner: string; leaseExpiresInSec: number; attempts: number; since: string }>;
   oldestQueuedAgeSec: number;
   spendTodayUsd: number;
+}
+
+interface ChatRequestRow {
+  id: string; message_name: string; space: string; thread: string; sender: string; sender_email: string | null; repo: string; number: number;
+  command: string; status: string; job_id: string | null; attempts: number; next_attempt_at: number; created_at: string; updated_at: string; note: string | null;
+}
+function toChatRequest(r: ChatRequestRow): ChatRequest {
+  return { id: r.id, messageName: r.message_name, space: r.space, thread: r.thread, sender: r.sender, senderEmail: r.sender_email, repo: r.repo, number: r.number,
+    command: r.command as ChatRequest['command'], status: r.status as ChatRequest['status'], jobId: r.job_id, attempts: r.attempts, nextAttemptAt: r.next_attempt_at,
+    createdAt: r.created_at, updatedAt: r.updated_at, note: r.note };
 }
 
 interface Row {

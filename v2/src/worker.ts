@@ -3,7 +3,7 @@ import { execFile } from 'node:child_process';
 import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import type { Config } from './config.ts';
+import { isAllowedRepo, type Config } from './config.ts';
 import { Mirror } from './evidence/git.ts';
 import type { GitHubAuth } from './ingress/github.ts';
 import type { Logger } from './log.ts';
@@ -28,6 +28,8 @@ export interface WorkerContext {
   log: Logger;
   /** Dry run: everything except posting to GitHub. */
   dryRun: boolean;
+  /** Receives every terminal outcome (published, held, skipped, dry run) so requesters can be told. */
+  notify?: (job: Job, outcome: JobOutcome & { event?: string; summary?: string; confidence?: string }) => void;
   /** Test seams. */
   githubFor?: (repo: string) => Promise<GitHubPort>;
   redactor?: Redactor;
@@ -100,6 +102,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
   let checkId: number | null = null;
   let checksEnabled = false;
   try {
+    if (!isAllowedRepo(ctx.config, job.repo)) return done('skipped', `${job.repo} is not in the repository allowlist (${ctx.config.github.repos.join(', ')}).`);
     const meta = await github.pull(job.repo, job.number);
     if (meta.state !== 'open' || meta.merged) return done('skipped', 'PR is closed or merged.');
     if (meta.draft) return done('skipped', 'PR is a draft; it will be reviewed when marked ready.');
@@ -111,7 +114,12 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
 
     // A finished review that failed to publish is replayed without another model run.
     const pending = ctx.store.pending(job);
-    if (pending) { checksEnabled = true; return await publish(pending, meta); }
+    if (pending) {
+      checksEnabled = true;
+      const outcome = await publish(pending, meta);
+      if (outcome.status === 'published') ctx.notify?.(job, { ...outcome, event: pending.event, summary: pending.summary });
+      return outcome;
+    }
 
     const ci = await github.ci(job.repo, job.headSha);
     if (ci === 'pending') return defer(90, 'CI still running', 'ci_pending');
@@ -178,9 +186,11 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     ctx.store.savePending(job.id, toPublish);
     if (ctx.dryRun) {
       ctx.store.finish(job.id, 'skipped', { error: 'dry run: review rendered, nothing posted' });
+      ctx.notify?.(job, { status: 'dry_run', summary: toPublish.summary });
       return { status: 'dry_run', rendered, output: finalOutput, usage };
     }
     const outcome = await publish(toPublish, meta);
+    if (outcome.status === 'published') ctx.notify?.(job, { ...outcome, event: toPublish.event, summary: toPublish.summary, confidence: finalOutput.confidence });
     return { ...outcome, rendered, output: finalOutput, usage };
   } catch (error) {
     if (error instanceof Incomplete) return done('held', error.message, true);
@@ -190,6 +200,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     log.error({ err: error }, 'job failed');
     ctx.store.finish(job.id, 'failed', { error: `${(error as Error).name}: ${(error as Error).message}` });
     await notice('neutral', 'Review failed', `${(error as Error).name}: ${redactor.apply((error as Error).message)}`);
+    ctx.notify?.(job, { status: 'held', reason: `the review failed (${(error as Error).name}). The operator has the details.` });
     return { status: 'held', reason: (error as Error).message };
   } finally {
     clearInterval(beat);
@@ -239,6 +250,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     }
     log.info({ status, reason }, 'job finished');
     if (tellAuthor) void notice('neutral', status === 'held' ? 'Review held' : 'Review not performed', reason);
+    if (tellAuthor || status === 'held') ctx.notify?.(job, { status, reason });
     return { status, reason };
   }
 

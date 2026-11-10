@@ -67,7 +67,7 @@ const meta = (origin: string, headSha: string, baseSha: string, over: Partial<Pu
   repo: 'acme/demo', number: 3, title: 'Use name', body: 'desc', author: 'ann', authorType: 'User', draft: false, state: 'open', merged: false, headSha, baseSha,
   baseRef: 'main', headRef: 'feature', changedFiles: 3, additions: 2, deletions: 2, labels: [], htmlUrl: 'https://example.test/pr/3', cloneUrl: origin, ...over,
 });
-const configFor = (root: string) => ConfigSchema.parse({ stateDir: join(root, 'state'), policy: { defaultPack: new URL('../policies/default.yaml', import.meta.url).pathname } });
+const configFor = (root: string) => ConfigSchema.parse({ stateDir: join(root, 'state'), github: { repos: ['acme/demo'] }, policy: { defaultPack: new URL('../policies/default.yaml', import.meta.url).pathname } });
 
 function fakeReviewer(findings: Array<{ path: string; line: number; evidence: string; severity: 'critical' | 'high' | 'medium'; ruleId?: string }>, calls: { n: number }): Reviewer {
   return {
@@ -157,4 +157,12 @@ test('worker holds on failed CI, defers on pending CI, and skips drafts without 
     assert.equal(outcome.status, expected, `ci=${ci} draft=${draft}`);
     if (expected === 'deferred') assert.equal(s.job(job.id)?.status, 'queued');
   }
+  // A job for any other repository is refused before GitHub is even asked.
+  const s = new Store(':memory:');
+  const { job } = s.enqueue({ repo: 'ROKT/op3', number: 1, headSha: headSha, baseSha, baseRef: 'main', trigger: 'poll', receivedAt: 'now' });
+  const github = new FakeGitHub(meta(origin, headSha, baseSha));
+  const outcome = await processJob({ config, store: s, auth, anthropic: {} as Anthropic, reviewer, log, dryRun: false, githubFor: async () => github }, s.claim('t', 60, { perRepo: 1, global: 1 })!, 't');
+  assert.equal(outcome.status, 'skipped');
+  assert.match(outcome.reason!, /not in the repository allowlist/);
+  assert.equal(s.job(job.id)?.status, 'skipped');
 });

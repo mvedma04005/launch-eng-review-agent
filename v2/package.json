@@ -20,6 +20,7 @@
     "@octokit/app": "^16.1.4",
     "@octokit/plugin-throttling": "^11.0.5",
     "@octokit/rest": "^22.0.0",
+    "google-auth-library": "^10.9.1",
     "pino": "^9.6.0",
     "yaml": "^2.7.0",
     "zod": "^3.24.0"

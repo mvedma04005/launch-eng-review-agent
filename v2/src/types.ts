@@ -161,3 +161,25 @@ export interface PendingPublication {
   attempts: number;
   renderedAt: string;
 }
+
+export type ChatRequestStatus = 'pending' | 'queued' | 'refused' | 'delivered';
+
+/** One human request from Chat: a PR link (or re-review command) in a thread we must answer in. */
+export interface ChatRequest {
+  id: string;
+  messageName: string;
+  space: string;
+  thread: string;
+  sender: string;
+  senderEmail: string | null;
+  repo: string;
+  number: number;
+  command: 'review' | 're-review';
+  status: ChatRequestStatus;
+  jobId: string | null;
+  attempts: number;
+  nextAttemptAt: number;
+  createdAt: string;
+  updatedAt: string;
+  note: string | null;
+}

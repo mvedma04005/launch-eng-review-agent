@@ -14,10 +14,26 @@ export const ConfigSchema = z.object({
     webhookSecretEnv: z.string().default('FALCON_GITHUB_WEBHOOK_SECRET'),
     /** Token mode (dry runs, local development). */
     tokenEnv: z.string().default('GITHUB_TOKEN'),
-    /** Repositories to watch when polling; empty means every installed repository. */
-    repos: z.array(z.string().regex(/^[\w.-]+\/[\w.-]+$/)).default([]),
+    /** THE repository allowlist. Every intake path, the queue and the worker refuse anything else. */
+    repos: z.array(z.string().regex(/^[\w.-]+\/[\w.-]+$/)).min(1).default(['ROKT/launch-engineering']),
     pollSeconds: z.number().int().min(10).default(30),
     webhookPort: z.number().int().min(0).default(0),
+  }).prefault({}),
+  /** Google Chat as the request channel: a Chat app identity, events over Pub/Sub, replies through a durable outbox. */
+  chat: z.object({
+    enabled: z.boolean().default(false),
+    /** Closed allowlist of spaces a request may come from and where replies go. */
+    spaces: z.array(z.string().regex(/^spaces\/[A-Za-z0-9_-]+$/)).default([]),
+    /** Env var holding the service-account JSON for the Chat app (chat.bot scope; plus chat.app.messages.readonly for polling). */
+    serviceAccountEnv: z.string().default('FALCON_GOOGLE_SERVICE_ACCOUNT_JSON'),
+    pubsub: z.object({
+      project: z.string().default(''),
+      subscription: z.string().default(''),
+    }).prefault({}),
+    /** App-authenticated poll of the spaces for bare links without a mention; 0 disables. */
+    pollSeconds: z.number().int().min(0).default(5),
+    /** Manual review rounds per PR from Chat, counted across threads. */
+    maxRoundsPerPr: z.number().int().min(1).default(3),
   }).prefault({}),
   model: z.object({
     reviewer: z.string().default('claude-opus-5-5'),
@@ -73,6 +89,12 @@ export const ConfigSchema = z.object({
   }).prefault({}),
 });
 export type Config = z.infer<typeof ConfigSchema>;
+
+/** The one place the repository scope is decided. Case-insensitive on purpose: GitHub is. */
+export function isAllowedRepo(config: Pick<Config, 'github'>, repo: string): boolean {
+  const wanted = repo.toLowerCase();
+  return config.github.repos.some((r) => r.toLowerCase() === wanted);
+}
 
 export function loadConfig(path = process.env['FALCON_CONFIG'] ?? 'falcon.yaml'): Config {
   const raw = existsSync(path) ? YAML.parse(readFileSync(path, 'utf8')) ?? {} : {};

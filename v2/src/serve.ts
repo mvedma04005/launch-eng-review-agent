@@ -1,79 +1,109 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { spawn } from 'node:child_process';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AlertState, evaluateAlerts, notify } from './alerts.ts';
 import type { Config } from './config.ts';
+import { buildContext } from './context.ts';
 import { registerStoreGauges, startStatusServer } from './http.ts';
-import { githubAuthFromEnv, pollRepository } from './ingress/github.ts';
+import { CHAT_SCOPES, GoogleChatApi, PUBSUB_SCOPES, PubSubPuller, flushChatOutbox, handleChatMessage, parseChatEvent, pollChatSpaces, resolvePendingChatRequests, serviceAccountTokens } from './ingress/chat.ts';
+import { pollRepository } from './ingress/github.ts';
 import { log } from './log.ts';
 import { metrics } from './metrics.ts';
+import { OctokitGitHub } from './publisher/github.ts';
 import { Store } from './queue/store.ts';
-import { claudeReviewer } from './reviewer/claude.ts';
-import { processJob, type WorkerContext } from './worker.ts';
+import { processJob } from './worker.ts';
 
 const CLI = fileURLToPath(new URL('./cli.ts', import.meta.url));
 
 /**
- * The daemon: one process, N concurrent reviews, polling ingress, a status and metrics server, alerting.
- * Crash-only by design: all state is in SQLite, leases expire, and the next start simply resumes. With
- * `workers.isolation: process`, each review runs in its own child process under a hard kill timer, so a
- * runaway review cannot take the daemon or its siblings down. Suitable for launchd on a Mac.
+ * The daemon: Chat intake (Pub/Sub pull plus app-authenticated poll), GitHub polling, N concurrent reviews each
+ * in its own child process, a Chat reply outbox, alerts, and a status server. Crash-only: all state is in SQLite,
+ * leases expire, and the next start resumes. Suitable for launchd on a Mac.
  */
 export async function serve(config: Config, signal: AbortSignal): Promise<void> {
   const store = new Store(join(config.stateDir, 'falcon.sqlite3'));
-  const auth = githubAuthFromEnv(config);
-  const ctx: WorkerContext = { config, store, auth, anthropic: new Anthropic(), reviewer: claudeReviewer, log, dryRun: config.dryRun };
+  const ctx = buildContext(config, store);
   const owner = `${hostname()}:${process.pid}`;
   registerStoreGauges(store);
   const http = config.http.port > 0 ? startStatusServer(config, store, log) : null;
-  log.info({ owner, mode: auth.mode, isolation: config.workers.isolation, dryRun: config.dryRun, concurrency: config.workers.concurrency, repos: config.github.repos, http: config.http.port || 'off' }, 'falcon serving');
+  log.info({ owner, mode: ctx.auth.mode, isolation: config.workers.isolation, dryRun: config.dryRun, chat: config.chat.enabled, repos: config.github.repos, concurrency: config.workers.concurrency, http: config.http.port || 'off' }, 'falcon serving');
 
-  const poller = (async () => {
+  const loops: Array<Promise<void>> = [];
+  const every = (ms: number, name: string, fn: () => Promise<unknown>) => loops.push((async () => {
     while (!signal.aborted) {
-      for (const repo of config.github.repos) {
-        try { await pollRepository(auth, store, repo, log); }
-        catch (error) { metrics.errors.inc({ component: 'poller' }); log.warn({ err: error, repo }, 'poll failed'); }
-      }
-      await sleep(config.github.pollSeconds * 1000, signal);
+      try { await fn(); } catch (error) { metrics.errors.inc({ component: name }); log.warn({ err: error }, `${name} failed`); }
+      await sleep(ms, signal);
     }
-  })();
+  })());
 
-  const workers = Array.from({ length: config.workers.concurrency }, async (_, i) => {
+  // GitHub: automatic intake of open PRs in the allowlisted repositories.
+  every(config.github.pollSeconds * 1000, 'github_poll', async () => {
+    for (const repo of config.github.repos) await pollRepository(ctx.auth, store, repo, log, config);
+  });
+
+  // Chat: the fast path. Events arrive through Pub/Sub within about a second of being posted.
+  if (config.chat.enabled) {
+    const json = process.env[config.chat.serviceAccountEnv];
+    if (!json) throw new Error(`chat.enabled requires ${config.chat.serviceAccountEnv} in the environment`);
+    const chat = new GoogleChatApi(serviceAccountTokens(json, CHAT_SCOPES));
+    const intake = { config, store, log };
+    if (config.chat.pubsub.project && config.chat.pubsub.subscription) {
+      const puller = new PubSubPuller(serviceAccountTokens(json, PUBSUB_SCOPES), config.chat.pubsub.project, config.chat.pubsub.subscription);
+      loops.push((async () => {
+        while (!signal.aborted) {
+          try {
+            const received = await puller.pull(10);
+            for (const { event } of received) {
+              const msg = parseChatEvent(event);
+              if (msg) { const r = handleChatMessage(intake, msg); metrics.feedback.inc({ repo: 'chat', signal: `event_${r}` }); }
+            }
+            await puller.ack(received.map((r) => r.ackId));
+            if (!received.length) await sleep(300, signal);
+          } catch (error) { metrics.errors.inc({ component: 'chat_pubsub' }); log.warn({ err: error }, 'pubsub pull failed'); await sleep(5000, signal); }
+        }
+      })());
+    } else {
+      log.warn('chat.pubsub is not configured; relying on polling alone, so pickup is bounded by chat.pollSeconds');
+    }
+    if (config.chat.pollSeconds > 0) every(config.chat.pollSeconds * 1000, 'chat_poll', () => pollChatSpaces(intake, chat));
+    every(1000, 'chat_resolve', () => resolvePendingChatRequests(intake, async (repo, number) => new OctokitGitHub(await ctx.auth.octokitFor(repo), await ctx.auth.botLogin()).pull(repo, number)));
+    every(1000, 'chat_outbox', () => flushChatOutbox(store, chat, log));
+  }
+
+  // Workers.
+  for (let i = 0; i < config.workers.concurrency; i++) {
     const me = `${owner}#${i}`;
-    while (!signal.aborted) {
-      const job = store.claim(me, config.workers.leaseSeconds, { perRepo: config.workers.perRepoConcurrency, global: config.workers.concurrency });
-      if (!job) { await sleep(2000, signal); continue; }
-      try {
-        if (config.workers.isolation === 'process') await runInChild(config, store, job.id, me, signal);
-        else await processJob(ctx, job, me);
-      } catch (error) {
-        metrics.errors.inc({ component: 'worker_loop' });
-        log.error({ err: error, job: job.id }, 'worker loop error');
-        store.finish(job.id, 'failed', { error: String(error) });
+    loops.push((async () => {
+      while (!signal.aborted) {
+        const job = store.claim(me, config.workers.leaseSeconds, { perRepo: config.workers.perRepoConcurrency, global: config.workers.concurrency });
+        if (!job) { await sleep(1000, signal); continue; }
+        try {
+          if (config.workers.isolation === 'process') await runInChild(config, store, job.id, me, signal);
+          else await processJob(ctx, job, me);
+        } catch (error) {
+          metrics.errors.inc({ component: 'worker_loop' });
+          log.error({ err: error, job: job.id }, 'worker loop error');
+          store.finish(job.id, 'failed', { error: String(error) });
+        }
       }
+    })());
+  }
+
+  // Alerts: edge-triggered, to a Chat or Slack webhook when configured.
+  const alertState = new AlertState();
+  const webhook = process.env[config.notify.webhookUrlEnv];
+  every(60_000, 'alerts', async () => {
+    const hourAgo = new Date(Date.now() - 3_600_000).toISOString();
+    const last = store.lastProgressAt();
+    const active = evaluateAlerts(config, { snapshot: store.snapshot(), lastProgressAt: last ? new Date(last) : null, failedLastHour: store.failedSince(hourAgo) });
+    for (const text of alertState.transition(active)) {
+      log.warn({ alert: text }, 'alert');
+      if (!(await notify(webhook, text))) log.info('no alert webhook configured; alert logged only');
     }
   });
 
-  const alerts = (async () => {
-    const state = new AlertState();
-    const webhook = process.env[config.notify.webhookUrlEnv];
-    while (!signal.aborted) {
-      try {
-        const hourAgo = new Date(Date.now() - 3_600_000).toISOString();
-        const last = store.lastProgressAt();
-        const active = evaluateAlerts(config, { snapshot: store.snapshot(), lastProgressAt: last ? new Date(last) : null, failedLastHour: store.failedSince(hourAgo) });
-        for (const text of state.transition(active)) {
-          log.warn({ alert: text }, 'alert');
-          if (!(await notify(webhook, text))) log.info('no alert webhook configured; alert logged only');
-        }
-      } catch (error) { log.warn({ err: error }, 'alert evaluation failed'); }
-      await sleep(60_000, signal);
-    }
-  })();
-
-  await Promise.all([poller, alerts, ...workers]);
+  await Promise.all(loops);
   http?.close();
   store.close();
 }
@@ -91,7 +121,6 @@ async function runInChild(config: Config, store: Store, jobId: string, owner: st
   signal.removeEventListener('abort', onAbort);
   const job = store.job(jobId);
   if (job?.status === 'leased' && job.leaseOwner === owner) {
-    // The child did not reach a terminal state: crash, kill, or deadline. Requeue promptly rather than waiting for the lease to lapse.
     const reason = killed ? `worker process exceeded ${deadlineMs / 1000}s and was killed` : `worker process exited with code ${code}`;
     metrics.errors.inc({ component: 'worker_process' });
     if (job.attempts >= 3) store.finish(jobId, 'failed', { error: reason });

@@ -18,7 +18,7 @@ const throttle = {
   },
 };
 const ThrottledOctokit = Octokit.plugin(throttling).defaults({ throttle });
-import type { Config } from '../config.ts';
+import { isAllowedRepo, type Config } from '../config.ts';
 import type { Store } from '../queue/store.ts';
 import type { ReviewRequest } from '../types.ts';
 import type { Logger } from '../log.ts';
@@ -87,7 +87,8 @@ export function parsePullUrl(url: string): { repo: string; number: number } {
  * Polling ingress: works behind NAT with no inbound URL, which is the fleet-Mac default. Webhooks are an
  * optional accelerator; both feed the same queue, so running both is harmless.
  */
-export async function pollRepository(auth: GitHubAuth, store: Store, repo: string, log: Logger): Promise<number> {
+export async function pollRepository(auth: GitHubAuth, store: Store, repo: string, log: Logger, config?: Pick<Config, 'github'>): Promise<number> {
+  if (config && !isAllowedRepo(config, repo)) { log.warn({ repo }, 'refusing to poll a repository outside the allowlist'); return 0; }
   const octokit = await auth.octokitFor(repo);
   const [owner, name] = repo.split('/') as [string, string];
   const cursorKey = `poll:${repo}`;

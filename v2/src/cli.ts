@@ -1,13 +1,12 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { parseArgs } from 'node:util';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { loadConfig } from './config.ts';
+import { buildContext } from './context.ts';
 import { githubAuthFromEnv, parsePullUrl } from './ingress/github.ts';
 import { log } from './log.ts';
 import { OctokitGitHub } from './publisher/github.ts';
 import { Store } from './queue/store.ts';
-import { claudeReviewer } from './reviewer/claude.ts';
 import { serve } from './serve.ts';
 import { findingsSummary, processJob } from './worker.ts';
 
@@ -39,7 +38,7 @@ async function main(argv: string[]): Promise<number> {
     const meta = await github.pull(repo, number);
     const { job } = store.enqueue({ repo, number, headSha: meta.headSha, baseSha: meta.baseSha, baseRef: meta.baseRef, trigger: 'manual', receivedAt: new Date().toISOString() });
     const leased = store.claim('cli', 3600, { perRepo: 1, global: 1 }) ?? job;
-    const outcome = await processJob({ config: { ...config, stateDir }, store, auth, anthropic: new Anthropic(), reviewer: claudeReviewer, log, dryRun: !values.post }, leased, 'cli');
+    const outcome = await processJob(buildContext({ ...config, stateDir, chat: { ...config.chat, enabled: false } }, store, { auth, dryRun: !values.post }), leased, 'cli');
     if (outcome.rendered) {
       out(`\n${outcome.rendered.body}\n\n--- inline comments (${outcome.rendered.comments.length}) ---`);
       for (const c of outcome.rendered.comments) out(`\n${c.path}:${c.line} (${c.side})\n${c.body}`);
@@ -55,7 +54,7 @@ async function main(argv: string[]): Promise<number> {
     const store = openStore();
     const job = store.job(arg);
     if (!job || job.status !== 'leased' || job.leaseOwner !== values.owner) { process.stderr.write('run-job: job is not leased to this owner\n'); store.close(); return 1; }
-    const outcome = await processJob({ config, store, auth: githubAuthFromEnv(config), anthropic: new Anthropic(), reviewer: claudeReviewer, log, dryRun: config.dryRun }, job, values.owner);
+    const outcome = await processJob(buildContext(config, store), job, values.owner);
     store.close();
     return outcome.status === 'held' ? 2 : 0;
   }
