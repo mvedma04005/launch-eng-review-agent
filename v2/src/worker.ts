@@ -93,9 +93,14 @@ export function sanitize(rendered: RenderedReview, redactor: Redactor): Rendered
 export async function processJob(ctx: WorkerContext, job: Job, owner: string): Promise<JobOutcome> {
   const log = ctx.log.child({ job: job.id, repo: job.repo, number: job.number, head: job.headSha.slice(0, 12) });
   const startedAt = Date.now();
+  // Where the wall time of one review goes. Logged once per job as 'job phases'.
+  const phases: Record<string, number> = {};
+  let phaseMark = startedAt;
+  const phase = (name: string) => { const now = Date.now(); phases[name] = (phases[name] ?? 0) + now - phaseMark; phaseMark = now; };
   const redactor = ctx.redactor ?? redactorFromEnv();
   if (job.attempts <= 1) metrics.queueWaitSeconds.observe(Math.max(0, (startedAt - Date.parse(job.createdAt)) / 1000), { repo: job.repo });
   const github = ctx.githubFor ? await ctx.githubFor(job.repo) : new OctokitGitHub(await ctx.auth.octokitFor(job.repo), await ctx.auth.botLogin());
+  phase('auth');
   const beat = setInterval(() => ctx.store.heartbeat(job.id, owner, ctx.config.workers.leaseSeconds), 60_000);
   let worktreeDir: string | null = null;
   let mirror: Mirror | null = null;
@@ -128,12 +133,16 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     const capReason = dailyCapReason(ctx.store, ctx.config, job.repo);
     if (capReason) return defer(secondsUntilNextUtcDay(), capReason, 'daily_cap');
 
+    phase('github');
     mirror = new Mirror(ctx.config.stateDir, job.repo, meta.cloneUrl, () => ctx.auth.gitTokenFor(job.repo));
     await mirror.fetchPull(job.number, job.headSha, meta.baseRef, meta.baseSha);
+    phase('fetch');
     const mergeBase = await mirror.mergeBase(meta.baseSha, job.headSha);
     const anchors = await mirror.diff(mergeBase, job.headSha);
+    phase('diff');
     worktreeDir = join(ctx.config.stateDir, 'worktrees', job.id);
     const worktree = await mirror.worktree(job.headSha, worktreeDir);
+    phase('checkout');
 
     // Policy and instruction files come from the base branch, never from the PR: a change cannot govern its own review.
     const trustedRead = (path: string) => mirrorShow(mirror!, meta.baseSha, path);
@@ -160,6 +169,8 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     const prior = ctx.store.priorFingerprints(job.repo, job.number, job.headSha);
     const lessons = policy.feedback.learn ? ctx.store.lessons(job.repo, inScopeFiles, policy.feedback.maxLessons) : [];
 
+    phase('context');
+    log.info('model started');
     if (checksEnabled && !ctx.dryRun) checkId = await github.startCheckRun(job.repo, job.headSha, `Reviewing ${inScopeFiles.length} file(s), ${changedLines} changed lines, against policy ${policy.name}.`);
 
     const { output, usage } = await ctx.reviewer.review({
@@ -169,6 +180,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
       turn: { changedFiles: inScopeFiles, excludedFiles: excluded, instructionDocs, requiredDocs, priorOpen: [...prior.values()].map((f) => ({ path: f.path, line: f.line, title: f.title })) },
     });
     recordUsage(ctx, job, usage);
+    phase('model');
 
     const { kept, dropped } = applyPolicy(policy, output.findings);
     for (const d of dropped) log.info({ finding: d.finding.id, reason: d.reason }, 'finding dropped by policy');
@@ -179,11 +191,13 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
         if (f.verified && !f.verified.real) log.info({ finding: f.id, reason: f.verified.reason }, 'verifier rejected blocking finding');
       }
     }
+    phase('verify');
     const finalOutput: ReviewOutput = { ...output, findings: kept };
     const rendered = sanitize(renderReview(policy, meta, finalOutput, anchors, prior), redactor);
     const toPublish = toPending(rendered, job.headSha, boundBytes(redactor.apply(finalOutput.summary), LIMITS.summary));
     ctx.store.recordFindings(job, kept);
     ctx.store.savePending(job.id, toPublish);
+    phase('render');
     if (ctx.dryRun) {
       ctx.store.finish(job.id, 'skipped', { error: 'dry run: review rendered, nothing posted' });
       ctx.notify?.(job, { status: 'dry_run', summary: toPublish.summary });
@@ -204,7 +218,10 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     return { status: 'held', reason: (error as Error).message };
   } finally {
     clearInterval(beat);
+    phase('other');
     if (mirror && worktreeDir) await mirror.removeWorktree(worktreeDir);
+    phase('cleanup');
+    log.info({ phases, totalMs: Date.now() - startedAt, attempts: job.attempts }, 'job phases');
   }
 
   /** Publishes a finished review. Failures keep the review and retry; after the cap, the job parks for `falcon replay`. */
