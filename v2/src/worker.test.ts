@@ -377,3 +377,36 @@ test('policy and instruction files come from the default branch when the PR targ
   assert.equal(failed.store.job(failed.job.id)?.status, 'failed');
   assert.equal(unknown.posted.length, 0);
 });
+
+test('approve mode: a review that does not cover every in-scope file only comments', async () => {
+  const f = approveFixture();
+  const github = new FakeGitHub(meta(f.origin, f.headSha, f.baseSha));
+  const { outcome } = await runJob(f, github, scriptedReviewer({ reviewedFiles: [] }));
+  assert.equal(outcome.output?.confidence, 'medium');
+  assert.equal(github.posted[0]?.event, 'COMMENT');
+});
+
+test('deleted files count toward the size limit and are shown to the reviewer', async () => {
+  const f = approveFixture('version: 1\nname: repo\nverdict: { mode: approve }\nbudgets: { maxChangedLines: 50 }\n');
+  writeFileSync(join(f.origin, 'old.py'), Array.from({ length: 100 }, (_, i) => `y${i} = ${i}`).join('\n') + '\n');
+  git(f.origin, 'add', '.'); git(f.origin, 'commit', '-qm', 'old');
+  const baseSha = git(f.origin, 'rev-parse', 'HEAD');
+  git(f.origin, 'checkout', '-q', '-b', 'del');
+  git(f.origin, 'rm', '-q', 'old.py'); git(f.origin, 'commit', '-qm', 'delete 100 lines');
+  const headSha = git(f.origin, 'rev-parse', 'HEAD');
+  git(f.origin, 'checkout', '-q', 'main');
+  git(f.origin, 'update-ref', 'refs/pull/3/head', headSha);
+  const refused = await runJob(f, new FakeGitHub(meta(f.origin, headSha, baseSha)), scriptedReviewer());
+  assert.equal(refused.outcome.status, 'skipped');
+  assert.match(refused.outcome.reason ?? '', /100 changed lines exceeds the policy budget of 50/);
+
+  git(f.origin, 'checkout', '-q', 'main');
+  writeFileSync(join(f.origin, '.falcon', 'policy.yaml'), 'version: 1\nname: repo\nverdict: { mode: approve }\nbudgets: { maxChangedLines: 500 }\n');
+  git(f.origin, 'commit', '-qam', 'raise limit');
+  const raised = git(f.origin, 'rev-parse', 'HEAD');
+  const seen: Seen = {};
+  const github = new FakeGitHub(meta(f.origin, headSha, raised));
+  await runJob(f, github, scriptedReviewer({}, seen));
+  assert.deepEqual(seen.changedFiles, ['old.py']);
+  assert.equal(github.posted[0]?.event, 'APPROVE', 'a deletion the reviewer covered can be approved');
+});

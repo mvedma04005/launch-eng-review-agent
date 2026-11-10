@@ -159,7 +159,8 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
       if (missing.length) return done('skipped', `This PR needs a short write-up before review. Add these sections to the description: ${missing.map((h) => `## ${h}`).join(', ')}. Say what problem this solves and how the change solves it, in a few sentences each.`, 'block');
     }
     const budget = effectiveBudget(ctx.config, policy);
-    const changed = anchors.files.filter((f) => f.status !== 'removed').map((f) => f.path);
+    // Deleted files are part of the change: their lines count toward the size limit and the reviewer sees them.
+    const changed = anchors.files.map((f) => f.path);
     const excluded = changed.filter((p) => !inScope(policy, p));
     const inScopeFiles = changed.filter((p) => inScope(policy, p));
     if (!inScopeFiles.length) return done('skipped', 'No in-scope files changed.');
@@ -201,7 +202,10 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
       }
     }
     phase('verify');
-    const finalOutput: ReviewOutput = { ...output, findings: kept };
+    // A review that does not account for every in-scope file is incomplete: medium confidence, comment-only.
+    const unreviewed = inScopeFiles.filter((p) => !output.reviewedFiles.includes(p));
+    if (unreviewed.length) log.info({ unreviewed }, 'review did not cover every in-scope file');
+    const finalOutput: ReviewOutput = { ...output, findings: kept, confidence: unreviewed.length ? 'medium' : output.confidence };
     const rendered = sanitize(renderReview(policy, meta, finalOutput, anchors, prior, override), redactor);
     const toPublish = toPending(rendered, job.headSha, boundBytes(redactor.apply(finalOutput.summary), LIMITS.summary));
     ctx.store.recordFindings(job, kept);

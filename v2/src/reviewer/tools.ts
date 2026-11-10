@@ -115,7 +115,8 @@ export function buildTools(
         record('submit_review', `${input.findings.length} findings, ${errors.length} rejected`, started, 'error');
         return `REJECTED (${errors.length} problem(s)). Fix these and call submit_review again:\n- ${errors.join('\n- ')}`;
       }
-      state.accepted = { submission: input, findings };
+      // Accepted with problems still open is an incomplete review: it may comment, never approve or block.
+      state.accepted = { submission: errors.length ? { ...input, confidence: 'medium' } : input, findings };
       record('submit_review', `${findings.length} verified, ${errors.length} dropped, confidence ${input.confidence}`, started, 'ok');
       return errors.length
         ? `ACCEPTED with ${findings.length} verified finding(s); ${errors.length} unverifiable finding(s) were dropped. You are done; end your turn.`
