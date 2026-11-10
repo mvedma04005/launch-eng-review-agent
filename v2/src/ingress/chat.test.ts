@@ -12,7 +12,7 @@ const msg = (over: Partial<ChatMessage> = {}): ChatMessage => ({
   name: `${SPACE}/messages/m1`, space: SPACE, thread: `${SPACE}/threads/t1`, sender: { name: 'users/117476753422602532202', type: 'HUMAN', email: 'mani.vedma@rokt.com' },
   text: 'https://github.com/ROKT/launch-engineering/pull/585', createTime: '2026-11-10T00:43:11Z', ...over,
 });
-const meta = (over: Partial<PullMeta> = {}): PullMeta => ({ repo: 'ROKT/launch-engineering', number: 585, title: 't', body: '', author: 'ann', authorType: 'User', draft: false, state: 'open', merged: false, headSha: 'a'.repeat(40), baseSha: 'b'.repeat(40), baseRef: 'main', headRef: 'f', changedFiles: 1, additions: 1, deletions: 1, labels: [], htmlUrl: 'u', cloneUrl: 'c', ...over });
+const meta = (over: Partial<PullMeta> = {}): PullMeta => ({ repo: 'ROKT/launch-engineering', number: 585, title: 't', body: '', author: 'ann', authorType: 'User', draft: false, state: 'open', merged: false, headSha: 'a'.repeat(40), baseSha: 'b'.repeat(40), baseRef: 'main', defaultBranch: 'main', headRef: 'f', changedFiles: 1, additions: 1, deletions: 1, labels: [], htmlUrl: 'u', cloneUrl: 'c', ...over });
 
 test('the repository allowlist is exact and case-insensitive', () => {
   assert.ok(isAllowedRepo(config, 'ROKT/launch-engineering'));

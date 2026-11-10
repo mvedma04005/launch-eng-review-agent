@@ -5,7 +5,7 @@ import { parseUnifiedDiff } from '../evidence/diff.ts';
 import { decideVerdict, renderReview } from './render.ts';
 import type { Finding, PullMeta } from '../types.ts';
 
-const meta: PullMeta = { repo: 'acme/demo', number: 7, title: 'T', body: '', author: 'ann', authorType: 'User', draft: false, state: 'open', merged: false, headSha: 'f'.repeat(40), baseSha: 'e'.repeat(40), baseRef: 'main', headRef: 'feat', changedFiles: 1, additions: 1, deletions: 1, labels: [], htmlUrl: 'https://github.com/acme/demo/pull/7', cloneUrl: 'https://github.com/acme/demo.git' };
+const meta: PullMeta = { repo: 'acme/demo', number: 7, title: 'T', body: '', author: 'ann', authorType: 'User', draft: false, state: 'open', merged: false, headSha: 'f'.repeat(40), baseSha: 'e'.repeat(40), baseRef: 'main', defaultBranch: 'main', headRef: 'feat', changedFiles: 1, additions: 1, deletions: 1, labels: [], htmlUrl: 'https://github.com/acme/demo/pull/7', cloneUrl: 'https://github.com/acme/demo.git' };
 const anchors = parseUnifiedDiff('diff --git a/h.py b/h.py\n--- a/h.py\n+++ b/h.py\n@@ -1,2 +1,2 @@\n-a\n+b\n c\n');
 const f = (over: Partial<Finding>): Finding => ({ id: 'abcdef123456', severity: 'high', blocking: true, path: 'h.py', line: 1, side: 'RIGHT', title: 'Bug', scenario: 's', impact: 'i', evidence: 'b', fix: 'x', fingerprint: 'fp', ...over });
 

@@ -33,6 +33,8 @@ export interface PullMeta {
   headSha: string;
   baseSha: string;
   baseRef: string;
+  /** The repository's default branch: the only source of policy and instruction files. */
+  defaultBranch: string;
   headRef: string;
   changedFiles: number;
   additions: number;

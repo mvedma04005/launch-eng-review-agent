@@ -37,7 +37,7 @@ export class OctokitGitHub implements GitHubPort {
     return {
       repo, number, title: data.title, body: data.body ?? '', author: data.user?.login ?? 'unknown', authorType: data.user?.type ?? 'User',
       draft: Boolean(data.draft), state: data.state as 'open' | 'closed', merged: Boolean(data.merged_at), headSha: data.head.sha, baseSha: data.base.sha,
-      baseRef: data.base.ref, headRef: data.head.ref, changedFiles: data.changed_files, additions: data.additions, deletions: data.deletions,
+      baseRef: data.base.ref, defaultBranch: data.base.repo.default_branch, headRef: data.head.ref, changedFiles: data.changed_files, additions: data.additions, deletions: data.deletions,
       labels: data.labels.map((l) => l.name), htmlUrl: data.html_url, cloneUrl: data.base.repo.clone_url,
     };
   }

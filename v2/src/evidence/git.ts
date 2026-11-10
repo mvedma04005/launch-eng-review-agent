@@ -71,6 +71,13 @@ export class Mirror {
     }
   }
 
+  /** Fetch the tip of a branch into a per-PR ref and return its SHA. */
+  async fetchBranchTip(number: number, branch: string): Promise<string> {
+    if (!/^[\w./-]+$/.test(branch)) throw new Error('Unsupported branch name.');
+    await git(['fetch', '--quiet', '--no-tags', 'origin', `+refs/heads/${branch}:refs/falcon/pull/${number}/default`], this.path, await this.authEnv());
+    return checkSha((await git(['rev-parse', `refs/falcon/pull/${number}/default^{commit}`], this.path)).trim());
+  }
+
   async mergeBase(a: string, b: string): Promise<string> {
     return checkSha((await git(['merge-base', checkSha(a), checkSha(b)], this.path)).trim());
   }

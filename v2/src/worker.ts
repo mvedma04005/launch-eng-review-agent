@@ -145,8 +145,10 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     const worktree = await mirror.worktree(job.headSha, worktreeDir);
     phase('checkout');
 
-    // Policy and instruction files come from the base branch, never from the PR: a change cannot govern its own review.
-    const trustedRead = (path: string) => mirrorShow(mirror!, meta.baseSha, path);
+    // Policy and instruction files come from the default branch, never from the PR or from a base branch its author
+    // may control: a change cannot govern its own review. A PR onto the default branch reads its base as before.
+    const trustedSha = meta.baseRef === meta.defaultBranch ? meta.baseSha : await mirror.fetchBranchTip(job.number, meta.defaultBranch);
+    const trustedRead = (path: string) => mirrorShow(mirror!, trustedSha, path);
     const baseRead = (path: string) => mirrorShow(mirror!, mergeBase, path);
     const policy = await loadPolicyFor(ctx, job.repo, trustedRead);
     checksEnabled = policy.verdict.checkRun;
@@ -169,10 +171,10 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     const requiredDocs: Array<{ path: string; text: string }> = [];
     for (const p of policy.context.required) {
       const text = await trustedRead(p);
-      if (text === null) return done('held', `Required context file ${p} is missing on the base branch.`, true);
+      if (text === null) return done('held', `Required context file ${p} is missing on the default branch.`, true);
       requiredDocs.push({ path: p, text });
     }
-    if (policyChangedInPr) instructionDocs.unshift({ path: '(note)', text: `This PR changes ${ctx.config.policy.repoPath}. The review was governed by the base branch's version; treat the PR's version as a change under review.` });
+    if (policyChangedInPr) instructionDocs.unshift({ path: '(note)', text: `This PR changes ${ctx.config.policy.repoPath}. The review was governed by the default branch's version; treat the PR's version as a change under review.` });
     const prior = ctx.store.priorFingerprints(job.repo, job.number, job.headSha);
     const lessons = policy.feedback.learn ? ctx.store.lessons(job.repo, inScopeFiles, policy.feedback.maxLessons) : [];
 
@@ -314,7 +316,7 @@ async function loadPolicyFor(ctx: WorkerContext, repo: string, trustedRead: (pat
   try {
     return mergePolicies(base, parsePolicy(text, `${repo}:${ctx.config.policy.repoPath}`));
   } catch (error) {
-    throw new Incomplete(`Repository policy on the base branch is invalid: ${(error as Error).message}`);
+    throw new Incomplete(`Repository policy on the default branch is invalid: ${(error as Error).message}`);
   }
 }
 
