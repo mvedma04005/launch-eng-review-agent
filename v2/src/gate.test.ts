@@ -10,7 +10,7 @@ const PACK = 'version: 1\nname: repo\nteam: { members: [lee] }\n';
 const T0 = Date.parse('2026-11-10T12:00:00Z');
 const MINUTE = 60_000;
 
-interface Pull { number: number; headSha: string; baseRef: string; updatedAt: string; author: string; files: string[] | null; approvers: string[] }
+interface Pull { number: number; headSha: string; baseRef: string; updatedAt: string; author: string; files: string[] | null; approvers: string[]; open?: boolean }
 const pull = (number: number, over: Partial<Pull> = {}): Pull => ({ number, headSha: `sha${number}`, baseRef: 'main', updatedAt: `2026-11-10T10:00:0${number}Z`, author: 'sam', files: ['Orbit/a.py'], approvers: [], ...over });
 
 function fixture(pulls: Pull[], over: Partial<GateDeps> = {}, files: Record<string, string> = { '.github/CODEOWNERS': CODEOWNERS, '.falcon/policy.yaml': PACK }) {
@@ -20,7 +20,7 @@ function fixture(pulls: Pull[], over: Partial<GateDeps> = {}, files: Record<stri
   const find = (number: number) => pulls.find((x) => x.number === number)!;
   const github: GatePort = {
     openPulls: async () => pulls.map((p) => ({ ...p, defaultBranch: 'main' })),
-    pullState: async (_repo, number) => ({ ...find(number), open: true }),
+    pullState: async (_repo, number) => ({ ...find(number), open: find(number).open ?? true }),
     changedPaths: async (_repo, number) => {
       const p = find(number);
       if (p.files?.[0] === 'boom') throw new Error('GitHub is down');
@@ -100,16 +100,48 @@ test('an unknown Falcon login, the author, and a cut-short file list never give 
   assert.deepEqual(huge.posts[0], { sha: 'sha1', passed: false, title: 'Waiting: too many files to check' });
 });
 
-test('a PR that moves while it is being read is judged on the next pass, not on mixed state', async () => {
+test('a push while the PR is being read: the new commit is judged, never the old commit with the new files', async () => {
   // Commit sha1 changes a merlin file too. The author pushes a commit without it while the pass is reading files.
   const p = pull(1, { files: ['Orbit/a.py', 'merlin/a.js'], approvers: [FALCON] });
   const f = fixture([p]);
-  f.hooks.onFiles = (x) => { x.files = ['Orbit/a.py']; x.headSha = 'sha1b'; x.updatedAt = '2026-11-10T10:09:00Z'; };
-  assert.equal(await sweepGate(f.deps, REPO, T0), 0, 'the files of the new commit are not judged against the old commit');
-  delete f.hooks.onFiles;
-  p.approvers = [];
+  let pushed = false;
+  f.hooks.onFiles = (x) => { if (!pushed) { pushed = true; x.files = ['Orbit/a.py']; x.headSha = 'sha1b'; x.approvers = []; x.updatedAt = '2026-11-10T10:09:00Z'; } };
   assert.equal(await sweepGate(f.deps, REPO, T0), 1);
   assert.deepEqual(f.posts, [{ sha: 'sha1b', passed: false, title: 'Waiting for an owner or Falcon to approve' }]);
+});
+
+test('a comment while the PR is being read costs one more read, not a wrong or missing verdict', async () => {
+  const p = pull(1, { approvers: ['lee'] });
+  const f = fixture([p]);
+  let touched = false;
+  f.hooks.onFiles = (x) => { if (!touched) { touched = true; x.updatedAt = '2026-11-10T10:09:00Z'; } }; // Only the update time moves.
+  assert.equal(await sweepGate(f.deps, REPO, T0), 1);
+  assert.deepEqual(f.posts, [{ sha: 'sha1', passed: true, title: 'Approved by an owner or Falcon' }]);
+});
+
+test('a PR that keeps moving loses its pass until it holds still', async () => {
+  const p = pull(1, { approvers: ['lee'] });
+  const f = fixture([p]);
+  await sweepGate(f.deps, REPO, T0);
+  assert.equal(f.posts.at(-1)!.passed, true);
+  let tick = 10;
+  f.hooks.onFiles = (x) => { x.updatedAt = `2026-11-10T10:09:${tick++}Z`; }; // Touched on every read.
+  assert.equal(await sweepGate(f.deps, REPO, T0), 1);
+  assert.deepEqual(f.posts.at(-1), { sha: 'sha1', passed: false, title: 'Waiting: the PR changed while it was being checked' });
+  assert.equal(await sweepGate(f.deps, REPO, T0), 0, 'still moving on the same commit: the wait stands, nothing new is posted');
+  delete f.hooks.onFiles;
+  assert.equal(await sweepGate(f.deps, REPO, T0), 1);
+  assert.deepEqual(f.posts.at(-1), { sha: 'sha1', passed: true, title: 'Approved by an owner or Falcon' });
+});
+
+test('a PR closed or retargeted while it is being read gets no check', async () => {
+  const closed = fixture([pull(1, { approvers: ['lee'] })]);
+  closed.hooks.onFiles = (x) => { x.open = false; };
+  assert.equal(await sweepGate(closed.deps, REPO, T0), 0);
+  const moved = fixture([pull(1, { approvers: ['lee'] })]);
+  moved.hooks.onFiles = (x) => { x.baseRef = 'stack/base'; };
+  assert.equal(await sweepGate(moved.deps, REPO, T0), 0);
+  assert.deepEqual([...closed.posts, ...moved.posts], []);
 });
 
 test('a pass does not outlive a change to the rules on the default branch', async () => {

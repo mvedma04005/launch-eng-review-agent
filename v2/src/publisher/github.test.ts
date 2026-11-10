@@ -39,6 +39,9 @@ test('postGate: a pass is a completed success; anything else stays in progress, 
 test('changedPaths: renamed files count under both names, and a list at the cap is refused', async () => {
   const some = { paginate: async () => [{ filename: 'new.py', previous_filename: 'old.py' }, { filename: 'a.py' }], pulls: { listFiles: {} } } as unknown as Octokit;
   assert.deepEqual(await new OctokitGitHub(some, null).changedPaths('acme/demo', 3), ['new.py', 'old.py', 'a.py']);
+  // 1600 renamed files are 3200 names but 1600 files: under the cap.
+  const renames = { paginate: async () => Array.from({ length: 1600 }, (_, i) => ({ filename: `n${i}`, previous_filename: `o${i}` })), pulls: { listFiles: {} } } as unknown as Octokit;
+  assert.equal((await new OctokitGitHub(renames, null).changedPaths('acme/demo', 3))?.length, 3200);
   const capped = { paginate: async () => Array.from({ length: 3000 }, (_, i) => ({ filename: `f${i}` })), pulls: { listFiles: {} } } as unknown as Octokit;
   assert.equal(await new OctokitGitHub(capped, null).changedPaths('acme/demo', 3), null);
 });

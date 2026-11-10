@@ -33,13 +33,32 @@ export interface GateDeps {
   dryRun: boolean;
 }
 
-function describe({ verdict, uncovered }: GateVerdict, approvers: string[], tooMany: boolean): { title: string; summary: string } {
+function describe({ verdict, uncovered }: GateVerdict, approvers: string[], tooMany: boolean, moved: boolean): { title: string; summary: string } {
   const who = approvers.length ? `Approved on this commit by ${approvers.join(', ')}.` : 'Nobody has approved this commit yet.';
   const list = uncovered.slice(0, 10).map((f) => `\`${f}\``).join(', ') + (uncovered.length > 10 ? ` and ${uncovered.length - 10} more` : '');
   if (verdict === 'pass') return { title: 'Approved by an owner or Falcon', summary: `${who} Every changed file has an approval from one of its owners.` };
+  if (moved) return { title: 'Waiting: the PR changed while it was being checked', summary: 'The PR was pushed to or edited during the check. It is checked again on the next pass.' };
   if (tooMany) return { title: 'Waiting: too many files to check', summary: 'This PR changes more files than GitHub lists, so the list of files may be incomplete. Split the PR.' };
   if (verdict === 'unknown') return { title: 'Waiting: cannot confirm the approver is an owner', summary: `${who} These files have an owner team whose members Falcon cannot read: ${list}.` };
   return { title: 'Waiting for an owner or Falcon to approve', summary: `${who} No owner approval covers: ${list || 'this change'}.` };
+}
+
+/**
+ * Reads one PR, its files and its approvals, then the PR again. GitHub lists the files of "the PR now", so they
+ * belong to the commit only if nothing about the PR moved in between. Tries twice; `steady` says whether it held.
+ */
+async function readPull(github: GatePort, repo: string, number: number, author: string) {
+  for (let attempt = 0; ; attempt++) {
+    const before = await github.pullState(repo, number);
+    const files = await github.changedPaths(repo, number);
+    // GitHub refuses a self-approval; this does not rely on it.
+    const approvers = (await github.approvers(repo, number, before.headSha)).filter((a) => a.toLowerCase() !== author.toLowerCase()).sort();
+    const after = await github.pullState(repo, number);
+    // shortcut: two pushes inside one second of the update time go unseen; read the files with the compare API,
+    // pinned to the commit, if that window ever matters.
+    const steady = after.headSha === before.headSha && after.baseRef === before.baseRef && after.updatedAt === before.updatedAt;
+    if (steady || attempt === 1) return { ...after, files, approvers, steady };
+  }
 }
 
 /**
@@ -67,7 +86,7 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   }
 
   // A pass must not outlive the rule that gave it: a change to CODEOWNERS, the pack or the team entry re-judges every PR.
-  const rules = createHash('sha256').update([codeowners, pack ?? '', deps.teamOwner].join('\0')).digest('hex');
+  const rules = createHash('sha256').update([codeowners, pack ?? '', deps.teamOwner, deps.falcon ?? ''].join('\0')).digest('hex');
   const fullKey = `gate:${repo}:full`;
   const [lastRules, lastAt] = (store.cursor(fullKey) ?? ':0').split(':');
   const full = lastRules !== rules || now - Number(lastAt) >= FULL_RECHECK_MS;
@@ -81,23 +100,18 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   let newest = since;
   for (const p of pulls) {
     try {
-      const files = await github.changedPaths(repo, p.number);
-      // GitHub refuses a self-approval; this does not rely on it.
-      const approvers = (await github.approvers(repo, p.number, p.headSha)).filter((a) => a.toLowerCase() !== p.author.toLowerCase()).sort();
-      // The file list is the PR's files now, not this commit's. If anything about the PR moved since it was listed,
-      // the files may belong to another commit: skip it, and the next pass lists it again.
-      // shortcut: two pushes inside the second of the listed update time go unseen; read the files with the
-      // compare API, pinned to the commit, if that window ever matters.
-      const fresh = await github.pullState(repo, p.number);
-      if (!fresh.open || fresh.headSha !== p.headSha || fresh.baseRef !== p.baseRef || fresh.updatedAt !== p.updatedAt) continue;
-      const result: GateVerdict = files === null ? { verdict: 'wait', uncovered: [] } : gateVerdict({ files, codeowners, teamOwner: deps.teamOwner, team, approvers, falcon: deps.falcon });
-      const state = `${p.headSha}:${result.verdict}:${approvers.join(',')}:${result.uncovered.length}`;
+      const read = await readPull(github, repo, p.number, p.author);
+      if (!read.open || read.baseRef !== branch) continue; // Closed or retargeted since it was listed.
+      // A PR that will not hold still gets a wait, never a skip: an old pass must not survive because the PR keeps moving.
+      const result: GateVerdict = !read.steady || read.files === null ? { verdict: 'wait', uncovered: [] } : gateVerdict({ files: read.files, codeowners, teamOwner: deps.teamOwner, team, approvers: read.approvers, falcon: deps.falcon });
+      // `moved` never equals a judged state, so the next pass posts the real verdict.
+      const state = read.steady ? `${read.headSha}:${result.verdict}:${read.approvers.join(',')}:${result.uncovered.length}` : `${read.headSha}:moved`;
       const key = `gate:${repo}#${p.number}`;
       if (store.cursor(key) !== state) {
-        const { title, summary } = describe(result, approvers, files === null);
-        log.info({ repo, number: p.number, head: p.headSha, verdict: result.verdict, approvers, dryRun: deps.dryRun }, 'merge gate decided');
+        const { title, summary } = describe(result, read.approvers, read.files === null, !read.steady);
+        log.info({ repo, number: p.number, head: read.headSha, verdict: result.verdict, steady: read.steady, approvers: read.approvers, dryRun: deps.dryRun }, 'merge gate decided');
         if (!deps.dryRun) {
-          await github.postGate(repo, p.headSha, result.verdict === 'pass', title, summary);
+          await github.postGate(repo, read.headSha, result.verdict === 'pass', title, summary);
           store.setCursor(key, state);
           posted++;
         }
