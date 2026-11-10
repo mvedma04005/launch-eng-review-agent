@@ -268,8 +268,9 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
   }
 
   function done(status: 'skipped' | 'held', reason: string, tellAuthor = false): JobOutcome {
+    // Recorded in dry run too: an unrecorded skip left the job leased, so it was retried and then marked failed.
+    ctx.store.finish(job.id, status, { error: reason });
     if (!ctx.dryRun || status === 'held') {
-      ctx.store.finish(job.id, status, { error: reason });
       metrics.jobsFinished.inc({ repo: job.repo, outcome: status });
     }
     log.info({ status, reason }, 'job finished');
