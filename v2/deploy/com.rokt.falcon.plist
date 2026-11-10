@@ -14,7 +14,10 @@
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>15</integer>
   <key>ExitTimeOut</key><integer>120</integer>
-  <key>ProcessType</key><string>Background</string>
+  <!-- Standard, not Background: macOS throttles disk writes for Background jobs and their children, and every
+       review checks out the repository. Measured on the fleet Mac: 4 checkouts take 2 s at Standard and had
+       written 2% of their files after 41 s at Background. -->
+  <key>ProcessType</key><string>Standard</string>
   <key>StandardOutPath</key><string>__FALCON_STATE__/logs/falcon.out.log</string>
   <key>StandardErrorPath</key><string>__FALCON_STATE__/logs/falcon.err.log</string>
 </dict>
