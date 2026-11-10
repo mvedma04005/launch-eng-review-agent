@@ -391,6 +391,22 @@ test('policy and instruction files come from the default branch when the PR targ
   assert.equal(unknown.posted.length, 0);
 });
 
+test('approve mode: a PR that edits CODEOWNERS only comments', async () => {
+  const f = approveFixture();
+  git(f.origin, 'checkout', '-q', 'feature');
+  mkdirSync(join(f.origin, '.github'));
+  writeFileSync(join(f.origin, '.github', 'CODEOWNERS'), '* @eve\n');
+  git(f.origin, 'add', '.'); git(f.origin, 'commit', '-qm', 'own everything');
+  const headSha = git(f.origin, 'rev-parse', 'HEAD');
+  git(f.origin, 'update-ref', 'refs/pull/3/head', headSha);
+  git(f.origin, 'checkout', '-q', 'main');
+  const github = new FakeGitHub(meta(f.origin, headSha, f.baseSha));
+  const { outcome } = await runJob(f, github, scriptedReviewer());
+  assert.equal(outcome.status, 'published', outcome.reason);
+  assert.equal(github.posted[0]?.event, 'COMMENT');
+  assert.match(github.posted[0]?.body ?? '', /changes \.github\/CODEOWNERS, so Falcon only comments/);
+});
+
 test('approve mode: a review that does not cover every in-scope file only comments', async () => {
   const f = approveFixture();
   const github = new FakeGitHub(meta(f.origin, f.headSha, f.baseSha));

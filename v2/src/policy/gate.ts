@@ -3,6 +3,8 @@ import { minimatch } from './glob.ts';
 /** Files that decide who may merge. Falcon's own approval never covers a change to them. */
 const GATE_FILES = ['.falcon/**', '.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS'];
 
+export const isGateFile = (path: string): boolean => GATE_FILES.some((g) => minimatch(path, g));
+
 export interface GateInput {
   /** Every path the PR changes, old names of renamed files included. */
   files: string[];
@@ -57,7 +59,7 @@ export function gateVerdict(input: GateInput): GateVerdict {
   const unknown: string[] = [];
   for (const path of input.files) {
     const owners = ownersOf(path, input.codeowners);
-    const gateFile = GATE_FILES.some((g) => minimatch(path, g));
+    const gateFile = isGateFile(path);
     if (owners.includes(teamOwner) && (people.some((p) => team.has(p)) || (falconApproved && !gateFile))) continue;
     if (owners.some((o) => !o.includes('/') && people.includes(o.replace(/^@/, '')))) continue;
     // Falcon's App cannot read team membership, so a person's approval on another team's file stays unknown.

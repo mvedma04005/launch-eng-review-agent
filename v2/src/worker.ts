@@ -8,6 +8,7 @@ import { Mirror } from './evidence/git.ts';
 import type { GitHubAuth } from './ingress/github.ts';
 import type { Logger } from './log.ts';
 import { metrics } from './metrics.ts';
+import { isGateFile } from './policy/gate.ts';
 import { applyPolicy, inScope, isTeamMember, loadPolicyFile, mergePolicies, overrideBy, parsePolicy } from './policy/load.ts';
 import { missingPlanSections } from './policy/plan.ts';
 import type { PolicyPack } from './policy/schema.ts';
@@ -152,10 +153,11 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     const trustedSha = meta.baseRef === meta.defaultBranch ? meta.baseSha : await mirror.fetchBranchTip(job.number, meta.defaultBranch);
     const trustedRead = (path: string) => mirrorShow(mirror!, trustedSha, path);
     const baseRead = (path: string) => mirrorShow(mirror!, mergeBase, path);
-    const policyChangedInPr = anchors.files.some((f) => f.path === ctx.config.policy.repoPath || f.oldPath === ctx.config.policy.repoPath);
+    // The first changed file that decides who may merge: the policy pack or CODEOWNERS.
+    const gateFile = anchors.files.flatMap((f) => [f.path, f.oldPath]).find((p) => p === ctx.config.policy.repoPath || isGateFile(p)) ?? null;
     const loaded = await loadPolicyFor(ctx, job.repo, trustedRead);
-    // A PR that edits the policy pack is a human's call: comment only, whatever the pack allows.
-    const policy: PolicyPack = policyChangedInPr ? { ...loaded, verdict: { ...loaded.verdict, mode: 'comment' } } : loaded;
+    // A PR that edits the policy pack or CODEOWNERS is a human's call: comment only, whatever the pack allows.
+    const policy: PolicyPack = gateFile ? { ...loaded, verdict: { ...loaded.verdict, mode: 'comment' } } : loaded;
     checksEnabled = policy.verdict.checkRun;
     const override = overrideBy(policy, meta.author, await github.approvers(job.repo, job.number, job.headSha));
     if (!override && policy.outsiders.requirePlan && !isTeamMember(policy, meta.author)) {
@@ -179,7 +181,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
       if (text === null) return await done('held', `Required context file ${p} is missing on the default branch.`, true);
       requiredDocs.push({ path: p, text });
     }
-    if (policyChangedInPr) instructionDocs.unshift({ path: '(note)', text: `This PR changes ${ctx.config.policy.repoPath}. The review was governed by the default branch's version; treat the PR's version as a change under review.` });
+    if (gateFile) instructionDocs.unshift({ path: '(note)', text: `This PR changes ${gateFile}. The review was governed by the default branch's version; treat the PR's version as a change under review.` });
     const prior = ctx.store.priorFingerprints(job.repo, job.number, job.headSha);
     const lessons = policy.feedback.learn ? ctx.store.lessons(job.repo, inScopeFiles, policy.feedback.maxLessons) : [];
 
@@ -209,7 +211,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     // A review that does not account for every in-scope file is incomplete: medium confidence, comment-only.
     const unreviewed = inScopeFiles.filter((p) => !output.reviewedFiles.includes(p));
     if (unreviewed.length) log.info({ unreviewed }, 'review did not cover every in-scope file');
-    const summary = policyChangedInPr ? `This PR changes ${ctx.config.policy.repoPath}, so Falcon only comments: a human must review policy changes.\n\n${output.summary}` : output.summary;
+    const summary = gateFile ? `This PR changes ${gateFile}, so Falcon only comments: a human must review policy changes.\n\n${output.summary}` : output.summary;
     const finalOutput: ReviewOutput = { ...output, summary, findings: kept, confidence: unreviewed.length ? 'medium' : output.confidence };
     const rendered = sanitize(renderReview(policy, meta, finalOutput, anchors, prior, override), redactor);
     const toPublish = toPending(rendered, job.headSha, boundBytes(redactor.apply(finalOutput.summary), LIMITS.summary));
