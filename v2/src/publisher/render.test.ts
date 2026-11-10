@@ -43,3 +43,19 @@ test('render places anchored findings inline, others in the body, and always car
   assert.ok(out.body.endsWith(`<!-- falcon-review:v2 acme/demo#7@${'f'.repeat(40)} -->`));
   assert.equal(out.checkConclusion, 'action_required');
 });
+
+test('an override turns a blocking verdict into a comment', () => {
+  const approve = parsePolicy('version: 1\nname: a\nverdict: { mode: approve }', 'a');
+  assert.deepEqual(decideVerdict(approve, [f({})], 'high', 'lee'), { verdict: 'comment', blocking: [] });
+  assert.equal(decideVerdict(approve, [], 'high', 'lee').verdict, 'approve');
+});
+
+test('an overridden review says who overrode it, and only when something was blocking', () => {
+  const rc = parsePolicy('version: 1\nname: r\nverdict: { mode: request_changes }', 'r');
+  const out = (findings: Finding[]) => ({ summary: 's', findings, reviewedFiles: ['h.py'], questions: [], confidence: 'high' as const, lenses: ['correctness'] });
+  const blocked = renderReview(rc, meta, out([f({})]), anchors, new Map(), 'lee');
+  assert.match(blocked.body, /### Falcon review: .*\n\nBlocking findings overridden by @lee's approval\./);
+  assert.equal(blocked.event, 'COMMENT');
+  assert.equal(blocked.checkConclusion, 'neutral');
+  assert.doesNotMatch(renderReview(rc, meta, out([]), anchors, new Map(), 'lee').body, /overridden/);
+});

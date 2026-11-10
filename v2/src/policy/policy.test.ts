@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { minimatch } from './glob.ts';
-import { applyPolicy, inScope, isTeamMember, loadPolicyFile, mergePolicies, parsePolicy, rulesFor } from './load.ts';
+import { applyPolicy, inScope, isTeamMember, loadPolicyFile, mergePolicies, overrideBy, parsePolicy, rulesFor } from './load.ts';
 import type { Finding } from '../types.ts';
 
 const finding = (over: Partial<Finding>): Finding => ({ id: 'a', severity: 'high', blocking: false, path: 'src/a.ts', line: 1, side: 'RIGHT', title: 't', scenario: 's', impact: 'i', evidence: 'e', fix: 'f', fingerprint: 'fp', ...over });
@@ -91,4 +91,12 @@ test('team membership is case-insensitive; outsiders need no plan by default', (
   const d = parsePolicy('version: 1\nname: d', 'd');
   assert.equal(d.outsiders.requirePlan, false);
   assert.deepEqual(d.team.members, []);
+});
+
+test('only a team member who is not the author can override', () => {
+  const p = parsePolicy('version: 1\nname: t\nteam: { members: [lee, ann] }', 't');
+  assert.equal(overrideBy(p, 'eve', ['Lee']), 'Lee');
+  assert.equal(overrideBy(p, 'lee', ['lee']), null, 'own approval');
+  assert.equal(overrideBy(p, 'eve', ['mallory']), null, 'not on the team');
+  assert.equal(overrideBy(p, 'eve', []), null);
 });

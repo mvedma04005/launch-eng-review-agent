@@ -17,16 +17,18 @@ export interface RenderedReview {
 
 const sevLabel: Record<Finding['severity'], string> = { critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low', info: 'Info' };
 
-export function decideVerdict(policy: PolicyPack, findings: Finding[], confidence: ReviewOutput['confidence'] = 'high'): { verdict: Verdict; blocking: Finding[] } {
+export function decideVerdict(policy: PolicyPack, findings: Finding[], confidence: ReviewOutput['confidence'] = 'high', override: string | null = null): { verdict: Verdict; blocking: Finding[] } {
   const blocking = findings.filter((f) => f.blocking && (!policy.verdict.verifyBlocking || f.verified?.real !== false));
+  if (override && blocking.length) return { verdict: 'comment', blocking: [] };
   // A reviewer that is not sure may ask, never decide: medium confidence is comment-only whatever the policy allows.
   if (confidence === 'medium') return { verdict: 'comment', blocking };
   if (blocking.length) return { verdict: policy.verdict.mode === 'comment' ? 'comment' : 'request_changes', blocking };
   return { verdict: policy.verdict.mode === 'approve' ? 'approve' : 'comment', blocking };
 }
 
-export function renderReview(policy: PolicyPack, meta: PullMeta, output: ReviewOutput, anchors: Anchors, priorOpen: Map<string, Finding>): RenderedReview {
-  const { verdict, blocking } = decideVerdict(policy, output.findings, output.confidence);
+export function renderReview(policy: PolicyPack, meta: PullMeta, output: ReviewOutput, anchors: Anchors, priorOpen: Map<string, Finding>, override: string | null = null): RenderedReview {
+  const { verdict, blocking } = decideVerdict(policy, output.findings, output.confidence, override);
+  const overridden = Boolean(override) && decideVerdict(policy, output.findings, output.confidence).blocking.length > 0;
   const ordered = [...output.findings].sort((a, b) => Number(b.blocking) - Number(a.blocking) || sevRank(a) - sevRank(b));
   const comments: RenderedReview['comments'] = [];
   const bodyFindings: string[] = [];
@@ -45,6 +47,7 @@ export function renderReview(policy: PolicyPack, meta: PullMeta, output: ReviewO
   const notice = verdict === 'comment' ? ' This comment-only review does not withdraw earlier approvals or change requests.' : '';
   const lines = [
     `### Falcon review: ${headline}`,
+    ...(overridden ? ['', `Blocking findings overridden by @${override}'s approval.`] : []),
     '',
     output.summary,
     '',

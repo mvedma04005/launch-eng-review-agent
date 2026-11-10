@@ -42,7 +42,8 @@ function fixture() {
 
 class FakeGitHub implements GitHubPort {
   posted: Publishable[] = [];
-  checks: Array<{ status: 'in_progress' | 'completed'; conclusion?: CheckConclusion; id: number | null }> = [];
+  checks: Array<{ status: 'in_progress' | 'completed'; conclusion?: CheckConclusion; title?: string; id: number | null }> = [];
+  approversByHead = new Map<string, string[]>();
   failPostsRemaining = 0;
   meta: PullMeta;
   ciState: 'none' | 'pending' | 'success' | 'failure';
@@ -52,13 +53,14 @@ class FakeGitHub implements GitHubPort {
   async pull() { return this.meta; }
   async ci() { return this.ciState; }
   async ownReviews() { return this.existing; }
+  async approvers(_r: string, _n: number, headSha: string) { return this.approversByHead.get(headSha) ?? []; }
   async postReview(_r: string, _n: number, _h: string, review: Publishable) {
     if (this.failPostsRemaining > 0) { this.failPostsRemaining--; const e = new Error('bad gateway') as Error & { status: number }; e.status = 502; throw e; }
     this.posted.push(review);
     return { id: 1, htmlUrl: 'https://example.test/review/1', inlineDropped: false, commentIds: new Map(review.comments.map((c, i) => [c.findingId, 100 + i])) };
   }
   async startCheckRun() { const id = this.nextCheckId++; this.checks.push({ status: 'in_progress', id }); return id; }
-  async completeCheckRun(_r: string, _h: string, id: number | null, conclusion: CheckConclusion) { this.checks.push({ status: 'completed', conclusion, id }); return id ?? this.nextCheckId++; }
+  async completeCheckRun(_r: string, _h: string, id: number | null, conclusion: CheckConclusion, title: string) { this.checks.push({ status: 'completed', conclusion, title, id }); return id ?? this.nextCheckId++; }
   async fileAtRef() { return null; }
 }
 
@@ -239,4 +241,33 @@ test('an outsider without a plan is refused; a team member is not; the base bran
   assert.notEqual((await run('lee')).outcome.status, 'skipped');
   git(origin, 'update-ref', 'refs/pull/3/head', selfSha);
   assert.equal((await run('eve', selfSha)).outcome.status, 'skipped');
+});
+
+test('a team approval on the current commit lifts the size block; an approval on an older commit does not', async () => {
+  const { root, origin, baseSha: fixtureBase } = fixture();
+  git(origin, 'checkout', '-q', '-b', 'ovr', fixtureBase);
+  writeFileSync(join(origin, '.falcon', 'policy.yaml'), 'version: 1\nname: repo\nbudgets: { maxChangedLines: 50 }\nteam: { members: [lee] }\n');
+  git(origin, 'commit', '-qam', 'budget');
+  const baseSha = git(origin, 'rev-parse', 'HEAD');
+  writeFileSync(join(origin, 'big.py'), Array.from({ length: 60 }, (_, i) => `x${i} = ${i}`).join('\n') + '\n');
+  git(origin, 'add', '.'); git(origin, 'commit', '-qm', 'big');
+  const headSha = git(origin, 'rev-parse', 'HEAD');
+  git(origin, 'update-ref', 'refs/pull/3/head', headSha);
+
+  const run = async (approvedAt: string) => {
+    const store = new Store(':memory:');
+    const github = new FakeGitHub(meta(origin, headSha, baseSha));
+    github.approversByHead.set(approvedAt, ['lee']);
+    const ctx: WorkerContext = { config: configFor(root), store, auth, anthropic: {} as Anthropic, reviewer: fakeReviewer([], { n: 0 }), log, dryRun: false, githubFor: async () => github };
+    store.enqueue({ repo: 'acme/demo', number: 3, headSha, baseSha, baseRef: 'main', trigger: 'manual', receivedAt: 'now' });
+    return { github, outcome: await processJob(ctx, store.claim('t', 60, { perRepo: 1, global: 1 })!, 't') };
+  };
+  const { github: gh, outcome: overridden } = await run(headSha);
+  assert.equal(overridden.status, 'skipped');
+  assert.match(overridden.reason ?? '', /overridden by @lee, not reviewed/);
+  assert.equal(gh.checks.at(-1)?.conclusion, 'success');
+  assert.equal(gh.checks.at(-1)?.title, 'Overridden');
+  const { github: ghStale } = await run('0'.repeat(40));
+  assert.equal(ghStale.checks.at(-1)?.conclusion, 'action_required');
+  assert.equal(ghStale.checks.at(-1)?.title, 'Changes needed');
 });

@@ -63,6 +63,10 @@ export function isTeamMember(policy: PolicyPack, login: string): boolean {
   return policy.team.members.some((m) => m.toLowerCase() === l);
 }
 
+export function overrideBy(policy: PolicyPack, author: string, approvers: string[]): string | null {
+  return approvers.find((a) => a.toLowerCase() !== author.toLowerCase() && isTeamMember(policy, a)) ?? null;
+}
+
 export function inScope(policy: PolicyPack, path: string): boolean {
   return policy.scope.include.some((g) => minimatch(path, g)) && !policy.scope.exclude.some((g) => minimatch(path, g));
 }

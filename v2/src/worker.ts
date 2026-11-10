@@ -8,7 +8,7 @@ import { Mirror } from './evidence/git.ts';
 import type { GitHubAuth } from './ingress/github.ts';
 import type { Logger } from './log.ts';
 import { metrics } from './metrics.ts';
-import { applyPolicy, inScope, isTeamMember, loadPolicyFile, mergePolicies, parsePolicy } from './policy/load.ts';
+import { applyPolicy, inScope, isTeamMember, loadPolicyFile, mergePolicies, overrideBy, parsePolicy } from './policy/load.ts';
 import { missingPlanSections } from './policy/plan.ts';
 import type { PolicyPack } from './policy/schema.ts';
 import { OctokitGitHub, type GitHubPort } from './publisher/github.ts';
@@ -151,7 +151,8 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     const policy = await loadPolicyFor(ctx, job.repo, trustedRead);
     checksEnabled = policy.verdict.checkRun;
     const policyChangedInPr = anchors.files.some((f) => f.path === ctx.config.policy.repoPath || f.oldPath === ctx.config.policy.repoPath);
-    if (policy.outsiders.requirePlan && !isTeamMember(policy, meta.author)) {
+    const override = overrideBy(policy, meta.author, await github.approvers(job.repo, job.number, job.headSha));
+    if (!override && policy.outsiders.requirePlan && !isTeamMember(policy, meta.author)) {
       const missing = missingPlanSections(meta.body, policy.outsiders.planHeadings);
       if (missing.length) return done('skipped', `This PR needs a short write-up before review. Add these sections to the description: ${missing.map((h) => `## ${h}`).join(', ')}. Say what problem this solves and how the change solves it, in a few sentences each.`, 'block');
     }
@@ -162,6 +163,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     if (!inScopeFiles.length) return done('skipped', 'No in-scope files changed.');
     if (inScopeFiles.length > policy.budgets.maxChangedFiles) return done('held', `${inScopeFiles.length} changed files exceeds the policy budget of ${policy.budgets.maxChangedFiles}.`, true);
     const changedLines = anchors.files.filter((f) => inScopeFiles.includes(f.path)).reduce((n, f) => n + f.additions + f.deletions, 0);
+    if (changedLines > policy.budgets.maxChangedLines && override) return done('skipped', `${changedLines} changed lines is over the limit of ${policy.budgets.maxChangedLines}; overridden by @${override}, not reviewed.`, 'pass');
     if (changedLines > policy.budgets.maxChangedLines) return done('skipped', `${changedLines} changed lines exceeds the policy budget of ${policy.budgets.maxChangedLines}. Split the PR into smaller, focused PRs so the review can assess the changes and their interactions reliably.`, 'block');
     const instructionDocs = await collectInstructionDocs(trustedRead, inScopeFiles, policy);
     const requiredDocs: Array<{ path: string; text: string }> = [];
@@ -198,7 +200,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     }
     phase('verify');
     const finalOutput: ReviewOutput = { ...output, findings: kept };
-    const rendered = sanitize(renderReview(policy, meta, finalOutput, anchors, prior), redactor);
+    const rendered = sanitize(renderReview(policy, meta, finalOutput, anchors, prior, override), redactor);
     const toPublish = toPending(rendered, job.headSha, boundBytes(redactor.apply(finalOutput.summary), LIMITS.summary));
     ctx.store.recordFindings(job, kept);
     ctx.store.savePending(job.id, toPublish);

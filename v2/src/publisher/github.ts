@@ -13,6 +13,8 @@ export interface GitHubPort {
   ci(repo: string, sha: string): Promise<CiState>;
   /** Reviews already posted by this engine at the given head (identified by marker). */
   ownReviews(repo: string, number: number, headSha: string): Promise<Array<{ id: number; htmlUrl: string }>>;
+  /** Logins whose latest review on exactly this head is an approval. */
+  approvers(repo: string, number: number, headSha: string): Promise<string[]>;
   /** Posts one commit-anchored review. Falls back to a body-only review if inline anchors are rejected. */
   postReview(repo: string, number: number, headSha: string, review: Publishable): Promise<{ id: number; htmlUrl: string; inlineDropped: boolean; commentIds: Map<string, number> }>;
   /** Shows "in progress" on the PR while the review runs. Returns the check-run id, or null when checks are unavailable. */
@@ -59,6 +61,14 @@ export class OctokitGitHub implements GitHubPort {
     return rows
       .filter((r) => (r.body ?? '').includes(`${MARKER_PREFIX}${repo}#${number}@${headSha} -->`) && (!this.botLogin || r.user?.login === this.botLogin))
       .map((r) => ({ id: r.id, htmlUrl: r.html_url }));
+  }
+
+  async approvers(repo: string, number: number, headSha: string) {
+    const rows = await this.octokit.paginate(this.octokit.pulls.listReviews, { ...split(repo), pull_number: number, per_page: 100 });
+    const latest = new Map<string, string>();
+    // Reviews arrive oldest first; a comment never changes a verdict, and an approval on an older head does not count.
+    for (const r of rows) if (r.user && r.commit_id === headSha && r.state !== 'COMMENTED') latest.set(r.user.login, r.state);
+    return [...latest].filter(([, state]) => state === 'APPROVED').map(([login]) => login);
   }
 
   async postReview(repo: string, number: number, headSha: string, review: Publishable) {
