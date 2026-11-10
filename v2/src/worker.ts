@@ -226,6 +226,13 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
 
   /** Publishes a finished review. Failures keep the review and retry; after the cap, the job parks for `falcon replay`. */
   async function publish(pendingReview: PendingPublication, meta: PullMeta): Promise<JobOutcome> {
+    // Dry run posts nothing, on every path. Without this, replaying a dry-run job that holds a retained review
+    // would post that review for real.
+    if (ctx.dryRun) {
+      const reason = 'dry run: review rendered, nothing posted';
+      ctx.store.finish(job.id, 'skipped', { error: reason });
+      return { status: 'skipped', reason };
+    }
     const fresh = await github.pull(job.repo, job.number);
     if (fresh.headSha !== job.headSha) return done('skipped', 'Head moved during review; the newer head will be reviewed.');
     if (fresh.state !== 'open' || fresh.merged || fresh.draft) return done('skipped', 'PR closed, merged or converted to draft during review.');

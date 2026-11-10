@@ -122,6 +122,23 @@ test('worker runs a PR end to end: base-branch policy, git evidence, verificatio
   assert.equal(calls.n, 1);
 });
 
+test('replaying a dry-run job with a retained review posts nothing', async () => {
+  const { root, origin, baseSha, headSha } = fixture();
+  const store = new Store(':memory:');
+  const github = new FakeGitHub(meta(origin, headSha, baseSha));
+  const calls = { n: 0 };
+  const ctx: WorkerContext = { config: configFor(root), store, auth, anthropic: {} as Anthropic, reviewer: fakeReviewer([{ path: 'svc.py', line: 2, evidence: 'user.name', severity: 'high' }], calls), log, dryRun: true, githubFor: async () => github };
+  const { job } = store.enqueue({ repo: 'acme/demo', number: 3, headSha, baseSha, baseRef: 'main', trigger: 'poll', receivedAt: 'now' });
+  await processJob(ctx, store.claim('t', 60, { perRepo: 1, global: 1 })!, 't');
+  assert.ok(store.pending(store.job(job.id)!), 'the dry run keeps its rendered review');
+  store.requeue(job.id, 0, 'operator replay');
+  const replayed = await processJob(ctx, store.claim('t2', 60, { perRepo: 1, global: 1 })!, 't2');
+  assert.equal(replayed.status, 'skipped');
+  assert.equal(github.posted.length, 0, 'nothing reaches GitHub in dry run');
+  assert.equal(github.checks.length, 0);
+  assert.equal(store.job(job.id)?.status, 'skipped');
+});
+
 test('a finished review survives publication failures and is republished without another model run', async () => {
   const { root, origin, baseSha, headSha } = fixture();
   const store = new Store(':memory:');
