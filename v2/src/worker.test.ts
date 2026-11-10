@@ -192,11 +192,13 @@ test('worker holds on failed CI, defers on pending CI, and skips drafts without 
 });
 
 test('an oversized PR is refused and the check blocks; dry run posts nothing', async () => {
-  const { root, origin, baseSha: fixtureBase } = fixture();
-  git(origin, 'checkout', '-q', '-b', 'big', fixtureBase);
+  const { root, origin } = fixture();
+  git(origin, 'checkout', '-q', 'main'); // The pack is committed on main: Falcon reads the rules from the default branch tip.
   writeFileSync(join(origin, '.falcon', 'policy.yaml'), 'version: 1\nname: repo\nbudgets: { maxChangedLines: 50 }\n');
   git(origin, 'commit', '-qam', 'budget');
   const baseSha = git(origin, 'rev-parse', 'HEAD');
+  git(origin, 'checkout', '-q', '-b', 'ovr');
+  git(origin, 'checkout', '-q', '-b', 'big');
   writeFileSync(join(origin, 'big.py'), Array.from({ length: 60 }, (_, i) => `x${i} = ${i}`).join('\n') + '\n');
   git(origin, 'add', '.'); git(origin, 'commit', '-qm', 'big');
   const headSha = git(origin, 'rev-parse', 'HEAD');
@@ -217,11 +219,12 @@ test('an oversized PR is refused and the check blocks; dry run posts nothing', a
 });
 
 test('an outsider without a plan is refused; a team member is not; the base branch list governs', async () => {
-  const { root, origin, baseSha: fixtureBase } = fixture();
-  git(origin, 'checkout', '-q', '-b', 'gate', fixtureBase);
+  const { root, origin } = fixture();
+  git(origin, 'checkout', '-q', 'main'); // The pack is committed on main: Falcon reads the rules from the default branch tip.
   writeFileSync(join(origin, '.falcon', 'policy.yaml'), 'version: 1\nname: repo\nverdict: { mode: request_changes }\nteam: { members: [lee] }\noutsiders: { requirePlan: true }\n');
   git(origin, 'commit', '-qam', 'team');
   const baseSha = git(origin, 'rev-parse', 'HEAD');
+  git(origin, 'checkout', '-q', '-b', 'gate');
   writeFileSync(join(origin, 'svc.py'), 'def handler(user):\n    return user.name\n');
   git(origin, 'commit', '-qam', 'change');
   const headSha = git(origin, 'rev-parse', 'HEAD');
@@ -249,8 +252,8 @@ test('an outsider without a plan is refused; a team member is not; the base bran
 });
 
 test('a team approval on the current commit lifts the size block; an approval on an older commit does not', async () => {
-  const { root, origin, baseSha: fixtureBase } = fixture();
-  git(origin, 'checkout', '-q', '-b', 'ovr', fixtureBase);
+  const { root, origin } = fixture();
+  git(origin, 'checkout', '-q', 'main'); // The pack is committed on main: Falcon reads the rules from the default branch tip.
   writeFileSync(join(origin, '.falcon', 'policy.yaml'), 'version: 1\nname: repo\nbudgets: { maxChangedLines: 50 }\nteam: { members: [lee] }\n');
   git(origin, 'commit', '-qam', 'budget');
   const baseSha = git(origin, 'rev-parse', 'HEAD');
@@ -556,4 +559,15 @@ test('a re-review request reviews a commit again even though Falcon already revi
   const second = await processJob(ctx, store.claim('t', 60, { perRepo: 1, global: 1 })!, 't');
   assert.equal(second.status, 'published', second.reason);
   assert.equal(github.posted.length, 1);
+});
+
+test('the rules in force are the default branch tip, not the commit the PR started from', async () => {
+  const f = approveFixture('version: 1\nname: repo\nverdict: { mode: comment }\n');
+  // main moves on after the PR was opened: the pack now allows approvals. The PR's recorded base is the older commit.
+  writeFileSync(join(f.origin, '.falcon', 'policy.yaml'), 'version: 1\nname: repo\nverdict: { mode: approve }\nteam: { members: [lee] }\n');
+  git(f.origin, 'commit', '-qam', 'allow approvals');
+  const github = new FakeGitHub(meta(f.origin, f.headSha, f.baseSha));
+  const { outcome } = await runJob(f, github, scriptedReviewer());
+  assert.equal(outcome.status, 'published', outcome.reason);
+  assert.equal(github.posted[0]?.event, 'APPROVE');
 });

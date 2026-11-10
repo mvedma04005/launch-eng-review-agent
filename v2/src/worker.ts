@@ -157,9 +157,10 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     const worktree = await mirror.worktree(job.headSha, worktreeDir);
     phase('checkout');
 
-    // Policy and instruction files come from the default branch, never from the PR or from a base branch its author
-    // may control: a change cannot govern its own review. A PR onto the default branch reads its base as before.
-    const trustedSha = meta.baseRef === meta.defaultBranch ? meta.baseSha : await mirror.fetchBranchTip(job.number, meta.defaultBranch);
+    // Policy and instruction files come from the tip of the default branch: never from the PR, never from a base
+    // branch its author may control, and not from the PR's recorded base commit either. That commit is where the
+    // PR started, so it can be older than the rules in force today.
+    const trustedSha = await mirror.fetchBranchTip(job.number, meta.defaultBranch);
     const trustedRead = (path: string) => mirrorShow(mirror!, trustedSha, path);
     const baseRead = (path: string) => mirrorShow(mirror!, mergeBase, path);
     // The first changed file that decides who may merge: the policy pack or CODEOWNERS.
