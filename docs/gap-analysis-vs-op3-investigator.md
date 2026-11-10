@@ -30,7 +30,7 @@ Decision: build our own, on a dedicated Mac, borrowing the OP3 team's proven des
 | Depth modes and comment budgets | lite / default / deep; 40 comments; 5 inline nits; "N Important, N Nit" summary | Severity and blocking only | Policy pack content plus small renderer caps; Phase 1 |
 | Run resumption | Partial conclusions checkpointed so a retried attempt does not start from zero | A killed review restarts from scratch | Phase 2: checkpoint accepted findings every N tool calls and feed them into the retry prompt |
 | Evaluation set | Offline historical cases with a replay protocol | Planned only | Phase 2: `falcon eval` with constructed buggy/fixed commit pairs, same model, policy commit and tools for baseline and candidate |
-| Model access | Bedrock cross-account inference | Anthropic API direct | Decision needed. The SDK supports Bedrock through the Mantle client; a one-line client swap if governance requires it |
+| Model access | Bedrock cross-account inference | Anthropic API direct | Decided: Anthropic API. `ANTHROPIC_API_KEY` in the Mac's env file; the daemon refuses to start without a credential |
 | Time saved | Operator-declared minutes per review, audited | None | Later; cheap once the dashboard has write actions |
 | Multi-host | Postgres leases across replicas, Kubernetes quota | SQLite on one Mac | Not needed on a Mac. The store is behind an interface if a second host is ever required |
 
@@ -45,6 +45,5 @@ Decision: build our own, on a dedicated Mac, borrowing the OP3 team's proven des
 
 ## Decisions for you
 
-1. Bedrock or the Anthropic API for inference?
-2. Who owns the launch-engineering policy pack, and what are its gates?
-3. Is a `/falcon review` PR-comment command wanted in addition to Chat?
+1. Who owns the launch-engineering policy pack, and what are its gates?
+2. Is a `/falcon review` PR-comment command wanted in addition to Chat?
