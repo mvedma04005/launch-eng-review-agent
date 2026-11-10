@@ -111,9 +111,30 @@ Three layers, all visible, none silent:
 2. **Rule proposals.** Recurring rejected patterns are clustered into a proposed policy-pack change, opened as a PR against the policy file. A human merges it. The engine's behavior changes only through reviewed git history.
 3. **Eval set.** Every finding with an outcome is a labeled case. `falcon eval` (next phase) replays sampled PRs at their fixed heads with the current policy, prompt and model, and reports precision and recall before a change ships.
 
+## Operations: metrics, queue visibility, limits
+
+**Limits** live in two places with a clear precedence. The engine config (`falcon.yaml`, operator-owned) sets hard ceilings; a repository's policy pack sets budgets that are clamped to those ceilings. A repository can spend less than the ceiling, never more.
+
+| Limit | Where | Default | Behavior when hit |
+| --- | --- | --- | --- |
+| Tool calls per review | policy `budgets.maxToolCalls`, ceiling `limits.perReview.maxToolCalls` | 80 / 120 | Tools return "budget exhausted, submit now"; the model must submit what it has verified. |
+| Minutes per review | policy `budgets.maxMinutes`, ceiling `limits.perReview.maxMinutes` | 25 / 30 | Review aborted and held with the reason. |
+| Input and output tokens per review | policy `budgets.maxInputTokens` / `maxOutputTokens`, ceilings in `limits.perReview` | 800k, 60k / 1.5M, 150k | Checked after every model call; aborted and held with the reason. |
+| Dollars per review | policy `budgets.maxCostUsd`, ceiling `limits.perReview.maxCostUsd` | $6 / $15 | Estimated from list prices after every call; aborted and held with the reason. |
+| Dollars per repository per UTC day | `limits.daily.perRepoUsd` | $200 | New reviews for that repository defer to the next day; nothing fails. |
+| Dollars globally per UTC day | `limits.daily.globalUsd` | $1000 | All new reviews defer to the next day. |
+| Changed files per review | policy `budgets.maxChangedFiles` | 300 | Held with the reason. |
+| Concurrent reviews | `workers.concurrency`, `workers.perRepoConcurrency` | 8, 4 | Jobs wait in the queue. |
+
+Cost is estimated from a per-model price table in `src/pricing.ts` (overridable); every job stores its tokens and estimated dollars, so `spend today` on the dashboard and the daily caps come from the same numbers.
+
+**Metrics** are exposed at `/metrics` in Prometheus text format, which the Datadog agent scrapes as OpenMetrics. Counters: jobs finished by outcome, reviews published by event, findings by severity and blocking, feedback signals, tokens by kind, estimated spend, errors by component, deferrals by reason. Histograms: review duration, queue wait before first lease, tool calls per review. Gauges computed from SQLite at scrape time: jobs by status, live jobs by repository, age of the oldest runnable job, spend today. The useful alerts are oldest-queued-age, error rate, spend-today near cap, and no published review in N hours while jobs are queued.
+
+**Queue visibility**: `/` is a plain HTML dashboard (counts, by-repository table, what is in review and on which worker, recent jobs with wall time and cost and the hold reason). `/api/queue`, `/api/jobs`, `/api/jobs/:id` return the same as JSON, the last one with the job's usage and full event trail. `falcon status`, `falcon jobs`, `falcon job <id>` print the same from the command line. The server binds to localhost by default and is read-only.
+
 ## Data model
 
-`jobs` (lease, attempts, status, result), `events` (audit trail), `findings` (stable fingerprint, GitHub comment id), `finding_outcomes` (signal, actor), `reviews` (GitHub review and check-run ids, marker), `usage` (tokens and wall time per job), `lessons`, `cursors` (poll position per repository). All in one SQLite file under the state directory.
+`jobs` (lease, attempts, status, result), `events` (audit trail), `findings` (stable fingerprint, GitHub comment id), `finding_outcomes` (signal, actor), `reviews` (GitHub review and check-run ids, marker), `usage` (tokens, estimated cost and wall time per job, by repository and time for the daily caps), `lessons`, `cursors` (poll position per repository). All in one SQLite file under the state directory.
 
 ## Deployment on a fleet Mac
 
@@ -138,6 +159,6 @@ One Node process, `falcon serve`, under a launchd agent with `KeepAlive`. State 
 
 ## What exists now and what is next
 
-Implemented and tested in `v2/`: domain types; policy schema, loader, merge and enforcement; SQLite store with idempotent enqueue, lease-based claiming, outcomes and lessons; git mirror, worktree, diff parser and anchor set; host-side finding validation; the reviewer's tool surface and Claude invocation with verifier; review rendering; GitHub publishing with the 422 fallback and check runs; polling ingress; feedback classification; lesson derivation; the worker; a CLI with dry run; a daemon loop.
+Implemented and tested in `v2/`: per-review token, dollar, time and tool-call limits with operator ceilings; daily spend caps; Prometheus metrics; status server with HTML dashboard and JSON API; CLI status, jobs and job detail; domain types; policy schema, loader, merge and enforcement; SQLite store with idempotent enqueue, lease-based claiming, outcomes and lessons; git mirror, worktree, diff parser and anchor set; host-side finding validation; the reviewer's tool surface and Claude invocation with verifier; review rendering; GitHub publishing with the 422 fallback and check runs; polling ingress; feedback classification; lesson derivation; the worker; a CLI with dry run; a daemon loop.
 
 Next: webhook receiver, reactions and resolution poller, the "line changed on next push" detector, alerting, `falcon eval`, rule-proposal generation, launchd plist and Dockerfile, and an end-to-end dry run against real PRs once an Anthropic key and the GitHub App exist.

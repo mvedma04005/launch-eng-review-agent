@@ -43,6 +43,10 @@ export const PolicyPackSchema = z.object({
     maxFileBytes: z.number().int().min(1024).default(400_000),
     maxToolCalls: z.number().int().min(5).default(80),
     maxMinutes: z.number().int().min(1).default(25),
+    /** Token and spend ceilings per review; the engine config may clamp these lower. */
+    maxInputTokens: z.number().int().min(10_000).default(800_000),
+    maxOutputTokens: z.number().int().min(1_000).default(60_000),
+    maxCostUsd: z.number().min(0.1).default(6),
     /** Diff larger than this is not inlined; the reviewer reads files through tools instead. */
     inlineDiffBytes: z.number().int().min(1024).default(200_000),
   }).prefault({}),

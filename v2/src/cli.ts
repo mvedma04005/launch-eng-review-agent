@@ -11,18 +11,22 @@ import { claudeReviewer } from './reviewer/claude.ts';
 import { serve } from './serve.ts';
 import { findingsSummary, processJob } from './worker.ts';
 
-const USAGE = `falcon — PR review engine
+const USAGE = `falcon: PR review engine
 
   falcon review <pr-url> [--post]     Review one PR. Dry run by default: prints the review, posts nothing.
-  falcon serve                        Run the daemon (polling ingress + workers).
-  falcon status                       Queue counts and recent events.
+  falcon serve                        Run the daemon (polling ingress, workers, status server when http.port is set).
+  falcon status                       Queue snapshot: counts by status and repository, jobs in review, spend today.
+  falcon jobs [--limit N]             Recent jobs with outcome, wall time and estimated cost.
+  falcon job <id>                     One job with its usage and event trail.
 
 Environment: ANTHROPIC_API_KEY; GITHUB_TOKEN (token mode) or FALCON_GITHUB_PRIVATE_KEY with github.appId in falcon.yaml (app mode).`;
 
 async function main(argv: string[]): Promise<number> {
-  const { positionals, values } = parseArgs({ args: argv, allowPositionals: true, options: { post: { type: 'boolean', default: false }, config: { type: 'string' } } });
+  const { positionals, values } = parseArgs({ args: argv, allowPositionals: true, options: { post: { type: 'boolean', default: false }, config: { type: 'string' }, limit: { type: 'string' } } });
   const [command, arg] = positionals;
   const config = loadConfig(values.config);
+  const out = (s: string) => process.stdout.write(s + '\n');
+
   if (command === 'review' && arg) {
     const { repo, number } = parsePullUrl(arg);
     const auth = githubAuthFromEnv(config);
@@ -34,11 +38,11 @@ async function main(argv: string[]): Promise<number> {
     const leased = store.claim('cli', 3600, { perRepo: 1, global: 1 }) ?? job;
     const outcome = await processJob({ config: { ...config, stateDir }, store, auth, anthropic: new Anthropic(), reviewer: claudeReviewer, log, dryRun: !values.post }, leased, 'cli');
     if (outcome.rendered) {
-      process.stdout.write(`\n${outcome.rendered.body}\n\n--- inline comments (${outcome.rendered.comments.length}) ---\n`);
-      for (const c of outcome.rendered.comments) process.stdout.write(`\n${c.path}:${c.line} (${c.side})\n${c.body}\n`);
-      process.stdout.write(`\n--- findings ---\n${findingsSummary(outcome.output?.findings ?? [])}\n--- usage ---\n${JSON.stringify(outcome.usage)}\n`);
+      out(`\n${outcome.rendered.body}\n\n--- inline comments (${outcome.rendered.comments.length}) ---`);
+      for (const c of outcome.rendered.comments) out(`\n${c.path}:${c.line} (${c.side})\n${c.body}`);
+      out(`\n--- findings ---\n${findingsSummary(outcome.output?.findings ?? [])}\n--- usage ---\n${JSON.stringify(outcome.usage)}`);
     }
-    process.stdout.write(`\nstatus: ${outcome.status}${outcome.reason ? ` — ${outcome.reason}` : ''}${outcome.reviewUrl ? ` — ${outcome.reviewUrl}` : ''}\n`);
+    out(`\nstatus: ${outcome.status}${outcome.reason ? ` (${outcome.reason})` : ''}${outcome.reviewUrl ? ` ${outcome.reviewUrl}` : ''}`);
     store.close();
     return outcome.status === 'held' ? 2 : 0;
   }
@@ -50,8 +54,23 @@ async function main(argv: string[]): Promise<number> {
   }
   if (command === 'status') {
     const store = new Store(join(config.stateDir, 'falcon.sqlite3'));
-    const events = store.db.prepare('select at, job_id, kind, data from events order by id desc limit 20').all();
-    process.stdout.write(JSON.stringify({ jobs: store.counts(), recent: events }, null, 2) + '\n');
+    out(JSON.stringify(store.snapshot(), null, 2));
+    store.close();
+    return 0;
+  }
+  if (command === 'jobs') {
+    const store = new Store(join(config.stateDir, 'falcon.sqlite3'));
+    const rows = store.recentJobs(Math.min(500, Number(values.limit ?? 30) || 30));
+    out(['job      pr                              status      att  wall    cost     updated                   note', ...rows.map((j) =>
+      `${j.id.slice(0, 8)} ${(j.repo + '#' + j.number).padEnd(31)} ${j.status.padEnd(11)} ${String(j.attempts).padEnd(4)} ${(j.wallMs == null ? '' : Math.round(j.wallMs / 1000) + 's').padEnd(7)} ${(j.costUsd == null ? '' : '$' + j.costUsd.toFixed(3)).padEnd(8)} ${j.updatedAt} ${j.error ?? ''}`)].join('\n'));
+    store.close();
+    return 0;
+  }
+  if (command === 'job' && arg) {
+    const store = new Store(join(config.stateDir, 'falcon.sqlite3'));
+    const job = store.job(arg) ?? store.recentJobs(500).find((j) => j.id.startsWith(arg));
+    if (!job) { out('no such job'); store.close(); return 1; }
+    out(JSON.stringify({ job, usage: store.usageFor(job.id), events: store.eventsFor(job.id) }, null, 2));
     store.close();
     return 0;
   }

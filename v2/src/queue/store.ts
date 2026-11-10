@@ -29,8 +29,10 @@ create table if not exists reviews(
   id integer primary key, job_id text not null references jobs(id), github_review_id integer, check_run_id integer,
   event text not null, marker text not null, posted_at text not null);
 create table if not exists usage(
-  job_id text primary key references jobs(id), input_tokens integer, cached_input_tokens integer, output_tokens integer,
-  tool_calls integer, model_calls integer, wall_ms integer, model text);
+  job_id text primary key references jobs(id), repo text not null default '', input_tokens integer, cached_input_tokens integer,
+  cache_creation_tokens integer not null default 0, output_tokens integer, tool_calls integer, model_calls integer, wall_ms integer,
+  model text, cost_usd real, recorded_at text not null default '');
+create index if not exists usage_repo_time on usage(repo, recorded_at);
 create table if not exists lessons(
   id text primary key, repo text not null, path_prefix text not null default '', text text not null, source_finding_id text,
   confidence real not null, uses integer not null default 0, created_at text not null, last_used_at text, retired_at text);
@@ -173,9 +175,48 @@ export class Store {
       .run(jobId, review.githubReviewId, review.checkRunId, review.event, review.marker, now());
   }
 
-  recordUsage(jobId: string, model: string, usage: Usage): void {
-    this.db.prepare(`insert or replace into usage(job_id,input_tokens,cached_input_tokens,output_tokens,tool_calls,model_calls,wall_ms,model) values(?,?,?,?,?,?,?,?)`)
-      .run(jobId, usage.inputTokens, usage.cachedInputTokens, usage.outputTokens, usage.toolCalls, usage.modelCalls, usage.wallMs, model);
+  recordUsage(job: Pick<Job, 'id' | 'repo'>, model: string, usage: Usage): void {
+    this.db.prepare(`insert or replace into usage(job_id,repo,input_tokens,cached_input_tokens,cache_creation_tokens,output_tokens,tool_calls,model_calls,wall_ms,model,cost_usd,recorded_at)
+      values(?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(job.id, job.repo, usage.inputTokens, usage.cachedInputTokens, usage.cacheCreationTokens, usage.outputTokens, usage.toolCalls, usage.modelCalls, usage.wallMs, model, usage.estimatedCostUsd, now());
+  }
+
+  /** Estimated spend since a timestamp, for one repository or all. Unknown-price runs count as zero and are reported separately. */
+  spendSince(sinceIso: string, repo?: string): { usd: number; runs: number; unpriced: number } {
+    const row = (repo
+      ? this.db.prepare('select coalesce(sum(cost_usd),0) as usd, count(*) as runs, sum(cost_usd is null) as unpriced from usage where repo=? and recorded_at>=?').get(repo, sinceIso)
+      : this.db.prepare('select coalesce(sum(cost_usd),0) as usd, count(*) as runs, sum(cost_usd is null) as unpriced from usage where recorded_at>=?').get(sinceIso)) as { usd: number; runs: number; unpriced: number | null };
+    return { usd: row.usd, runs: row.runs, unpriced: row.unpriced ?? 0 };
+  }
+
+  usageFor(jobId: string): (Usage & { model: string; costUsd: number | null }) | null {
+    const r = this.db.prepare('select * from usage where job_id=?').get(jobId) as unknown as { input_tokens: number; cached_input_tokens: number; cache_creation_tokens: number; output_tokens: number; tool_calls: number; model_calls: number; wall_ms: number; model: string; cost_usd: number | null } | undefined;
+    return r ? { inputTokens: r.input_tokens, cachedInputTokens: r.cached_input_tokens, cacheCreationTokens: r.cache_creation_tokens, outputTokens: r.output_tokens, toolCalls: r.tool_calls, modelCalls: r.model_calls, wallMs: r.wall_ms, estimatedCostUsd: r.cost_usd, model: r.model, costUsd: r.cost_usd } : null;
+  }
+
+  /** Everything an operator wants to see about the queue, computed from the source of truth. */
+  snapshot(nowSec = Date.now() / 1000): QueueSnapshot {
+    const byStatus = Object.fromEntries((this.db.prepare('select status, count(*) as n from jobs group by status').all() as Array<{ status: string; n: number }>).map((r) => [r.status, r.n]));
+    const byRepo = (this.db.prepare(`select repo, sum(status='queued') as queued, sum(status='leased') as leased, sum(status='waiting_ci') as waiting_ci, sum(status='held') as held from jobs group by repo order by repo`).all() as unknown as QueueSnapshot['byRepo']);
+    const oldest = this.db.prepare(`select min(created_at) as created_at from jobs where status='queued' and ready_after<=?`).get(nowSec) as { created_at: string | null };
+    const leased = (this.db.prepare(`select id, repo, number, head_sha, lease_owner, lease_until, attempts, updated_at from jobs where status='leased' order by updated_at`).all() as unknown as Array<{ id: string; repo: string; number: number; head_sha: string; lease_owner: string; lease_until: number; attempts: number; updated_at: string }>)
+      .map((r) => ({ id: r.id, repo: r.repo, number: r.number, head: r.head_sha.slice(0, 12), owner: r.lease_owner, leaseExpiresInSec: Math.round(r.lease_until - nowSec), attempts: r.attempts, since: r.updated_at }));
+    const dayStart = new Date(); dayStart.setUTCHours(0, 0, 0, 0);
+    return {
+      at: new Date().toISOString(), byStatus, byRepo, leased,
+      oldestQueuedAgeSec: oldest.created_at ? Math.max(0, Math.round(nowSec - Date.parse(oldest.created_at) / 1000)) : 0,
+      spendTodayUsd: this.spendSince(dayStart.toISOString()).usd,
+    };
+  }
+
+  recentJobs(limit = 50): Array<Job & { costUsd: number | null; wallMs: number | null }> {
+    const rows = this.db.prepare(`select jobs.*, usage.cost_usd, usage.wall_ms from jobs left join usage on usage.job_id=jobs.id order by jobs.updated_at desc limit ?`).all(limit) as unknown as Array<Row & { cost_usd: number | null; wall_ms: number | null }>;
+    return rows.map((r) => ({ ...toJob(r), costUsd: r.cost_usd, wallMs: r.wall_ms }));
+  }
+
+  eventsFor(jobId: string, limit = 50): Array<{ at: string; kind: string; data: unknown }> {
+    return (this.db.prepare('select at, kind, data from events where job_id=? order by id desc limit ?').all(jobId, limit) as Array<{ at: string; kind: string; data: string | null }>)
+      .map((r) => ({ at: r.at, kind: r.kind, data: r.data ? JSON.parse(r.data) : null }));
   }
 
   addLesson(lesson: Omit<Lesson, 'id' | 'uses' | 'createdAt' | 'lastUsedAt' | 'retiredAt'>): Lesson {
@@ -208,6 +249,15 @@ export class Store {
     const rows = this.db.prepare('select status, count(*) as n from jobs group by status').all() as Array<{ status: string; n: number }>;
     return Object.fromEntries(rows.map((r) => [r.status, r.n]));
   }
+}
+
+export interface QueueSnapshot {
+  at: string;
+  byStatus: Record<string, number>;
+  byRepo: Array<{ repo: string; queued: number; leased: number; waiting_ci: number; held: number }>;
+  leased: Array<{ id: string; repo: string; number: number; head: string; owner: string; leaseExpiresInSec: number; attempts: number; since: string }>;
+  oldestQueuedAgeSec: number;
+  spendTodayUsd: number;
 }
 
 interface Row {

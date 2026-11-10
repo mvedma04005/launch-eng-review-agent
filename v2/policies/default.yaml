@@ -29,6 +29,9 @@ budgets:
   maxFileBytes: 400000
   maxToolCalls: 80
   maxMinutes: 25
+  maxInputTokens: 800000
+  maxOutputTokens: 60000
+  maxCostUsd: 6          # per review, estimated from list prices; the engine config clamps this
   inlineDiffBytes: 200000
 context:
   instructionFiles: [AGENTS.md, CLAUDE.md]

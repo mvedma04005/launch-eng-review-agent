@@ -3,6 +3,7 @@ import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
 import type { Anchors } from '../evidence/diff.ts';
 import type { Worktree } from '../evidence/git.ts';
 import type { PolicyPack } from '../policy/schema.ts';
+import { DEFAULT_PRICES, emptyUsage, estimateCostUsd, overBudget, type ModelPrice, type ReviewBudget } from '../pricing.ts';
 import type { Finding, Lesson, PullMeta, ReviewOutput, Usage } from '../types.ts';
 import { buildTools, type ToolState } from './tools.ts';
 import { systemPrompt, userTurn, type UserTurnInput } from './prompt.ts';
@@ -16,6 +17,9 @@ export interface ReviewerOptions {
   effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   serverSideFallback: boolean;
   policy: PolicyPack;
+  /** Effective per-review limits after the engine config clamps the policy budgets. */
+  budget: ReviewBudget & { maxMinutes: number; maxToolCalls: number };
+  prices?: Record<string, ModelPrice>;
   worktree: Worktree;
   anchors: Anchors;
   meta: PullMeta;
@@ -34,16 +38,19 @@ export interface Reviewer {
 export const claudeReviewer: Reviewer = {
   async review(opts) {
     const started = Date.now();
+    const prices = opts.prices ?? DEFAULT_PRICES;
     const state: ToolState = { calls: 0, accepted: null, rejectedSubmissions: 0 };
-    const tools = buildTools(opts.worktree, opts.anchors, opts.policy, { baseRead: opts.baseRead, changedFiles: opts.turn.changedFiles }, state);
+    const policy: PolicyPack = { ...opts.policy, budgets: { ...opts.policy.budgets, maxToolCalls: opts.budget.maxToolCalls } };
+    const tools = buildTools(opts.worktree, opts.anchors, policy, { baseRead: opts.baseRead, changedFiles: opts.turn.changedFiles }, state);
     const system = systemPrompt(opts.policy, opts.lessons);
     const user = userTurn({ ...opts.turn, meta: opts.meta, anchors: opts.anchors, inlineDiffBytes: opts.policy.budgets.inlineDiffBytes });
-    const usage: Usage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, toolCalls: 0, modelCalls: 0, wallMs: 0 };
-    const deadline = started + opts.policy.budgets.maxMinutes * 60_000;
+    const usage = emptyUsage();
+    const deadline = started + opts.budget.maxMinutes * 60_000;
     const controller = new AbortController();
+    let stopReason: string | null = null;
     const onAbort = () => controller.abort();
     opts.signal?.addEventListener('abort', onAbort, { once: true });
-    const timer = setTimeout(() => controller.abort(), Math.max(1000, deadline - Date.now()));
+    const timer = setTimeout(() => { stopReason = 'Review exceeded its time budget.'; controller.abort(); }, Math.max(1000, deadline - Date.now()));
     try {
       const messages: Anthropic.Beta.Messages.BetaMessageParam[] = [{ role: 'user', content: user }];
       for (let attempt = 0; attempt < 2 && !state.accepted; attempt++) {
@@ -53,29 +60,37 @@ export const claudeReviewer: Reviewer = {
           system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
           messages,
           tools,
-          max_iterations: opts.policy.budgets.maxToolCalls + 6,
+          max_iterations: opts.budget.maxToolCalls + 6,
           output_config: { effort: opts.effort },
-          // Server-side fallback: if a safety classifier declines the review on the primary model, the API re-runs it
-          // on a fallback model inside the same call instead of failing the review.
+          // Server-side fallback: if a safety classifier declines on the primary model, the API re-runs the call on
+          // a fallback model instead of failing the review.
           ...(opts.serverSideFallback ? { betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' as const } : {}),
         };
         const runner = opts.client.beta.messages.toolRunner(params, { signal: controller.signal });
         let last: Anthropic.Beta.Messages.BetaMessage | null = null;
         for await (const message of runner) {
           last = message;
-          usage.modelCalls++;
+          usage.modelCalls += 1;
           usage.inputTokens += message.usage.input_tokens;
           usage.cachedInputTokens += message.usage.cache_read_input_tokens ?? 0;
+          usage.cacheCreationTokens += message.usage.cache_creation_input_tokens ?? 0;
           usage.outputTokens += message.usage.output_tokens;
+          usage.estimatedCostUsd = estimateCostUsd(opts.model, usage, prices);
           if (message.stop_reason === 'refusal') throw new Incomplete('The model declined to review this change.');
+          const over = overBudget(usage, opts.budget);
+          if (over) { stopReason = `Review stopped: ${over}.`; controller.abort(); break; }
           if (state.accepted) break;
         }
+        if (stopReason) break;
         if (!state.accepted && last) {
-          messages.push({ role: 'assistant', content: last.content }, { role: 'user', content: 'You stopped without a successful submit_review call. Call submit_review now with your verified findings, or with an empty findings list and a summary if the change is sound.' });
+          messages.push(
+            { role: 'assistant', content: last.content },
+            { role: 'user', content: 'You stopped without a successful submit_review call. Call submit_review now with your verified findings, or with an empty findings list and a summary if the change is sound.' },
+          );
         }
       }
     } catch (error) {
-      if (controller.signal.aborted) throw new Incomplete(Date.now() >= deadline ? 'Review exceeded its time budget.' : 'Review was cancelled.');
+      if (controller.signal.aborted) throw new Incomplete(stopReason ?? 'Review was cancelled.');
       throw error;
     } finally {
       clearTimeout(timer);
@@ -83,6 +98,7 @@ export const claudeReviewer: Reviewer = {
       usage.toolCalls = state.calls;
       usage.wallMs = Date.now() - started;
     }
+    if (stopReason) throw new Incomplete(stopReason);
     if (!state.accepted) throw new Incomplete('The model did not produce a verifiable review.');
     const { submission, findings } = state.accepted;
     return {
@@ -91,7 +107,7 @@ export const claudeReviewer: Reviewer = {
     };
   },
 
-  /** Second, independent look at one finding with only the relevant source in view. Cuts false positives before anything blocks. */
+  /** Independent second look at one finding with only the relevant source in view. Cuts false positives before anything blocks. */
   async verify(client, model, finding, excerpt) {
     const response = await client.messages.parse({
       model,

@@ -70,7 +70,7 @@ const fakeReviewer = (findings: Array<{ path: string; line: number; evidence: st
         summary: 'Null user crashes handler.', reviewedFiles: opts.turn.changedFiles, lenses: opts.policy.lenses, questions: [],
         findings: findings.map((f, i) => ({ id: `f${i}`.padEnd(12, '0'), ruleId: f.ruleId, severity: f.severity, blocking: false, path: f.path, line: f.line, side: 'RIGHT' as const, title: `Finding ${i}`, scenario: 's', impact: 'i', evidence: f.evidence, fix: 'guard', fingerprint: `fp${i}` })),
       },
-      usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 5, toolCalls: 3, modelCalls: 1, wallMs: 10 },
+      usage: { inputTokens: 10, cachedInputTokens: 0, cacheCreationTokens: 0, outputTokens: 5, toolCalls: 3, modelCalls: 1, wallMs: 10, estimatedCostUsd: 0.0001 },
     };
   },
   async verify(_c, _m, finding) { return { real: finding.line === 2, confidence: 0.9, reason: finding.line === 2 ? 'confirmed' : 'line 1 is the signature' }; },
@@ -117,13 +117,13 @@ test('worker holds on failed CI, requeues on pending CI, and skips drafts withou
   const meta: PullMeta = { repo: 'acme/demo', number: 3, title: 't', body: '', author: 'ann', authorType: 'User', draft: false, state: 'open', merged: false, headSha, baseSha, baseRef: 'main', headRef: 'f', changedFiles: 1, additions: 1, deletions: 1, labels: [], htmlUrl: 'u', cloneUrl: origin };
   const reviewer: Reviewer = { review: async () => { throw new Error('model must not be called'); }, verify: async () => undefined };
   const auth = { mode: 'token' as const, octokitFor: async () => { throw new Error('unused'); }, gitTokenFor: async () => 'tok', botLogin: async () => null, installationIdFor: async () => null };
-  for (const [ci, draft, expected] of [['failure', false, 'held'], ['pending', false, 'waiting_ci'], ['success', true, 'skipped']] as const) {
+  for (const [ci, draft, expected] of [['failure', false, 'held'], ['pending', false, 'deferred'], ['success', true, 'skipped']] as const) {
     const github = new FakeGitHub({ ...meta, draft }, ci);
     const s = new Store(':memory:');
     const { job } = s.enqueue({ repo: 'acme/demo', number: 3, headSha, baseSha, baseRef: 'main', trigger: 'poll', receivedAt: 'now' });
     const outcome = await processJob({ config, store: s, auth, anthropic: {} as Anthropic, reviewer, log, dryRun: false, githubFor: async () => github }, s.claim('t', 60, { perRepo: 1, global: 1 })!, 't');
     assert.equal(outcome.status, expected, `ci=${ci} draft=${draft}`);
-    if (expected === 'waiting_ci') assert.equal(s.job(job.id)?.status, 'queued');
+    if (expected === 'deferred') assert.equal(s.job(job.id)?.status, 'queued');
   }
   store.close();
 });

@@ -31,6 +31,26 @@ export const ConfigSchema = z.object({
     perRepoConcurrency: z.number().int().min(1).default(4),
     leaseSeconds: z.number().int().min(60).default(900),
   }).prefault({}),
+  /** Hard ceilings the operator sets centrally. Repository policy budgets are clamped to these. */
+  limits: z.object({
+    perReview: z.object({
+      maxInputTokens: z.number().int().min(10_000).default(1_500_000),
+      maxOutputTokens: z.number().int().min(1_000).default(150_000),
+      maxCostUsd: z.number().min(0.1).default(15),
+      maxMinutes: z.number().int().min(1).default(30),
+      maxToolCalls: z.number().int().min(5).default(120),
+    }).prefault({}),
+    /** UTC-day spend caps. When reached, new reviews defer to the next day instead of failing. */
+    daily: z.object({
+      perRepoUsd: z.number().min(0).default(200),
+      globalUsd: z.number().min(0).default(1000),
+    }).prefault({}),
+  }).prefault({}),
+  /** Status and metrics HTTP server. Port 0 disables it. Binds to localhost unless host is set. */
+  http: z.object({
+    port: z.number().int().min(0).default(0),
+    host: z.string().default('127.0.0.1'),
+  }).prefault({}),
   policy: z.object({
     /** Engine-wide pack applied before repository packs. */
     defaultPack: z.string().default('policies/default.yaml'),

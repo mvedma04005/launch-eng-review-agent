@@ -74,12 +74,16 @@ export interface ReviewOutput {
 export type Verdict = 'approve' | 'request_changes' | 'comment';
 
 export interface Usage {
+  /** Uncached input tokens. */
   inputTokens: number;
   cachedInputTokens: number;
+  cacheCreationTokens: number;
   outputTokens: number;
   toolCalls: number;
   modelCalls: number;
   wallMs: number;
+  /** Null when the model has no price entry. */
+  estimatedCostUsd: number | null;
 }
 
 export type JobStatus =
