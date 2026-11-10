@@ -56,7 +56,8 @@ class FakeGitHub implements GitHubPort {
   async pull() { return this.meta; }
   async ci() { return this.ciState; }
   async ownReviews() { return this.existing; }
-  async approvers(_r: string, _n: number, headSha: string) { return this.approversByHead.get(headSha) ?? []; }
+  approversError: Error | null = null;
+  async approvers(_r: string, _n: number, headSha: string) { if (this.approversError) throw this.approversError; return this.approversByHead.get(headSha) ?? []; }
   async postReview(_r: string, _n: number, _h: string, review: Publishable) {
     if (this.failPostsRemaining > 0) { this.failPostsRemaining--; const e = new Error('bad gateway') as Error & { status: number }; e.status = 502; throw e; }
     this.posted.push(review);
@@ -438,4 +439,24 @@ test('a refusal notice is posted before the job returns, and says how to re-run'
   assert.equal(outcome.status, 'skipped');
   assert.equal(github.checks.at(-1)?.conclusion, 'action_required', 'the check is recorded before processJob resolves');
   assert.match(outcome.reason ?? '', /post its link in the review space again to re-run Falcon/);
+});
+
+test('approve mode: if approvals cannot be read the job fails and nothing is approved', async () => {
+  const f = approveFixture();
+  const github = new FakeGitHub(meta(f.origin, f.headSha, f.baseSha));
+  github.approversError = Object.assign(new Error('forbidden'), { status: 403 });
+  const { store, job } = await runJob(f, github, scriptedReviewer());
+  assert.equal(store.job(job.id)?.status, 'failed');
+  assert.equal(github.posted.length, 0);
+  assert.deepEqual(github.checks.map((c) => `${c.status}:${c.conclusion}:${c.title}`), ['completed:neutral:Review failed']);
+});
+
+test('approve mode: a dry run renders the approval and posts nothing', async () => {
+  const f = approveFixture();
+  const github = new FakeGitHub(meta(f.origin, f.headSha, f.baseSha));
+  const { outcome } = await runJob(f, github, scriptedReviewer(), true);
+  assert.equal(outcome.status, 'dry_run');
+  assert.equal(outcome.rendered?.event, 'APPROVE');
+  assert.equal(github.posted.length, 0);
+  assert.equal(github.checks.length, 0);
 });
