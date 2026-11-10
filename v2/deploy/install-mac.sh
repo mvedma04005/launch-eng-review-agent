@@ -25,11 +25,11 @@ chmod 600 "$CONF_DIR/env"
 [ -f "$CONF_DIR/falcon.yaml" ] || cat > "$CONF_DIR/falcon.yaml" <<YAML
 stateDir: $STATE
 github:
-  appId: 0            # the Falcon GitHub App id
+  # appId: 123456     # the Falcon GitHub App id; uncomment once the App exists (0 fails config validation)
   repos: [ROKT/launch-engineering]   # the allowlist; nothing else is ever reviewed
   pollSeconds: 30
 chat:
-  enabled: true
+  enabled: false      # set true once FALCON_GOOGLE_SERVICE_ACCOUNT_JSON, the space and Pub/Sub are filled in
   spaces: [spaces/REPLACE_ME]
   pubsub: { project: REPLACE_ME, subscription: falcon-chat-pull }
   pollSeconds: 5

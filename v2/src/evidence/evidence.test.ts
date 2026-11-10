@@ -51,7 +51,7 @@ test('mirror + worktree: fetch, merge base, diff, confined reads, grep, and host
   const baseSha = git(origin, 'rev-parse', 'HEAD');
   git(origin, 'checkout', '-q', '-b', 'feature');
   writeFileSync(join(origin, 'handler.py'), 'import os\nreturn user.name\nlog(user)\ndone\n');
-  symlinkSync('/etc/hostname', join(origin, 'escape'));
+  symlinkSync('/etc/hosts', join(origin, 'escape')); // exists on macOS and Linux; /etc/hostname is Linux-only
   git(origin, 'add', '.'); git(origin, 'commit', '-q', '-m', 'change');
   const headSha = git(origin, 'rev-parse', 'HEAD');
   // Simulate GitHub's refs/pull/N/head.
