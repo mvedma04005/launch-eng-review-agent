@@ -74,6 +74,8 @@ test('mirror + worktree: fetch, merge base, diff, confined reads, grep, and host
   const mirror = new Mirror(join(root, 'state'), 'acme/demo', origin);
   await mirror.fetchPull(7, headSha, 'main', baseSha);
   assert.equal(await mirror.mergeBase(baseSha, headSha), baseSha);
+  assert.equal(git(mirror.path, 'rev-parse', 'refs/falcon/pull/7/base'), baseSha, 'the base is fetched into a ref owned by this PR');
+  assert.throws(() => git(mirror.path, 'rev-parse', '--verify', '--quiet', 'refs/falcon/base/main'), 'no ref is shared between PRs');
   const anchors = await mirror.diff(baseSha, headSha);
   assert.deepEqual(anchors.files.map((f) => f.path).sort(), ['escape', 'handler.py']);
   const wt = await mirror.worktree(headSha, join(root, 'wt', 'job1'));

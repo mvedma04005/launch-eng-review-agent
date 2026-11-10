@@ -63,7 +63,9 @@ export class Mirror {
     checkSha(headSha); checkSha(baseSha);
     if (!/^[\w./-]+$/.test(baseRef)) throw new Error('Unsupported base ref name.');
     await this.ensure();
-    await git(['fetch', '--quiet', '--no-tags', 'origin', `+refs/pull/${number}/head:refs/falcon/pull/${number}/head`, `+refs/heads/${baseRef}:refs/falcon/base/${baseRef}`], this.path, await this.authEnv());
+    // Both refs are per pull request. A base ref shared by every PR on the same branch made parallel fetches
+    // fail with "cannot lock ref".
+    await git(['fetch', '--quiet', '--no-tags', 'origin', `+refs/pull/${number}/head:refs/falcon/pull/${number}/head`, `+refs/heads/${baseRef}:refs/falcon/pull/${number}/base`], this.path, await this.authEnv());
     for (const sha of [headSha, baseSha]) {
       await git(['cat-file', '-e', `${sha}^{commit}`], this.path).catch(() => { throw new Error(`Commit ${sha} is not reachable after fetch; the PR may have moved.`); });
     }
