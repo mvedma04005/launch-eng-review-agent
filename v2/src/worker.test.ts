@@ -208,3 +208,35 @@ test('an oversized PR is refused and the check blocks; dry run posts nothing', a
   assert.equal(live.github.checks.at(-1)?.conclusion, 'action_required');
   assert.equal((await run(true)).github.checks.length, 0);
 });
+
+test('an outsider without a plan is refused; a team member is not; the base branch list governs', async () => {
+  const { root, origin, baseSha: fixtureBase } = fixture();
+  git(origin, 'checkout', '-q', '-b', 'gate', fixtureBase);
+  writeFileSync(join(origin, '.falcon', 'policy.yaml'), 'version: 1\nname: repo\nverdict: { mode: request_changes }\nteam: { members: [lee] }\noutsiders: { requirePlan: true }\n');
+  git(origin, 'commit', '-qam', 'team');
+  const baseSha = git(origin, 'rev-parse', 'HEAD');
+  writeFileSync(join(origin, 'svc.py'), 'def handler(user):\n    return user.name\n');
+  git(origin, 'commit', '-qam', 'change');
+  const headSha = git(origin, 'rev-parse', 'HEAD');
+  git(origin, 'checkout', '-q', '-b', 'self', headSha);
+  writeFileSync(join(origin, '.falcon', 'policy.yaml'), 'version: 1\nname: repo\nverdict: { mode: request_changes }\nteam: { members: [lee, eve] }\noutsiders: { requirePlan: true }\n');
+  git(origin, 'commit', '-qam', 'promote eve');
+  const selfSha = git(origin, 'rev-parse', 'HEAD');
+  git(origin, 'update-ref', 'refs/pull/3/head', headSha);
+
+  const run = async (author: string, sha = headSha, dryRun = false) => {
+    const store = new Store(':memory:');
+    const github = new FakeGitHub(meta(origin, sha, baseSha, { author, body: '' }));
+    const ctx: WorkerContext = { config: configFor(root), store, auth, anthropic: {} as Anthropic, reviewer: fakeReviewer([], { n: 0 }), log, dryRun, githubFor: async () => github };
+    store.enqueue({ repo: 'acme/demo', number: 3, headSha: sha, baseSha, baseRef: 'main', trigger: 'manual', receivedAt: 'now' });
+    return { github, outcome: await processJob(ctx, store.claim('t', 60, { perRepo: 1, global: 1 })!, 't') };
+  };
+  const eve = await run('eve');
+  assert.equal(eve.outcome.status, 'skipped');
+  assert.match(eve.outcome.reason ?? '', /Add these sections to the description: ## Problem, ## Plan/);
+  assert.equal(eve.github.checks.at(-1)?.conclusion, 'action_required');
+  assert.equal((await run('eve', headSha, true)).github.checks.length, 0);
+  assert.notEqual((await run('lee')).outcome.status, 'skipped');
+  git(origin, 'update-ref', 'refs/pull/3/head', selfSha);
+  assert.equal((await run('eve', selfSha)).outcome.status, 'skipped');
+});

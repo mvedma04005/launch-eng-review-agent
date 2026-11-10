@@ -8,7 +8,8 @@ import { Mirror } from './evidence/git.ts';
 import type { GitHubAuth } from './ingress/github.ts';
 import type { Logger } from './log.ts';
 import { metrics } from './metrics.ts';
-import { applyPolicy, inScope, loadPolicyFile, mergePolicies, parsePolicy } from './policy/load.ts';
+import { applyPolicy, inScope, isTeamMember, loadPolicyFile, mergePolicies, parsePolicy } from './policy/load.ts';
+import { missingPlanSections } from './policy/plan.ts';
 import type { PolicyPack } from './policy/schema.ts';
 import { OctokitGitHub, type GitHubPort } from './publisher/github.ts';
 import { boundBytes, LIMITS, redactorFromEnv, type Redactor } from './publisher/redact.ts';
@@ -150,6 +151,10 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     const policy = await loadPolicyFor(ctx, job.repo, trustedRead);
     checksEnabled = policy.verdict.checkRun;
     const policyChangedInPr = anchors.files.some((f) => f.path === ctx.config.policy.repoPath || f.oldPath === ctx.config.policy.repoPath);
+    if (policy.outsiders.requirePlan && !isTeamMember(policy, meta.author)) {
+      const missing = missingPlanSections(meta.body, policy.outsiders.planHeadings);
+      if (missing.length) return done('skipped', `This PR needs a short write-up before review. Add these sections to the description: ${missing.map((h) => `## ${h}`).join(', ')}. Say what problem this solves and how the change solves it, in a few sentences each.`, 'block');
+    }
     const budget = effectiveBudget(ctx.config, policy);
     const changed = anchors.files.filter((f) => f.status !== 'removed').map((f) => f.path);
     const excluded = changed.filter((p) => !inScope(policy, p));
