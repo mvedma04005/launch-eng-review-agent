@@ -31,7 +31,7 @@ function fixture(pulls: Pull[], over: Partial<GateDeps> = {}, files: Record<stri
     fileAtRef: async (_repo, ref, path) => (ref === 'main' ? files[path] ?? null : null),
     postGate: async (_repo, sha, passed, title) => { posts.push({ sha, passed, title }); },
   };
-  const deps: GateDeps = { github, store: { cursor: (k) => cursors.get(k) ?? null, setCursor: (k, v) => { cursors.set(k, v); } }, log, teamOwner: '@acme/team', falcon: FALCON, repoPack: '.falcon/policy.yaml', dryRun: false, ...over };
+  const deps: GateDeps = { github, store: { cursor: (k) => cursors.get(k) ?? null, setCursor: (k, v) => { cursors.set(k, v); } }, log, teamOwner: '@acme/team', falcon: FALCON, repoPack: '.falcon/policy.yaml', requested: new Set(pulls.map((p) => p.number)), dryRun: false, ...over };
   return { deps, posts, cursors, files, hooks };
 }
 
@@ -161,4 +161,16 @@ test('every open PR is judged again after half an hour, so a silent change is st
   assert.equal(await sweepGate(f.deps, REPO, T0 + MINUTE), 0);
   assert.equal(await sweepGate(f.deps, REPO, T0 + 31 * MINUTE), 1);
   assert.deepEqual(f.posts.at(-1), { sha: 'sha1', passed: false, title: 'Waiting for an owner or Falcon to approve' });
+});
+
+test('only PRs requested in Chat get a check, and a request for an old PR is picked up on the next pass', async () => {
+  const f = fixture([pull(1, { approvers: ['lee'] }), pull(2, { approvers: ['lee'] })], { requested: new Set([2]) });
+  assert.equal(await sweepGate(f.deps, REPO, T0), 1);
+  assert.deepEqual(f.posts.map((p) => p.sha), ['sha2']);
+  // PR 1 is requested later. Its update time is older than the cursor, and the half-hour pass is not due.
+  assert.equal(await sweepGate({ ...f.deps, requested: new Set([1, 2]) }, REPO, T0 + MINUTE), 1);
+  assert.deepEqual(f.posts.map((p) => p.sha), ['sha2', 'sha1']);
+  const none = fixture([pull(1, { approvers: ['lee'] })], { requested: new Set() });
+  assert.equal(await sweepGate(none.deps, REPO, T0), 0);
+  assert.deepEqual(none.posts, []);
 });

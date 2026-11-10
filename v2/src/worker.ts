@@ -112,6 +112,9 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
   let checksEnabled = false;
   try {
     if (!isAllowedRepo(ctx.config, job.repo)) return await done('skipped', `${job.repo} is not in the repository allowlist (${ctx.config.github.repos.join(', ')}).`);
+    if (ctx.config.github.pollSeconds === 0 && job.trigger === 'poll' && !ctx.store.chatRequestsForJob(job.id).length) {
+      return await done('skipped', 'Automatic reviews are off. Post the PR link in the review space to request one.');
+    }
     const meta = await github.pull(job.repo, job.number);
     if (meta.state !== 'open' || meta.merged) return await done('skipped', 'PR is closed or merged.');
     if (meta.draft) return await done('skipped', 'PR is a draft; it will be reviewed when marked ready.');

@@ -199,11 +199,11 @@ export async function resolvePendingChatRequests(ctx: IntakeContext, pull: (repo
         continue;
       }
       if (!created && ['held', 'failed', 'cancelled', 'skipped'].includes(job.status)) {
-        if (store.chatRoundsForPr(req.repo, req.number) >= config.chat.maxRoundsPerPr) { refuse(`this PR has used its ${config.chat.maxRoundsPerPr} manual review rounds. Push a new commit for an automatic review.`); continue; }
+        if (store.chatRoundsForPr(req.repo, req.number) >= config.chat.maxRoundsPerPr) { refuse(`this PR has used its ${config.chat.maxRoundsPerPr} manual review rounds.${config.github.pollSeconds > 0 ? ' Push a new commit for an automatic review.' : ' Ask a team member to review it.'}`); continue; }
         store.requeue(job.id, 0, `chat ${req.command} by ${req.sender}`);
       } else if (created && store.chatRoundsForPr(req.repo, req.number) >= config.chat.maxRoundsPerPr) {
         store.finish(job.id, 'cancelled', { error: 'manual rounds exhausted' });
-        refuse(`this PR has used its ${config.chat.maxRoundsPerPr} manual review rounds. Push a new commit for an automatic review.`);
+        refuse(`this PR has used its ${config.chat.maxRoundsPerPr} manual review rounds.${config.github.pollSeconds > 0 ? ' Push a new commit for an automatic review.' : ' Ask a team member to review it.'}`);
         continue;
       }
       store.setChatRequest(req.id, { status: 'queued', jobId: job.id });

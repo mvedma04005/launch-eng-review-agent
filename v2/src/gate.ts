@@ -30,6 +30,8 @@ export interface GateDeps {
   falcon: string | null;
   /** Path of the repository's policy pack, which holds the team list. */
   repoPack: string;
+  /** The PRs requested in Chat. The gate judges no others. */
+  requested: Set<number>;
   dryRun: boolean;
 }
 
@@ -62,13 +64,14 @@ async function readPull(github: GatePort, repo: string, number: number, author: 
 }
 
 /**
- * One pass over the open PRs into the default branch. It judges the ones that changed since the last pass, and
+ * One pass over the open PRs into the default branch that were requested in Chat. It judges the ones that changed since the last pass, and
  * all of them when the rules changed or half an hour has gone by, and posts the check when the decision differs
  * from the last one posted. Returns the number of checks posted.
  */
 export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()): Promise<number> {
   const { github, store, log } = deps;
-  const open = (await github.openPulls(repo)).filter((p) => p.baseRef === p.defaultBranch);
+  if (!deps.requested.size) return 0;
+  const open = (await github.openPulls(repo)).filter((p) => p.baseRef === p.defaultBranch && deps.requested.has(p.number));
   if (!open.length) return 0;
   // Owners and the team list come from the default branch, never from the PR being judged.
   const branch = open[0]!.defaultBranch;
@@ -93,7 +96,8 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   const cursorKey = `gate:${repo}`;
   const since = full ? '' : store.cursor(cursorKey) ?? '';
   // `>=`: a review can land in the same second as the newest PR already seen.
-  const pulls = open.filter((p) => p.updatedAt >= since);
+  // A request in Chat does not move a PR's update time, so a PR never judged before is always judged.
+  const pulls = open.filter((p) => p.updatedAt >= since || store.cursor(`gate:${repo}#${p.number}`) === null);
 
   let posted = 0;
   let failed = false;

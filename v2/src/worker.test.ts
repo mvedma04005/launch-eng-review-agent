@@ -485,3 +485,29 @@ test('approve mode: a dry run renders the approval and posts nothing', async () 
   assert.equal(github.posted.length, 0);
   assert.equal(github.checks.length, 0);
 });
+
+test('with the poll off, a job the poll queued earlier runs only once someone asks for it in Chat', async () => {
+  const f = approveFixture();
+  const github = new FakeGitHub(meta(f.origin, f.headSha, f.baseSha));
+  const store = new Store(':memory:');
+  const config = ConfigSchema.parse({ stateDir: join(f.root, 'state'), github: { repos: ['acme/demo'], pollSeconds: 0 }, policy: { defaultPack: new URL('../policies/default.yaml', import.meta.url).pathname } });
+  const ctx: WorkerContext = { config, store, auth, anthropic: {} as Anthropic, reviewer: scriptedReviewer(), log, dryRun: false, githubFor: async () => github };
+  const { job } = store.enqueue({ repo: 'acme/demo', number: 3, headSha: f.headSha, baseSha: f.baseSha, baseRef: 'main', trigger: 'poll', receivedAt: 'now' });
+  const skipped = await processJob(ctx, store.claim('t', 60, { perRepo: 1, global: 1 })!, 't');
+  assert.equal(skipped.status, 'skipped');
+  assert.match(skipped.reason ?? '', /Automatic reviews are off/);
+  assert.equal(github.posted.length, 0);
+
+  const request = store.addChatRequest({ messageName: 'spaces/A/messages/m1#acme/demo/3', space: 'spaces/A', thread: 'spaces/A/threads/t', sender: 'users/1', senderEmail: null, repo: 'acme/demo', number: 3, command: 'review' })!;
+  store.requeue(job.id, 0, 'chat review');
+  store.setChatRequest(request.id, { status: 'queued', jobId: job.id });
+  assert.deepEqual([...store.chatRequestedPulls('acme/demo')], [3]);
+  const reviewed = await processJob(ctx, store.claim('t', 60, { perRepo: 1, global: 1 })!, 't');
+  assert.equal(reviewed.status, 'published', reviewed.reason);
+  assert.equal(github.posted[0]?.event, 'APPROVE');
+});
+
+test('github.pollSeconds is 0 for off or at least 10', () => {
+  assert.equal(ConfigSchema.parse({ github: { pollSeconds: 0 } }).github.pollSeconds, 0);
+  assert.throws(() => ConfigSchema.parse({ github: { pollSeconds: 5 } }), /must be 0 \(off\) or at least 10/);
+});

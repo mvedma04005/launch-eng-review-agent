@@ -214,6 +214,11 @@ export class Store {
   }
 
   /** Manual Chat rounds already spent on a PR, across threads and heads. */
+  /** The PRs of a repository that someone has requested in Chat, whatever became of the request. */
+  chatRequestedPulls(repo: string): Set<number> {
+    return new Set((this.db.prepare('select distinct number from chat_requests where repo=?').all(repo) as Array<{ number: number }>).map((r) => r.number));
+  }
+
   chatRoundsForPr(repo: string, number: number): number {
     return (this.db.prepare(`select count(distinct coalesce(job_id, id)) as n from chat_requests where repo=? and number=? and status in ('queued','delivered')`).get(repo, number) as { n: number }).n;
   }

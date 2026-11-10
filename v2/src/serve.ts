@@ -39,17 +39,19 @@ export async function serve(config: Config, signal: AbortSignal): Promise<void> 
   })());
 
   // GitHub: automatic intake of open PRs in the allowlisted repositories.
-  every(config.github.pollSeconds * 1000, 'github_poll', async () => {
-    for (const repo of config.github.repos) await pollRepository(ctx.auth, store, repo, log, config);
-  });
+  if (config.github.pollSeconds > 0) {
+    every(config.github.pollSeconds * 1000, 'github_poll', async () => {
+      for (const repo of config.github.repos) await pollRepository(ctx.auth, store, repo, log, config);
+    });
+  } else log.info('github.pollSeconds is 0: only PRs requested in Chat are reviewed');
 
   // Merge gate: re-read the open PRs whose approvals changed and post the second check.
   if (config.gate.enabled) {
     if (!config.gate.teamOwner) throw new Error('gate.enabled requires gate.teamOwner, the CODEOWNERS entry Falcon stands in for');
-    every(config.github.pollSeconds * 1000, 'gate_sweep', async () => {
+    every(config.gate.pollSeconds * 1000, 'gate_sweep', async () => {
       for (const repo of config.github.repos) {
         const github = new OctokitGitHub(await ctx.auth.octokitFor(repo), await ctx.auth.botLogin());
-        await sweepGate({ github, store, log, teamOwner: config.gate.teamOwner, falcon: await ctx.auth.botLogin(), repoPack: config.policy.repoPath, dryRun: config.dryRun }, repo);
+        await sweepGate({ github, store, log, teamOwner: config.gate.teamOwner, falcon: await ctx.auth.botLogin(), repoPack: config.policy.repoPath, requested: store.chatRequestedPulls(repo), dryRun: config.dryRun }, repo);
       }
     });
   }

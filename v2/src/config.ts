@@ -16,7 +16,8 @@ export const ConfigSchema = z.object({
     tokenEnv: z.string().default('GITHUB_TOKEN'),
     /** THE repository allowlist. Every intake path, the queue and the worker refuse anything else. */
     repos: z.array(z.string().regex(/^[\w.-]+\/[\w.-]+$/)).min(1).default(['ROKT/launch-engineering']),
-    pollSeconds: z.number().int().min(10).default(30),
+    /** Seconds between looks at GitHub for changed PRs. 0 turns this off: only PRs requested in Chat are reviewed. */
+    pollSeconds: z.number().int().refine((n) => n === 0 || n >= 10, 'must be 0 (off) or at least 10').default(30),
     webhookPort: z.number().int().min(0).default(0),
   }).prefault({}),
   /** Google Chat as the request channel: a Chat app identity, events over Pub/Sub, replies through a durable outbox. */
@@ -89,6 +90,8 @@ export const ConfigSchema = z.object({
     enabled: z.boolean().default(false),
     /** The CODEOWNERS entry Falcon stands in for, e.g. `@ROKT/launch-engineering`. Required when enabled. */
     teamOwner: z.string().default(''),
+    /** Seconds between passes over the PRs requested in Chat. */
+    pollSeconds: z.number().int().min(10).default(30),
   }).prefault({}),
   notify: z.object({
     webhookUrlEnv: z.string().default('FALCON_NOTIFY_WEBHOOK'),
