@@ -308,7 +308,8 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     if (tell === 'block') await notice('action_required', 'Changes needed', reason);
     else if (tell === 'pass') await notice('success', 'Overridden', reason);
     else if (tell) await notice('neutral', status === 'held' ? 'Review held' : 'Review not performed', reason);
-    if (tell || status === 'held') ctx.notify?.(job, { status, reason });
+    // Whoever asked for this PR in Chat hears every outcome, a quiet skip included. With no request there is nobody to tell.
+    ctx.notify?.(job, { status, reason });
     return { status, reason };
   }
 

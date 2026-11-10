@@ -571,3 +571,16 @@ test('the rules in force are the default branch tip, not the commit the PR start
   assert.equal(outcome.status, 'published', outcome.reason);
   assert.equal(github.posted[0]?.event, 'APPROVE');
 });
+
+test('a skip is reported to whoever asked: a moved head is never met with silence', async () => {
+  const f = approveFixture();
+  const github = new FakeGitHub(meta(f.origin, 'f'.repeat(40), f.baseSha)); // GitHub says the head is already another commit.
+  const store = new Store(':memory:');
+  const told: Array<{ status: string; reason?: string }> = [];
+  const ctx: WorkerContext = { config: configFor(f.root), store, auth, anthropic: {} as Anthropic, reviewer: scriptedReviewer(), log, dryRun: false, githubFor: async () => github, notify: (_job, outcome) => { told.push(outcome); } };
+  store.enqueue({ repo: 'acme/demo', number: 3, headSha: f.headSha, baseSha: f.baseSha, baseRef: 'main', trigger: 'comment', receivedAt: 'now' });
+  const outcome = await processJob(ctx, store.claim('t', 60, { perRepo: 1, global: 1 })!, 't');
+  assert.equal(outcome.status, 'skipped');
+  assert.equal(told.length, 1);
+  assert.match(told[0]!.reason ?? '', /Head moved to ffffffffffff/);
+});
