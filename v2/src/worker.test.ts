@@ -49,6 +49,8 @@ class FakeGitHub implements GitHubPort {
   meta: PullMeta;
   ciState: 'none' | 'pending' | 'success' | 'failure';
   existing: Array<{ id: number; htmlUrl: string }> = [];
+  /** Delay before a completed check run is recorded, like a slow GitHub API. */
+  checkDelayMs = 0;
   private nextCheckId = 500;
   constructor(meta: PullMeta, ciState: 'none' | 'pending' | 'success' | 'failure' = 'success') { this.meta = meta; this.ciState = ciState; }
   async pull() { return this.meta; }
@@ -61,7 +63,7 @@ class FakeGitHub implements GitHubPort {
     return { id: 1, htmlUrl: 'https://example.test/review/1', inlineDropped: false, commentIds: new Map(review.comments.map((c, i) => [c.findingId, 100 + i])) };
   }
   async startCheckRun() { const id = this.nextCheckId++; this.checks.push({ status: 'in_progress', id }); return id; }
-  async completeCheckRun(_r: string, _h: string, id: number | null, conclusion: CheckConclusion, title: string) { this.checks.push({ status: 'completed', conclusion, title, id }); return id ?? this.nextCheckId++; }
+  async completeCheckRun(_r: string, _h: string, id: number | null, conclusion: CheckConclusion, title: string) { if (this.checkDelayMs) await new Promise((r) => setTimeout(r, this.checkDelayMs)); this.checks.push({ status: 'completed', conclusion, title, id }); return id ?? this.nextCheckId++; }
   async fileAtRef() { return null; }
 }
 
@@ -237,7 +239,7 @@ test('an outsider without a plan is refused; a team member is not; the base bran
   };
   const eve = await run('eve');
   assert.equal(eve.outcome.status, 'skipped');
-  assert.match(eve.outcome.reason ?? '', /Add these sections to the description: ## Problem, ## Plan/);
+  assert.match(eve.outcome.reason ?? '', /Add or fill in these sections in the description: ## Problem, ## Plan\..*post its link in the review space again/);
   assert.equal(eve.github.checks.at(-1)?.conclusion, 'action_required');
   assert.equal((await run('eve', headSha, true)).github.checks.length, 0);
   assert.notEqual((await run('lee')).outcome.status, 'skipped');
@@ -426,4 +428,14 @@ test('approve mode: a PR that edits the policy pack only comments and asks for a
   assert.equal(github.posted[0]?.event, 'COMMENT');
   assert.match(github.posted[0]!.body, /a human must review policy changes/);
   assert.equal(github.checks.at(-1)?.conclusion, 'neutral');
+});
+
+test('a refusal notice is posted before the job returns, and says how to re-run', async () => {
+  const f = approveFixture('version: 1\nname: repo\nverdict: { mode: approve }\nteam: { members: [lee] }\noutsiders: { requirePlan: true }\n');
+  const github = new FakeGitHub(meta(f.origin, f.headSha, f.baseSha, { author: 'eve', body: '## Problem\nshort\n' }));
+  github.checkDelayMs = 400; // longer than the worktree cleanup that runs before processJob returns
+  const { outcome } = await runJob(f, github, scriptedReviewer());
+  assert.equal(outcome.status, 'skipped');
+  assert.equal(github.checks.at(-1)?.conclusion, 'action_required', 'the check is recorded before processJob resolves');
+  assert.match(outcome.reason ?? '', /post its link in the review space again to re-run Falcon/);
 });

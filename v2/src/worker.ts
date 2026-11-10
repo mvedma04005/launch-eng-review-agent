@@ -19,6 +19,8 @@ import { Incomplete, type Reviewer } from './reviewer/claude.ts';
 import type { Finding, Job, PendingPublication, PullMeta, ReviewOutput, Usage } from './types.ts';
 
 const PACKAGE_ROOT = fileURLToPath(new URL('..', import.meta.url));
+// shortcut: a refused PR is not requeued on its own; re-run is manual until requeue-on-poll has a loop-safe design.
+const RERUN = 'After updating the PR, post its link in the review space again to re-run Falcon.';
 
 export interface WorkerContext {
   config: Config;
@@ -116,7 +118,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     if (meta.authorType === 'Bot') return done('skipped', 'Bot-authored PR.');
 
     const existing = await github.ownReviews(job.repo, job.number, job.headSha);
-    if (existing.length) return { ...done('skipped', 'Already reviewed at this head.'), reviewUrl: existing[0]!.htmlUrl };
+    if (existing.length) return { ...(await done('skipped', 'Already reviewed at this head.')), reviewUrl: existing[0]!.htmlUrl };
 
     // A finished review that failed to publish is replayed without another model run.
     const pending = ctx.store.pending(job);
@@ -158,7 +160,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     const override = overrideBy(policy, meta.author, await github.approvers(job.repo, job.number, job.headSha));
     if (!override && policy.outsiders.requirePlan && !isTeamMember(policy, meta.author)) {
       const missing = missingPlanSections(meta.body, policy.outsiders.planHeadings);
-      if (missing.length) return done('skipped', `This PR needs a short write-up before review. Add these sections to the description: ${missing.map((h) => `## ${h}`).join(', ')}. Say what problem this solves and how the change solves it, in a few sentences each.`, 'block');
+      if (missing.length) return done('skipped', `This PR needs a short write-up before review. Add or fill in these sections in the description: ${missing.map((h) => `## ${h}`).join(', ')}. Say what problem this solves and how the change solves it, in a few sentences each. ${RERUN}`, 'block');
     }
     const budget = effectiveBudget(ctx.config, policy);
     // Deleted files are part of the change: their lines count toward the size limit and the reviewer sees them.
@@ -169,7 +171,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     if (inScopeFiles.length > policy.budgets.maxChangedFiles) return done('held', `${inScopeFiles.length} changed files exceeds the policy budget of ${policy.budgets.maxChangedFiles}.`, true);
     const changedLines = anchors.files.filter((f) => inScopeFiles.includes(f.path)).reduce((n, f) => n + f.additions + f.deletions, 0);
     if (changedLines > policy.budgets.maxChangedLines && override) return done('skipped', `${changedLines} changed lines is over the limit of ${policy.budgets.maxChangedLines}; overridden by @${override}, not reviewed.`, 'pass');
-    if (changedLines > policy.budgets.maxChangedLines) return done('skipped', `${changedLines} changed lines exceeds the policy budget of ${policy.budgets.maxChangedLines}. Split the PR into smaller, focused PRs so the review can assess the changes and their interactions reliably.`, 'block');
+    if (changedLines > policy.budgets.maxChangedLines) return done('skipped', `${changedLines} changed lines exceeds the policy budget of ${policy.budgets.maxChangedLines}. Split the PR into smaller, focused PRs so the review can assess the changes and their interactions reliably. ${RERUN}`, 'block');
     const instructionDocs = await collectInstructionDocs(trustedRead, inScopeFiles, policy);
     const requiredDocs: Array<{ path: string; text: string }> = [];
     for (const p of policy.context.required) {
@@ -283,16 +285,17 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     catch (error) { log.warn({ err: error }, 'could not post check-run notice'); }
   }
 
-  function done(status: 'skipped' | 'held', reason: string, tell: boolean | 'block' | 'pass' = false): JobOutcome {
+  // Awaits its check-run notice: `run-job` exits as soon as processJob returns, which would drop a pending notice.
+  async function done(status: 'skipped' | 'held', reason: string, tell: boolean | 'block' | 'pass' = false): Promise<JobOutcome> {
     // Recorded in dry run too: an unrecorded skip left the job leased, so it was retried and then marked failed.
     ctx.store.finish(job.id, status, { error: reason });
     if (!ctx.dryRun || status === 'held') {
       metrics.jobsFinished.inc({ repo: job.repo, outcome: status });
     }
     log.info({ status, reason }, 'job finished');
-    if (tell === 'block') void notice('action_required', 'Changes needed', reason);
-    else if (tell === 'pass') void notice('success', 'Overridden', reason);
-    else if (tell) void notice('neutral', status === 'held' ? 'Review held' : 'Review not performed', reason);
+    if (tell === 'block') await notice('action_required', 'Changes needed', reason);
+    else if (tell === 'pass') await notice('success', 'Overridden', reason);
+    else if (tell) await notice('neutral', status === 'held' ? 'Review held' : 'Review not performed', reason);
     if (tell || status === 'held') ctx.notify?.(job, { status, reason });
     return { status, reason };
   }
