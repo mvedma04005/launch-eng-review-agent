@@ -62,6 +62,9 @@ export const claudeReviewer: Reviewer = {
           model: opts.model,
           max_tokens: 32_000,
           stream: true,
+          // Cache the growing conversation: each turn re-reads the earlier turns at the cache-read price instead
+          // of paying full input price for the diff, the instruction files and every tool result again.
+          cache_control: { type: 'ephemeral' },
           system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
           messages,
           tools,
