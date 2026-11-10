@@ -104,6 +104,8 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
   const redactor = ctx.redactor ?? redactorFromEnv();
   if (job.attempts <= 1) metrics.queueWaitSeconds.observe(Math.max(0, (startedAt - Date.parse(job.createdAt)) / 1000), { repo: job.repo });
   const github = ctx.githubFor ? await ctx.githubFor(job.repo) : new OctokitGitHub(await ctx.auth.octokitFor(job.repo), await ctx.auth.botLogin());
+  /** True when someone asked for this PR in Chat. Such a request is honoured for a draft, and with the poll off. */
+  const askedInChat = () => ctx.store.chatRequestsForJob(job.id).length > 0;
   phase('auth');
   const beat = setInterval(() => ctx.store.heartbeat(job.id, owner, ctx.config.workers.leaseSeconds), 60_000);
   let worktreeDir: string | null = null;
@@ -112,12 +114,12 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
   let checksEnabled = false;
   try {
     if (!isAllowedRepo(ctx.config, job.repo)) return await done('skipped', `${job.repo} is not in the repository allowlist (${ctx.config.github.repos.join(', ')}).`);
-    if (ctx.config.github.pollSeconds === 0 && job.trigger === 'poll' && !ctx.store.chatRequestsForJob(job.id).length) {
+    if (ctx.config.github.pollSeconds === 0 && job.trigger === 'poll' && !askedInChat()) {
       return await done('skipped', 'Automatic reviews are off. Post the PR link in the review space to request one.');
     }
     const meta = await github.pull(job.repo, job.number);
     if (meta.state !== 'open' || meta.merged) return await done('skipped', 'PR is closed or merged.');
-    if (meta.draft) return await done('skipped', 'PR is a draft; it will be reviewed when marked ready.');
+    if (meta.draft && !askedInChat()) return await done('skipped', 'PR is a draft. Post the link in the review space to have it reviewed.');
     if (meta.headSha !== job.headSha) return await done('skipped', `Head moved to ${meta.headSha.slice(0, 12)}; a newer job covers it.`);
     if (meta.authorType === 'Bot') return await done('skipped', 'Bot-authored PR.');
 
@@ -258,7 +260,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     }
     const fresh = await github.pull(job.repo, job.number);
     if (fresh.headSha !== job.headSha) return done('skipped', 'Head moved during review; the newer head will be reviewed.');
-    if (fresh.state !== 'open' || fresh.merged || fresh.draft) return done('skipped', 'PR closed, merged or converted to draft during review.');
+    if (fresh.state !== 'open' || fresh.merged || (fresh.draft && !askedInChat())) return done('skipped', 'PR closed, merged or converted to draft during review.');
     try {
       const posted = await github.postReview(job.repo, job.number, job.headSha, pendingReview);
       for (const [findingId, commentId] of posted.commentIds) ctx.store.setFindingComment(findingId, commentId);

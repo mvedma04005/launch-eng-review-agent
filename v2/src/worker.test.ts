@@ -511,3 +511,16 @@ test('github.pollSeconds is 0 for off or at least 10', () => {
   assert.equal(ConfigSchema.parse({ github: { pollSeconds: 0 } }).github.pollSeconds, 0);
   assert.throws(() => ConfigSchema.parse({ github: { pollSeconds: 5 } }), /must be 0 \(off\) or at least 10/);
 });
+
+test('a draft is reviewed when someone asks for it in Chat', async () => {
+  const f = approveFixture();
+  const github = new FakeGitHub(meta(f.origin, f.headSha, f.baseSha, { draft: true }));
+  const store = new Store(':memory:');
+  const ctx: WorkerContext = { config: configFor(f.root), store, auth, anthropic: {} as Anthropic, reviewer: scriptedReviewer(), log, dryRun: false, githubFor: async () => github };
+  const { job } = store.enqueue({ repo: 'acme/demo', number: 3, headSha: f.headSha, baseSha: f.baseSha, baseRef: 'main', trigger: 'comment', receivedAt: 'now' });
+  const request = store.addChatRequest({ messageName: 'spaces/A/messages/m1#acme/demo/3', space: 'spaces/A', thread: 'spaces/A/threads/t', sender: 'users/1', senderEmail: null, repo: 'acme/demo', number: 3, command: 'review' })!;
+  store.setChatRequest(request.id, { status: 'queued', jobId: job.id });
+  const outcome = await processJob(ctx, store.claim('t', 60, { perRepo: 1, global: 1 })!, 't');
+  assert.equal(outcome.status, 'published', outcome.reason);
+  assert.equal(github.posted.length, 1);
+});

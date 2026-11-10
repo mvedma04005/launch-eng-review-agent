@@ -188,7 +188,6 @@ export async function resolvePendingChatRequests(ctx: IntakeContext, pull: (repo
     try {
       const meta = await pull(req.repo, req.number);
       if (meta.state !== 'open' || meta.merged) { refuse(meta.merged ? 'the PR is already merged; nothing to review.' : 'the PR is closed; nothing to review.'); continue; }
-      if (meta.draft) { refuse('the PR is a draft. Mark it ready for review and post the link again.'); continue; }
       if (meta.authorType === 'Bot') { refuse('bot-authored PRs are not reviewed.'); continue; }
       const { job, created } = store.enqueue({ repo: req.repo, number: req.number, headSha: meta.headSha, baseSha: meta.baseSha, baseRef: meta.baseRef, trigger: 'comment', requestedBy: req.senderEmail ?? req.sender, receivedAt: new Date().toISOString() }, 10);
       if (!created && job.status === 'published') {

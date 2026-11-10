@@ -58,7 +58,7 @@ test('intake records once, acknowledges immediately, refuses other repositories,
   assert.equal(store.pendingChatRequests().length, 1);
 });
 
-test('pending requests become prioritized jobs once GitHub answers; drafts, merged PRs and exhausted rounds are refused in-thread', async () => {
+test('pending requests become prioritized jobs once GitHub answers; merged PRs and exhausted rounds are refused in-thread; a draft is taken', async () => {
   const store = new Store(':memory:');
   const ctx = { config, store, log };
   handleChatMessage(ctx, msg());
@@ -92,10 +92,11 @@ test('pending requests become prioritized jobs once GitHub answers; drafts, merg
   assert.equal(store.counts()['queued'] ?? 0, 0);
   assert.ok(store.pendingChatReplies(Date.now() / 1000 + 1, 20).some((r) => /already reviewed at aaaaaaaa/.test(r.text)));
 
-  // Drafts and merged PRs are refused before any model work.
+  // A draft that someone asks for is queued like any other PR.
   handleChatMessage(ctx, msg({ name: `${SPACE}/messages/m4`, text: 'https://github.com/ROKT/launch-engineering/pull/586' }));
-  await resolvePendingChatRequests(ctx, async () => meta({ number: 586, draft: true }), 40_000);
-  assert.ok(store.pendingChatReplies(Date.now() / 1000 + 1, 30).some((r) => /#586: the PR is a draft/.test(r.text)));
+  await resolvePendingChatRequests(ctx, async () => meta({ number: 586, draft: true, headSha: 'd'.repeat(40) }), 40_000);
+  assert.equal(store.counts()['queued'] ?? 0, 1);
+  assert.ok(!store.pendingChatReplies(Date.now() / 1000 + 1, 30).some((r) => /#586: .*draft/.test(r.text)));
 });
 
 test('the outbox sends once per reply, retries transient failures and parks permanent ones', async () => {
