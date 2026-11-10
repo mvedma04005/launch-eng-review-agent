@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { existsSync, mkdirSync, realpathSync, statSync, readFileSync } from 'node:fs';
-import { join, resolve, sep } from 'node:path';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, statSync, readFileSync } from 'node:fs';
+import { dirname, join, resolve, sep } from 'node:path';
 import { parseUnifiedDiff, type Anchors } from './diff.ts';
 
 const run = promisify(execFile);
@@ -45,8 +45,17 @@ export class Mirror {
 
   async ensure(): Promise<void> {
     if (existsSync(join(this.path, 'HEAD'))) return;
-    mkdirSync(this.path, { recursive: true, mode: 0o700 });
-    await git(['clone', '--bare', '--quiet', this.cloneUrl, this.path], undefined, await this.authEnv());
+    // Reviews run in parallel processes: clone to a private directory and rename it into place, so no worker
+    // ever sees a half-written mirror and a lost race costs one spare clone, not a failed job.
+    mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
+    const tmp = mkdtempSync(this.path + '.tmp-');
+    try {
+      await git(['clone', '--bare', '--quiet', this.cloneUrl, tmp], undefined, await this.authEnv());
+      renameSync(tmp, this.path);
+    } catch (error) {
+      rmSync(tmp, { recursive: true, force: true });
+      if (!existsSync(join(this.path, 'HEAD'))) throw error; // not a lost race: a real clone failure
+    }
   }
 
   /** Fetch the PR head and base refs; verify the expected SHAs are present. */

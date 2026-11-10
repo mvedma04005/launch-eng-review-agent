@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseUnifiedDiff } from './diff.ts';
@@ -38,6 +38,19 @@ Binary files a/img.png and b/img.png differ
   assert.ok(anchors.has('app/h.py', 'LEFT', 2), 'deleted line');
   assert.ok(!anchors.has('app/h.py', 'LEFT', 1), 'context lines are not LEFT anchors');
   assert.ok(!anchors.has('app/h.py', 'RIGHT', 9));
+});
+
+test('workers that set up the mirror at the same time all succeed', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'falcon-race-'));
+  const origin = join(root, 'origin');
+  mkdirSync(origin);
+  git(origin, 'init', '-q', '-b', 'main');
+  writeFileSync(join(origin, 'a.txt'), 'a\n');
+  git(origin, 'add', '.'); git(origin, 'commit', '-q', '-m', 'base');
+  const mirror = () => new Mirror(join(root, 'state'), 'acme/demo', origin);
+  await Promise.all([mirror().ensure(), mirror().ensure(), mirror().ensure()]);
+  assert.ok(existsSync(join(mirror().path, 'HEAD')));
+  assert.deepEqual(readdirSync(join(root, 'state', 'mirrors', 'acme')), ['demo.git'], 'no spare clones left behind');
 });
 
 test('mirror + worktree: fetch, merge base, diff, confined reads, grep, and host-side finding validation', async () => {
