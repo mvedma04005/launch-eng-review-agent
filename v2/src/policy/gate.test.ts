@@ -86,3 +86,11 @@ test('every file needs cover, and an unknown Falcon login counts for nothing', (
   assert.equal(verdict([], [FALCON]), 'wait');
   assert.equal(gateVerdict({ files: ['Orbit/a.py'], codeowners: CODEOWNERS, teamOwner: LE, team: [], approvers: [FALCON], falcon: null }).verdict, 'wait');
 });
+
+test('a line break in a file name does not skip the more specific CODEOWNERS line', () => {
+  for (const ch of ['\n', '\r', '\u2028', '\u2029']) {
+    assert.deepEqual(ownersOf(`merlin-chrome-extension-suite/x${ch}.js`, CODEOWNERS), ['@pep-rokt', '@chenrog'], JSON.stringify(ch));
+    assert.equal(verdict([`merlin-chrome-extension-suite/x${ch}.js`], [FALCON]), 'wait');
+    assert.equal(verdict([`.falcon/a${ch}b`], [FALCON]), 'wait');
+  }
+});

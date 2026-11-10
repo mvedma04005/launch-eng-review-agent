@@ -126,18 +126,22 @@ export class OctokitGitHub implements GitHubPort {
     }
   }
 
-  /** Open PRs updated at or after `since`, newest first. */
-  async openPulls(repo: string, since: string) {
-    const rows = await this.octokit.paginate(this.octokit.pulls.list, { ...split(repo), state: 'open', sort: 'updated', direction: 'desc', per_page: 100 }, (response, done) => {
-      if (response.data.some((p) => p.updated_at < since)) done();
-      return response.data;
-    });
-    return rows.filter((p) => p.updated_at >= since).map((p) => ({ number: p.number, headSha: p.head.sha, baseRef: p.base.ref, defaultBranch: p.base.repo.default_branch, updatedAt: p.updated_at }));
+  /** Every open PR. */
+  async openPulls(repo: string) {
+    const rows = await this.octokit.paginate(this.octokit.pulls.list, { ...split(repo), state: 'open', per_page: 100 });
+    return rows.map((p) => ({ number: p.number, headSha: p.head.sha, baseRef: p.base.ref, defaultBranch: p.base.repo.default_branch, updatedAt: p.updated_at, author: p.user?.login ?? '' }));
   }
 
-  /** Every path the PR changes, old names of renamed files included. GitHub lists at most 3000 files. */
-  async changedPaths(repo: string, number: number): Promise<string[]> {
+  /** One PR's head, base and update time, read fresh. */
+  async pullState(repo: string, number: number) {
+    const { data } = await this.octokit.pulls.get({ ...split(repo), pull_number: number });
+    return { headSha: data.head.sha, baseRef: data.base.ref, updatedAt: data.updated_at, open: data.state === 'open' };
+  }
+
+  /** Every path the PR changes, old names of renamed files included. Null at GitHub's cap of 3000 files, where the list may be cut short. */
+  async changedPaths(repo: string, number: number): Promise<string[] | null> {
     const files = await this.octokit.paginate(this.octokit.pulls.listFiles, { ...split(repo), pull_number: number, per_page: 100 });
+    if (files.length >= 3000) return null;
     return files.flatMap((f) => (f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]));
   }
 

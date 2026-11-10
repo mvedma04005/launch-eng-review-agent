@@ -26,7 +26,8 @@ export function toRegExp(pattern: string): RegExp {
       i = end + 1;
     } else { out += c.replace(/[.+^${}()|[\]\\]/g, '\\$&'); i++; }
   }
-  const re = new RegExp(out + '$');
+  // `s`: a file name may hold a line break, and `**` must still match across it.
+  const re = new RegExp(out + '$', 's');
   cache.set(pattern, re);
   return re;
 }

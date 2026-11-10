@@ -1,16 +1,20 @@
+import { createHash } from 'node:crypto';
 import type { Logger } from './log.ts';
 import { gateVerdict, type GateVerdict } from './policy/gate.ts';
 import { parsePolicy } from './policy/load.ts';
 
 /** Where GitHub looks for CODEOWNERS, in its order. */
 const CODEOWNERS_PATHS = ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS'];
-/** GitHub lists at most this many files for a PR; at the cap the list may be cut short, so the gate waits. */
-const MAX_FILES = 3000;
+/** Every open PR is judged again this often, in case a change did not move its update time. */
+const FULL_RECHECK_MS = 30 * 60_000;
 
 /** The GitHub surface the merge gate needs; a fake implements this in tests. */
 export interface GatePort {
-  openPulls(repo: string, since: string): Promise<Array<{ number: number; headSha: string; baseRef: string; defaultBranch: string; updatedAt: string }>>;
-  changedPaths(repo: string, number: number): Promise<string[]>;
+  openPulls(repo: string): Promise<Array<{ number: number; headSha: string; baseRef: string; defaultBranch: string; updatedAt: string; author: string }>>;
+  /** One PR's head, base and update time, read fresh. */
+  pullState(repo: string, number: number): Promise<{ headSha: string; baseRef: string; updatedAt: string; open: boolean }>;
+  /** Every path the PR changes, or null when GitHub's list may be cut short. */
+  changedPaths(repo: string, number: number): Promise<string[] | null>;
   approvers(repo: string, number: number, headSha: string): Promise<string[]>;
   fileAtRef(repo: string, ref: string, path: string): Promise<string | null>;
   postGate(repo: string, headSha: string, passed: boolean, title: string, summary: string): Promise<void>;
@@ -33,32 +37,44 @@ function describe({ verdict, uncovered }: GateVerdict, approvers: string[], tooM
   const who = approvers.length ? `Approved on this commit by ${approvers.join(', ')}.` : 'Nobody has approved this commit yet.';
   const list = uncovered.slice(0, 10).map((f) => `\`${f}\``).join(', ') + (uncovered.length > 10 ? ` and ${uncovered.length - 10} more` : '');
   if (verdict === 'pass') return { title: 'Approved by an owner or Falcon', summary: `${who} Every changed file has an approval from one of its owners.` };
-  if (tooMany) return { title: 'Waiting: too many files to check', summary: `This PR changes ${MAX_FILES} files or more, so the list of files may be incomplete. Split the PR.` };
+  if (tooMany) return { title: 'Waiting: too many files to check', summary: 'This PR changes more files than GitHub lists, so the list of files may be incomplete. Split the PR.' };
   if (verdict === 'unknown') return { title: 'Waiting: cannot confirm the approver is an owner', summary: `${who} These files have an owner team whose members Falcon cannot read: ${list}.` };
   return { title: 'Waiting for an owner or Falcon to approve', summary: `${who} No owner approval covers: ${list || 'this change'}.` };
 }
 
 /**
- * One pass over the open PRs that changed since the last pass. For each PR into the default branch it decides the
- * merge gate from GitHub state and posts the check when the decision differs from the last one posted.
- * Returns the number of checks posted.
+ * One pass over the open PRs into the default branch. It judges the ones that changed since the last pass, and
+ * all of them when the rules changed or half an hour has gone by, and posts the check when the decision differs
+ * from the last one posted. Returns the number of checks posted.
  */
-export async function sweepGate(deps: GateDeps, repo: string): Promise<number> {
+export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()): Promise<number> {
   const { github, store, log } = deps;
-  const cursorKey = `gate:${repo}`;
-  const since = store.cursor(cursorKey) ?? '';
-  // `openPulls` includes PRs updated in the same second as the cursor: a review can land in that second.
-  const pulls = (await github.openPulls(repo, since)).filter((p) => p.baseRef === p.defaultBranch);
-  if (!pulls.length) return 0;
+  const open = (await github.openPulls(repo)).filter((p) => p.baseRef === p.defaultBranch);
+  if (!open.length) return 0;
   // Owners and the team list come from the default branch, never from the PR being judged.
-  const branch = pulls[0]!.defaultBranch;
+  const branch = open[0]!.defaultBranch;
   let codeowners = '';
   for (const path of CODEOWNERS_PATHS) {
     const text = await github.fileAtRef(repo, branch, path);
     if (text !== null) { codeowners = text; break; }
   }
   const pack = await github.fileAtRef(repo, branch, deps.repoPack);
-  const team = pack === null ? [] : parsePolicy(pack, deps.repoPack).team.members;
+  let team: string[] = [];
+  try {
+    if (pack !== null) team = parsePolicy(pack, deps.repoPack).team.members;
+  } catch (error) {
+    log.warn({ err: error, repo }, 'merge gate: the policy pack is invalid, so no team member counts');
+  }
+
+  // A pass must not outlive the rule that gave it: a change to CODEOWNERS, the pack or the team entry re-judges every PR.
+  const rules = createHash('sha256').update([codeowners, pack ?? '', deps.teamOwner].join('\0')).digest('hex');
+  const fullKey = `gate:${repo}:full`;
+  const [lastRules, lastAt] = (store.cursor(fullKey) ?? ':0').split(':');
+  const full = lastRules !== rules || now - Number(lastAt) >= FULL_RECHECK_MS;
+  const cursorKey = `gate:${repo}`;
+  const since = full ? '' : store.cursor(cursorKey) ?? '';
+  // `>=`: a review can land in the same second as the newest PR already seen.
+  const pulls = open.filter((p) => p.updatedAt >= since);
 
   let posted = 0;
   let failed = false;
@@ -66,13 +82,19 @@ export async function sweepGate(deps: GateDeps, repo: string): Promise<number> {
   for (const p of pulls) {
     try {
       const files = await github.changedPaths(repo, p.number);
-      const approvers = (await github.approvers(repo, p.number, p.headSha)).sort();
-      const tooMany = files.length >= MAX_FILES;
-      const result: GateVerdict = tooMany ? { verdict: 'wait', uncovered: [] } : gateVerdict({ files, codeowners, teamOwner: deps.teamOwner, team, approvers, falcon: deps.falcon });
+      // GitHub refuses a self-approval; this does not rely on it.
+      const approvers = (await github.approvers(repo, p.number, p.headSha)).filter((a) => a.toLowerCase() !== p.author.toLowerCase()).sort();
+      // The file list is the PR's files now, not this commit's. If anything about the PR moved since it was listed,
+      // the files may belong to another commit: skip it, and the next pass lists it again.
+      // shortcut: two pushes inside the second of the listed update time go unseen; read the files with the
+      // compare API, pinned to the commit, if that window ever matters.
+      const fresh = await github.pullState(repo, p.number);
+      if (!fresh.open || fresh.headSha !== p.headSha || fresh.baseRef !== p.baseRef || fresh.updatedAt !== p.updatedAt) continue;
+      const result: GateVerdict = files === null ? { verdict: 'wait', uncovered: [] } : gateVerdict({ files, codeowners, teamOwner: deps.teamOwner, team, approvers, falcon: deps.falcon });
       const state = `${p.headSha}:${result.verdict}:${approvers.join(',')}:${result.uncovered.length}`;
       const key = `gate:${repo}#${p.number}`;
       if (store.cursor(key) !== state) {
-        const { title, summary } = describe(result, approvers, tooMany);
+        const { title, summary } = describe(result, approvers, files === null);
         log.info({ repo, number: p.number, head: p.headSha, verdict: result.verdict, approvers, dryRun: deps.dryRun }, 'merge gate decided');
         if (!deps.dryRun) {
           await github.postGate(repo, p.headSha, result.verdict === 'pass', title, summary);
@@ -86,7 +108,11 @@ export async function sweepGate(deps: GateDeps, repo: string): Promise<number> {
       log.warn({ err: error, repo, number: p.number }, 'merge gate failed for one PR');
     }
   }
-  // After a failure the cursor stays, so the next pass lists the same PRs again; the ones already posted are skipped.
-  if (!failed) store.setCursor(cursorKey, newest);
+  // After a failure the cursors stay, so the next pass judges the same PRs again; the ones already posted are skipped.
+  // A dry run posts nothing, so it must not mark anything as seen either.
+  if (!failed && !deps.dryRun) {
+    store.setCursor(cursorKey, newest);
+    if (full) store.setCursor(fullKey, `${rules}:${now}`);
+  }
   return posted;
 }

@@ -26,3 +26,19 @@ test('ci: the merge gate check is never counted as CI', async () => {
   } as unknown as Octokit;
   assert.equal(await new OctokitGitHub(octokit, null).ci('acme/demo', HEAD), 'success');
 });
+
+test('postGate: a pass is a completed success; anything else stays in progress, never neutral', async () => {
+  const sent: Array<Record<string, unknown>> = [];
+  const octokit = { checks: { create: async (args: Record<string, unknown>) => { sent.push(args); return { data: {} }; } } } as unknown as Octokit;
+  const github = new OctokitGitHub(octokit, null);
+  await github.postGate('acme/demo', HEAD, true, 't', 's');
+  await github.postGate('acme/demo', HEAD, false, 't', 's');
+  assert.deepEqual(sent.map((a) => [a['name'], a['head_sha'], a['status'], a['conclusion']]), [['Merge gate', HEAD, 'completed', 'success'], ['Merge gate', HEAD, 'in_progress', undefined]]);
+});
+
+test('changedPaths: renamed files count under both names, and a list at the cap is refused', async () => {
+  const some = { paginate: async () => [{ filename: 'new.py', previous_filename: 'old.py' }, { filename: 'a.py' }], pulls: { listFiles: {} } } as unknown as Octokit;
+  assert.deepEqual(await new OctokitGitHub(some, null).changedPaths('acme/demo', 3), ['new.py', 'old.py', 'a.py']);
+  const capped = { paginate: async () => Array.from({ length: 3000 }, (_, i) => ({ filename: `f${i}` })), pulls: { listFiles: {} } } as unknown as Octokit;
+  assert.equal(await new OctokitGitHub(capped, null).changedPaths('acme/demo', 3), null);
+});
