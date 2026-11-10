@@ -64,7 +64,7 @@ export const PolicyPackSchema = z.object({
   suppressions: z.array(z.object({ rule: z.string(), paths: z.array(glob).default(['**']), reason: z.string().min(1) })).default([]),
   team: z.object({
     /** GitHub logins of the owning team; everyone else is an outsider. */
-    members: z.array(z.string().min(1)).default([]),
+    members: z.array(z.string().trim().transform((s) => s.replace(/^@/, '')).pipe(z.string().min(1))).default([]),
   }).prefault({}),
   outsiders: z.object({
     /** Ask outside contributors to explain the problem and plan in the PR description. */

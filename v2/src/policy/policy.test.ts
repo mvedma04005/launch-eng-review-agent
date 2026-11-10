@@ -107,3 +107,11 @@ test('the engine pack lets a repository opt into approvals', () => {
   assert.equal(merged.verdict.mode, 'approve');
   assert.equal(base.verdict.mode, 'comment', 'repositories without a pack still only comment');
 });
+
+test('team logins are trimmed and may carry one leading @', () => {
+  const p = parsePolicy('version: 1\nname: t\nteam: { members: ["@lee", " ann ", Bob] }', 't');
+  assert.ok(isTeamMember(p, 'lee'));
+  assert.ok(isTeamMember(p, 'ann'));
+  assert.ok(isTeamMember(p, 'bob'));
+  assert.throws(() => parsePolicy('version: 1\nname: t\nteam: { members: ["@"] }', 't'), /team\.members/);
+});

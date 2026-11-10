@@ -10,3 +10,13 @@ test('missingPlanSections wants a filled Problem and Plan', () => {
   assert.deepEqual(missingPlanSections('### problem statement\n' + 'x'.repeat(40) + '\n# PLAN\n' + 'y'.repeat(40), ['Problem', 'Plan']), []);
   assert.deepEqual(missingPlanSections('', ['Problem', 'Plan']), ['Problem', 'Plan']);
 });
+
+test('a # line in a fenced block or a sub-heading does not end a section', () => {
+  const P = '## Problem\nReports time out for accounts with more than 500 campaigns.\n';
+  const fenced = `${P}## Plan\nRun it:\n\`\`\`bash\n# dry run first\n./backfill --dry-run --batch 100 --since 2026-01-01\n\`\`\`\nThen flip the flag.`;
+  assert.deepEqual(missingPlanSections(fenced, ['Problem', 'Plan']), []);
+  const sub = `${P}## Plan\n### Step 1\nPage the query in batches of 100.\n### Step 2\nStream the rows to the client.`;
+  assert.deepEqual(missingPlanSections(sub, ['Problem', 'Plan']), []);
+  const onlyInFence = '```\n## Problem\nReports time out for accounts with more than 500 campaigns.\n## Plan\nPage the query in batches of 100 and stream.\n```';
+  assert.deepEqual(missingPlanSections(onlyInFence, ['Problem', 'Plan']), ['Problem', 'Plan']);
+});
