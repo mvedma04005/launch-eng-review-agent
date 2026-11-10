@@ -56,9 +56,12 @@ export const claudeReviewer: Reviewer = {
     try {
       const messages: Anthropic.Beta.Messages.BetaMessageParam[] = [{ role: 'user', content: user }];
       for (let attempt = 0; attempt < 2 && !state.accepted; attempt++) {
-        const params: Anthropic.Beta.Messages.BetaToolRunnerParams & { stream?: false } = {
+        // Streamed: the SDK refuses a non-streaming request this large ("Streaming is required for operations that
+        // may take longer than 10 minutes"). Tool inputs stay server-validated (no eager_input_streaming).
+        const params: Anthropic.Beta.Messages.BetaToolRunnerParams & { stream: true } = {
           model: opts.model,
           max_tokens: 32_000,
+          stream: true,
           system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
           messages,
           tools,
@@ -70,7 +73,8 @@ export const claudeReviewer: Reviewer = {
         };
         const runner = opts.client.beta.messages.toolRunner(params, { signal: controller.signal });
         let last: Anthropic.Beta.Messages.BetaMessage | null = null;
-        for await (const message of runner) {
+        for await (const messageStream of runner) {
+          const message = await messageStream.finalMessage();
           last = message;
           usage.modelCalls += 1;
           usage.inputTokens += message.usage.input_tokens;
