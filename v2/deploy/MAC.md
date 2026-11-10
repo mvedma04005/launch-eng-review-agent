@@ -2,6 +2,16 @@
 
 One Mac, one service user, one launchd agent, state in that user's Library folder. Nothing depends on a person being logged in or awake, and a restart resumes from SQLite.
 
+## Fastest path
+
+As the dedicated service user on the Mac, with Node 22.18+ and git installed:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mvedma04005/launch-eng-review-agent/rebuild/v2/deploy/bootstrap-mac.sh | bash
+```
+
+It clones the engine to `~/falcon`, finds an existing Anthropic API key in the shell profiles or the login Keychain without printing it, writes `~/.config/falcon/env`, and runs the installer below. Then fill in the GitHub App id and the Chat settings and restart the agent.
+
 ## Prepare the Mac once
 
 1. Create a dedicated local user (for example `falcon`) and log in as it. Everything below runs as that user. Enable automatic login for it so a power cycle brings the agent back, and disable sleep in Energy settings.

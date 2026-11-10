@@ -42,7 +42,7 @@ dryRun: true          # flip to false after the first dry-run week looks right
 http: { port: 8088 }
 YAML
 
-(cd "$HERE" && npm ci --omit=dev --no-audit --no-fund >/dev/null)
+(cd "$HERE" && npm ci --omit=dev --no-audit --no-fund >/dev/null 2>&1 || npm install --omit=dev --no-audit --no-fund >/dev/null)
 sed -e "s|__FALCON_HOME__|$HERE|g" -e "s|__FALCON_STATE__|$STATE|g" "$HERE/deploy/com.rokt.falcon.plist" > "$PLIST"
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
