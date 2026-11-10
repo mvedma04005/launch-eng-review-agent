@@ -58,6 +58,11 @@ export function mergePolicies(base: PolicyPack, overlay: PolicyPack): PolicyPack
   });
 }
 
+export function isTeamMember(policy: PolicyPack, login: string): boolean {
+  const l = login.toLowerCase();
+  return policy.team.members.some((m) => m.toLowerCase() === l);
+}
+
 export function inScope(policy: PolicyPack, path: string): boolean {
   return policy.scope.include.some((g) => minimatch(path, g)) && !policy.scope.exclude.some((g) => minimatch(path, g));
 }

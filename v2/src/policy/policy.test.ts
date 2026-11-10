@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { minimatch } from './glob.ts';
-import { applyPolicy, inScope, loadPolicyFile, mergePolicies, parsePolicy, rulesFor } from './load.ts';
+import { applyPolicy, inScope, isTeamMember, loadPolicyFile, mergePolicies, parsePolicy, rulesFor } from './load.ts';
 import type { Finding } from '../types.ts';
 
 const finding = (over: Partial<Finding>): Finding => ({ id: 'a', severity: 'high', blocking: false, path: 'src/a.ts', line: 1, side: 'RIGHT', title: 't', scenario: 's', impact: 'i', evidence: 'e', fix: 'f', fingerprint: 'fp', ...over });
@@ -80,4 +80,15 @@ suppressions:
 test('invalid policies fail loudly with a path to the problem', () => {
   assert.throws(() => parsePolicy('version: 1\nname: x\nrules:\n  - { id: Bad Id, title: t, severity: high, guidance: g }', 'x'), /rules\.0\.id/);
   assert.throws(() => parsePolicy('version: 1\nname: x\nrules:\n  - { id: dup, title: t, severity: high, guidance: g }\n  - { id: dup, title: t, severity: high, guidance: g }', 'x'), /twice/);
+});
+
+test('team membership is case-insensitive; outsiders need no plan by default', () => {
+  const p = parsePolicy('version: 1\nname: t\nteam: { members: [Ann, bob] }\noutsiders: { requirePlan: true }', 't');
+  assert.equal(isTeamMember(p, 'ann'), true);
+  assert.equal(isTeamMember(p, 'BOB'), true);
+  assert.equal(isTeamMember(p, 'eve'), false);
+  assert.deepEqual(p.outsiders.planHeadings, ['Problem', 'Plan']);
+  const d = parsePolicy('version: 1\nname: d', 'd');
+  assert.equal(d.outsiders.requirePlan, false);
+  assert.deepEqual(d.team.members, []);
 });

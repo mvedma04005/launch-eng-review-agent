@@ -62,6 +62,15 @@ export const PolicyPackSchema = z.object({
   standards: z.array(z.object({ title: z.string().min(1), text: z.string().min(1), paths: z.array(glob).default(['**']) })).default([]),
   rules: z.array(RuleSchema).default([]),
   suppressions: z.array(z.object({ rule: z.string(), paths: z.array(glob).default(['**']), reason: z.string().min(1) })).default([]),
+  team: z.object({
+    /** GitHub logins of the owning team; everyone else is an outsider. */
+    members: z.array(z.string().min(1)).default([]),
+  }).prefault({}),
+  outsiders: z.object({
+    /** Ask outside contributors to explain the problem and plan in the PR description. */
+    requirePlan: z.boolean().default(false),
+    planHeadings: z.array(z.string().min(1)).default(['Problem', 'Plan']),
+  }).prefault({}),
   feedback: z.object({
     learn: z.boolean().default(true),
     maxLessons: z.number().int().min(0).default(40),
