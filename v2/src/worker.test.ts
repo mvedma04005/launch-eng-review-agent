@@ -78,7 +78,8 @@ function fakeReviewer(findings: Array<{ path: string; line: number; evidence: st
       calls.n++;
       assert.ok(opts.turn.changedFiles.includes('svc.py'), 'svc.py stays in scope: the PR cannot exclude itself');
       assert.ok(!opts.turn.changedFiles.includes('package-lock.json'), 'lockfile excluded by the engine pack');
-      assert.equal(opts.policy.verdict.mode, 'request_changes', 'the base branch policy governs, not the PR copy');
+      assert.match(opts.policy.name, /\+repo$/, 'the base branch policy governs, not the PR copy');
+      assert.equal(opts.policy.verdict.mode, 'comment', 'a PR that edits the policy is comment-only');
       assert.ok(opts.turn.instructionDocs.some((d) => d.path === 'CLAUDE.md'), 'instruction files come from the base branch');
       assert.ok(opts.turn.instructionDocs.some((d) => d.path === '(note)' && /changes \.falcon\/policy\.yaml/.test(d.text)), 'the reviewer is told the PR edits the policy');
       opts.onStep?.({ seq: 1, at: new Date().toISOString(), tool: 'read_file', input: 'svc.py', durationMs: 3, outcome: 'ok' });
@@ -112,7 +113,7 @@ test('worker runs a PR end to end: base-branch policy, git evidence, verificatio
   assert.equal(outcome.status, 'published', outcome.reason);
   assert.equal(github.posted.length, 1);
   const review = github.posted[0]!;
-  assert.equal(review.event, 'REQUEST_CHANGES', 'one verified blocking finding remains');
+  assert.equal(review.event, 'COMMENT', 'one verified blocking finding remains; the PR edits the policy, so it only comments');
   assert.equal(review.comments.length, 2, 'verifier demoted one, suppression dropped one, both survivors inline');
   assert.ok(review.comments.some((c) => /verifier disagrees/.test(c.body)));
   assert.doesNotMatch(review.body, /ghp_abcdefghijklmnopqrstuvwxyz/, 'token-shaped text is redacted before publishing');
@@ -230,7 +231,7 @@ test('an outsider without a plan is refused; a team member is not; the base bran
   const run = async (author: string, sha = headSha, dryRun = false) => {
     const store = new Store(':memory:');
     const github = new FakeGitHub(meta(origin, sha, baseSha, { author, body: '' }));
-    const ctx: WorkerContext = { config: configFor(root), store, auth, anthropic: {} as Anthropic, reviewer: fakeReviewer([], { n: 0 }), log, dryRun, githubFor: async () => github };
+    const ctx: WorkerContext = { config: configFor(root), store, auth, anthropic: {} as Anthropic, reviewer: scriptedReviewer(), log, dryRun, githubFor: async () => github };
     store.enqueue({ repo: 'acme/demo', number: 3, headSha: sha, baseSha, baseRef: 'main', trigger: 'manual', receivedAt: 'now' });
     return { github, outcome: await processJob(ctx, store.claim('t', 60, { perRepo: 1, global: 1 })!, 't') };
   };
@@ -409,4 +410,20 @@ test('deleted files count toward the size limit and are shown to the reviewer', 
   await runJob(f, github, scriptedReviewer({}, seen));
   assert.deepEqual(seen.changedFiles, ['old.py']);
   assert.equal(github.posted[0]?.event, 'APPROVE', 'a deletion the reviewer covered can be approved');
+});
+
+test('approve mode: a PR that edits the policy pack only comments and asks for a human', async () => {
+  const f = approveFixture();
+  git(f.origin, 'checkout', '-q', 'feature');
+  writeFileSync(join(f.origin, '.falcon', 'policy.yaml'), 'version: 1\nname: repo\nverdict: { mode: approve }\nteam: { members: [lee, eve] }\n');
+  git(f.origin, 'commit', '-qam', 'add eve');
+  const headSha = git(f.origin, 'rev-parse', 'HEAD');
+  git(f.origin, 'checkout', '-q', 'main');
+  git(f.origin, 'update-ref', 'refs/pull/3/head', headSha);
+  const github = new FakeGitHub(meta(f.origin, headSha, f.baseSha));
+  const { outcome } = await runJob(f, github, scriptedReviewer());
+  assert.equal(outcome.status, 'published', outcome.reason);
+  assert.equal(github.posted[0]?.event, 'COMMENT');
+  assert.match(github.posted[0]!.body, /a human must review policy changes/);
+  assert.equal(github.checks.at(-1)?.conclusion, 'neutral');
 });

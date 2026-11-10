@@ -150,9 +150,11 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     const trustedSha = meta.baseRef === meta.defaultBranch ? meta.baseSha : await mirror.fetchBranchTip(job.number, meta.defaultBranch);
     const trustedRead = (path: string) => mirrorShow(mirror!, trustedSha, path);
     const baseRead = (path: string) => mirrorShow(mirror!, mergeBase, path);
-    const policy = await loadPolicyFor(ctx, job.repo, trustedRead);
-    checksEnabled = policy.verdict.checkRun;
     const policyChangedInPr = anchors.files.some((f) => f.path === ctx.config.policy.repoPath || f.oldPath === ctx.config.policy.repoPath);
+    const loaded = await loadPolicyFor(ctx, job.repo, trustedRead);
+    // A PR that edits the policy pack is a human's call: comment only, whatever the pack allows.
+    const policy: PolicyPack = policyChangedInPr ? { ...loaded, verdict: { ...loaded.verdict, mode: 'comment' } } : loaded;
+    checksEnabled = policy.verdict.checkRun;
     const override = overrideBy(policy, meta.author, await github.approvers(job.repo, job.number, job.headSha));
     if (!override && policy.outsiders.requirePlan && !isTeamMember(policy, meta.author)) {
       const missing = missingPlanSections(meta.body, policy.outsiders.planHeadings);
@@ -205,7 +207,8 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     // A review that does not account for every in-scope file is incomplete: medium confidence, comment-only.
     const unreviewed = inScopeFiles.filter((p) => !output.reviewedFiles.includes(p));
     if (unreviewed.length) log.info({ unreviewed }, 'review did not cover every in-scope file');
-    const finalOutput: ReviewOutput = { ...output, findings: kept, confidence: unreviewed.length ? 'medium' : output.confidence };
+    const summary = policyChangedInPr ? `This PR changes ${ctx.config.policy.repoPath}, so Falcon only comments: a human must review policy changes.\n\n${output.summary}` : output.summary;
+    const finalOutput: ReviewOutput = { ...output, summary, findings: kept, confidence: unreviewed.length ? 'medium' : output.confidence };
     const rendered = sanitize(renderReview(policy, meta, finalOutput, anchors, prior, override), redactor);
     const toPublish = toPending(rendered, job.headSha, boundBytes(redactor.apply(finalOutput.summary), LIMITS.summary));
     ctx.store.recordFindings(job, kept);
