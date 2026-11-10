@@ -106,6 +106,8 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
   const github = ctx.githubFor ? await ctx.githubFor(job.repo) : new OctokitGitHub(await ctx.auth.octokitFor(job.repo), await ctx.auth.botLogin());
   /** True when someone asked for this PR in Chat. Such a request is honoured for a draft, and with the poll off. */
   const askedInChat = () => ctx.store.chatRequestsForJob(job.id).length > 0;
+  /** With the poll off nothing is reviewed on its own, so no message may promise that. */
+  const auto = ctx.config.github.pollSeconds > 0;
   phase('auth');
   const beat = setInterval(() => ctx.store.heartbeat(job.id, owner, ctx.config.workers.leaseSeconds), 60_000);
   let worktreeDir: string | null = null;
@@ -120,7 +122,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     const meta = await github.pull(job.repo, job.number);
     if (meta.state !== 'open' || meta.merged) return await done('skipped', 'PR is closed or merged.');
     if (meta.draft && !askedInChat()) return await done('skipped', 'PR is a draft. Post the link in the review space to have it reviewed.');
-    if (meta.headSha !== job.headSha) return await done('skipped', `Head moved to ${meta.headSha.slice(0, 12)}; a newer job covers it.`);
+    if (meta.headSha !== job.headSha) return await done('skipped', `Head moved to ${meta.headSha.slice(0, 12)}. ${auto ? 'A newer job covers it.' : 'Post the PR link in the review space again to review the new commit.'}`);
     if (meta.authorType === 'Bot') return await done('skipped', 'Bot-authored PR.');
 
     const existing = await github.ownReviews(job.repo, job.number, job.headSha);
@@ -137,7 +139,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
 
     const ci = await github.ci(job.repo, job.headSha);
     if (ci === 'pending') return defer(90, 'CI still running', 'ci_pending');
-    if (ci === 'failure') return await done('held', 'CI failed at this head; fix CI and the next push is reviewed automatically.');
+    if (ci === 'failure') return await done('held', `CI failed at this head. ${auto ? 'Fix CI and the next push is reviewed automatically.' : 'Fix CI, then post the PR link in the review space again.'}`);
 
     const capReason = dailyCapReason(ctx.store, ctx.config, job.repo);
     if (capReason) return defer(secondsUntilNextUtcDay(), capReason, 'daily_cap');
@@ -259,7 +261,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
       return { status: 'skipped', reason };
     }
     const fresh = await github.pull(job.repo, job.number);
-    if (fresh.headSha !== job.headSha) return done('skipped', 'Head moved during review; the newer head will be reviewed.');
+    if (fresh.headSha !== job.headSha) return done('skipped', `Head moved during review. ${auto ? 'The newer head will be reviewed.' : 'Post the PR link in the review space again to review the new commit.'}`);
     if (fresh.state !== 'open' || fresh.merged || (fresh.draft && !askedInChat())) return done('skipped', 'PR closed, merged or converted to draft during review.');
     try {
       const posted = await github.postReview(job.repo, job.number, job.headSha, pendingReview);

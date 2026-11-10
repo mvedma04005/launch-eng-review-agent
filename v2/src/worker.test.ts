@@ -524,3 +524,17 @@ test('a draft is reviewed when someone asks for it in Chat', async () => {
   assert.equal(outcome.status, 'published', outcome.reason);
   assert.equal(github.posted.length, 1);
 });
+
+test('with the poll off, a hold on failed CI tells the author to post the link again', async () => {
+  const f = approveFixture();
+  for (const [pollSeconds, wanted] of [[0, /post the PR link in the review space again/], [30, /next push is reviewed automatically/]] as const) {
+    const github = new FakeGitHub(meta(f.origin, f.headSha, f.baseSha), 'failure');
+    const store = new Store(':memory:');
+    const config = ConfigSchema.parse({ stateDir: join(f.root, 'state'), github: { repos: ['acme/demo'], pollSeconds }, policy: { defaultPack: new URL('../policies/default.yaml', import.meta.url).pathname } });
+    const ctx: WorkerContext = { config, store, auth, anthropic: {} as Anthropic, reviewer: scriptedReviewer(), log, dryRun: false, githubFor: async () => github };
+    store.enqueue({ repo: 'acme/demo', number: 3, headSha: f.headSha, baseSha: f.baseSha, baseRef: 'main', trigger: 'comment', receivedAt: 'now' });
+    const outcome = await processJob(ctx, store.claim('t', 60, { perRepo: 1, global: 1 })!, 't');
+    assert.equal(outcome.status, 'held');
+    assert.match(outcome.reason ?? '', wanted);
+  }
+});

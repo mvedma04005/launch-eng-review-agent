@@ -193,7 +193,7 @@ export async function resolvePendingChatRequests(ctx: IntakeContext, pull: (repo
       if (!created && job.status === 'published') {
         const result = job.resultJson ? (JSON.parse(job.resultJson) as { reviewUrl?: string }) : {};
         store.setChatRequest(req.id, { status: 'delivered', jobId: job.id, note: 'already reviewed at this head' });
-        store.queueChatReply(`already:${req.id}`, req.space, req.thread, `${req.repo}#${req.number} was already reviewed at ${meta.headSha.slice(0, 8)}.${result.reviewUrl ? ` Review: ${result.reviewUrl}` : ''}${req.command === 're-review' ? ' Push a new commit for a fresh review.' : ''}`);
+        store.queueChatReply(`already:${req.id}`, req.space, req.thread, `${req.repo}#${req.number} was already reviewed at ${meta.headSha.slice(0, 8)}.${result.reviewUrl ? ` Review: ${result.reviewUrl}` : ''}${req.command === 're-review' ? (config.github.pollSeconds > 0 ? ' Push a new commit for a fresh review.' : ' Push a new commit and post the link again for a fresh review.') : ''}`);
         resolved++;
         continue;
       }
