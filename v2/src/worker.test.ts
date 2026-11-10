@@ -183,3 +183,28 @@ test('worker holds on failed CI, defers on pending CI, and skips drafts without 
   assert.match(outcome.reason!, /not in the repository allowlist/);
   assert.equal(s.job(job.id)?.status, 'skipped');
 });
+
+test('an oversized PR is refused and the check blocks; dry run posts nothing', async () => {
+  const { root, origin, baseSha: fixtureBase } = fixture();
+  git(origin, 'checkout', '-q', '-b', 'big', fixtureBase);
+  writeFileSync(join(origin, '.falcon', 'policy.yaml'), 'version: 1\nname: repo\nbudgets: { maxChangedLines: 50 }\n');
+  git(origin, 'commit', '-qam', 'budget');
+  const baseSha = git(origin, 'rev-parse', 'HEAD');
+  writeFileSync(join(origin, 'big.py'), Array.from({ length: 60 }, (_, i) => `x${i} = ${i}`).join('\n') + '\n');
+  git(origin, 'add', '.'); git(origin, 'commit', '-qm', 'big');
+  const headSha = git(origin, 'rev-parse', 'HEAD');
+  git(origin, 'update-ref', 'refs/pull/3/head', headSha);
+
+  const run = async (dryRun: boolean) => {
+    const store = new Store(':memory:');
+    const github = new FakeGitHub(meta(origin, headSha, baseSha));
+    const ctx: WorkerContext = { config: configFor(root), store, auth, anthropic: {} as Anthropic, reviewer: fakeReviewer([], { n: 0 }), log, dryRun, githubFor: async () => github };
+    store.enqueue({ repo: 'acme/demo', number: 3, headSha, baseSha, baseRef: 'main', trigger: 'manual', receivedAt: 'now' });
+    return { github, outcome: await processJob(ctx, store.claim('t', 60, { perRepo: 1, global: 1 })!, 't') };
+  };
+  const live = await run(false);
+  assert.equal(live.outcome.status, 'skipped');
+  assert.match(live.outcome.reason ?? '', /60 changed lines exceeds the policy budget of 50/);
+  assert.equal(live.github.checks.at(-1)?.conclusion, 'action_required');
+  assert.equal((await run(true)).github.checks.length, 0);
+});

@@ -157,7 +157,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     if (!inScopeFiles.length) return done('skipped', 'No in-scope files changed.');
     if (inScopeFiles.length > policy.budgets.maxChangedFiles) return done('held', `${inScopeFiles.length} changed files exceeds the policy budget of ${policy.budgets.maxChangedFiles}.`, true);
     const changedLines = anchors.files.filter((f) => inScopeFiles.includes(f.path)).reduce((n, f) => n + f.additions + f.deletions, 0);
-    if (changedLines > policy.budgets.maxChangedLines) return done('skipped', `${changedLines} changed lines exceeds the policy budget of ${policy.budgets.maxChangedLines}. Split the PR into smaller, focused PRs so the review can assess the changes and their interactions reliably.`, true);
+    if (changedLines > policy.budgets.maxChangedLines) return done('skipped', `${changedLines} changed lines exceeds the policy budget of ${policy.budgets.maxChangedLines}. Split the PR into smaller, focused PRs so the review can assess the changes and their interactions reliably.`, 'block');
     const instructionDocs = await collectInstructionDocs(trustedRead, inScopeFiles, policy);
     const requiredDocs: Array<{ path: string; text: string }> = [];
     for (const p of policy.context.required) {
@@ -261,21 +261,23 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     }
   }
 
-  async function notice(conclusion: 'neutral' | 'action_required', title: string, summary: string): Promise<void> {
+  async function notice(conclusion: 'neutral' | 'action_required' | 'success', title: string, summary: string): Promise<void> {
     if (!checksEnabled || ctx.dryRun) return;
     try { await github.completeCheckRun(job.repo, job.headSha, checkId, conclusion, title, boundBytes(summary, LIMITS.summary), null); }
     catch (error) { log.warn({ err: error }, 'could not post check-run notice'); }
   }
 
-  function done(status: 'skipped' | 'held', reason: string, tellAuthor = false): JobOutcome {
+  function done(status: 'skipped' | 'held', reason: string, tell: boolean | 'block' | 'pass' = false): JobOutcome {
     // Recorded in dry run too: an unrecorded skip left the job leased, so it was retried and then marked failed.
     ctx.store.finish(job.id, status, { error: reason });
     if (!ctx.dryRun || status === 'held') {
       metrics.jobsFinished.inc({ repo: job.repo, outcome: status });
     }
     log.info({ status, reason }, 'job finished');
-    if (tellAuthor) void notice('neutral', status === 'held' ? 'Review held' : 'Review not performed', reason);
-    if (tellAuthor || status === 'held') ctx.notify?.(job, { status, reason });
+    if (tell === 'block') void notice('action_required', 'Changes needed', reason);
+    else if (tell === 'pass') void notice('success', 'Overridden', reason);
+    else if (tell) void notice('neutral', status === 'held' ? 'Review held' : 'Review not performed', reason);
+    if (tell || status === 'held') ctx.notify?.(job, { status, reason });
     return { status, reason };
   }
 
