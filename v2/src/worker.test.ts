@@ -538,3 +538,22 @@ test('with the poll off, a hold on failed CI tells the author to post the link a
     assert.match(outcome.reason ?? '', wanted);
   }
 });
+
+test('a re-review request reviews a commit again even though Falcon already reviewed it', async () => {
+  const f = approveFixture();
+  const github = new FakeGitHub(meta(f.origin, f.headSha, f.baseSha));
+  github.existing = [{ id: 1, htmlUrl: 'https://example/review-1' }];
+  const store = new Store(':memory:');
+  const ctx: WorkerContext = { config: configFor(f.root), store, auth, anthropic: {} as Anthropic, reviewer: scriptedReviewer(), log, dryRun: false, githubFor: async () => github };
+  const { job } = store.enqueue({ repo: 'acme/demo', number: 3, headSha: f.headSha, baseSha: f.baseSha, baseRef: 'main', trigger: 'comment', receivedAt: 'now' });
+  const first = await processJob(ctx, store.claim('t', 60, { perRepo: 1, global: 1 })!, 't');
+  assert.equal(first.status, 'skipped');
+  assert.match(first.reason ?? '', /Already reviewed at this head/);
+
+  const request = store.addChatRequest({ messageName: 'spaces/A/messages/m1#acme/demo/3', space: 'spaces/A', thread: 'spaces/A/threads/t', sender: 'users/1', senderEmail: null, repo: 'acme/demo', number: 3, command: 're-review' })!;
+  store.requeue(job.id, 0, 'chat re-review', true);
+  store.setChatRequest(request.id, { status: 'queued', jobId: job.id });
+  const second = await processJob(ctx, store.claim('t', 60, { perRepo: 1, global: 1 })!, 't');
+  assert.equal(second.status, 'published', second.reason);
+  assert.equal(github.posted.length, 1);
+});

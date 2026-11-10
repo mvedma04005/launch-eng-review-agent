@@ -131,3 +131,35 @@ test('outcome text follows the OP3 shape and holds carry the reason', () => {
   assert.match(chatOutcomeText(job, { status: 'held', reason: 'CI failed at this head.' })!, /⚠️ ROKT\/launch-engineering#585 — Review held\n\nCI failed/);
   assert.equal(chatOutcomeText(job, { status: 'deferred' }), null, 'deferrals are not announced; the acknowledgement already said we are looking');
 });
+
+test('re-review runs a published commit again, drops the stored result, and counts as a round', async () => {
+  const store = new Store(':memory:');
+  const ctx = { config, store, log }; // maxRoundsPerPr is 2 here.
+  const link = 'https://github.com/ROKT/launch-engineering/pull/585';
+  handleChatMessage(ctx, msg());
+  await resolvePendingChatRequests(ctx, async () => meta(), 1000);
+  const job = store.claim('w', 60, { perRepo: 1, global: 1 })!;
+  store.finish(job.id, 'published', { result: { reviewUrl: 'https://example/review-1' } });
+  deliverOutcome(store, store.job(job.id)!, { status: 'published', event: 'COMMENT', summary: 's', confidence: 'high', reviewUrl: 'https://example/review-1' });
+
+  // A plain link is answered with the existing review and how to ask for a fresh one.
+  handleChatMessage(ctx, msg({ name: `${SPACE}/messages/p1`, text: link }));
+  await resolvePendingChatRequests(ctx, async () => meta(), 1500);
+  assert.equal(store.job(job.id)!.status, 'published');
+  assert.ok(store.pendingChatReplies(Date.now() / 1000 + 1, 30).some((r) => /already reviewed at aaaaaaaa.*Post "re-review" with the link/.test(r.text)));
+
+  handleChatMessage(ctx, msg({ name: `${SPACE}/messages/r1`, text: `re-review ${link}` }));
+  await resolvePendingChatRequests(ctx, async () => meta(), 2000);
+  const again = store.job(job.id)!;
+  assert.equal(again.status, 'queued');
+  assert.equal(again.resultJson, null, 'the stored result is dropped, so nothing is replayed');
+  assert.ok(store.chatRequestsForJob(job.id).some((r) => r.command === 're-review' && r.status === 'queued'));
+  assert.equal(store.chatRoundsForPr('ROKT/launch-engineering', 585), 2);
+
+  // The rounds are used up: a second fresh review is refused and the job stays as it is.
+  store.finish(job.id, 'published', { result: { reviewUrl: 'https://example/review-2' } });
+  handleChatMessage(ctx, msg({ name: `${SPACE}/messages/r2`, text: `re-review ${link}` }));
+  await resolvePendingChatRequests(ctx, async () => meta(), 3000);
+  assert.equal(store.job(job.id)!.status, 'published');
+  assert.ok(store.pendingChatReplies(Date.now() / 1000 + 1, 30).some((r) => /used its 2 manual review rounds/.test(r.text)));
+});

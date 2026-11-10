@@ -125,7 +125,9 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     if (meta.headSha !== job.headSha) return await done('skipped', `Head moved to ${meta.headSha.slice(0, 12)}. ${auto ? 'A newer job covers it.' : 'Post the PR link in the review space again to review the new commit.'}`);
     if (meta.authorType === 'Bot') return await done('skipped', 'Bot-authored PR.');
 
-    const existing = await github.ownReviews(job.repo, job.number, job.headSha);
+    // Someone asked for a fresh review of this commit: an earlier Falcon review at this head does not stop it.
+    const fresh = ctx.store.chatRequestsForJob(job.id).some((r) => r.command === 're-review' && r.status === 'queued');
+    const existing = fresh ? [] : await github.ownReviews(job.repo, job.number, job.headSha);
     if (existing.length) return { ...(await done('skipped', 'Already reviewed at this head.')), reviewUrl: existing[0]!.htmlUrl };
 
     // A finished review that failed to publish is replayed without another model run.

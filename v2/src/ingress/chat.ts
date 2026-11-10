@@ -2,7 +2,7 @@ import { JWT } from 'google-auth-library';
 import { isAllowedRepo, type Config } from '../config.ts';
 import type { Logger } from '../log.ts';
 import { metrics } from '../metrics.ts';
-import type { Store } from '../queue/store.ts';
+import { FRESH_REVIEW, type Store } from '../queue/store.ts';
 import type { ChatRequest, Job, PullMeta } from '../types.ts';
 
 /**
@@ -191,9 +191,18 @@ export async function resolvePendingChatRequests(ctx: IntakeContext, pull: (repo
       if (meta.authorType === 'Bot') { refuse('bot-authored PRs are not reviewed.'); continue; }
       const { job, created } = store.enqueue({ repo: req.repo, number: req.number, headSha: meta.headSha, baseSha: meta.baseSha, baseRef: meta.baseRef, trigger: 'comment', requestedBy: req.senderEmail ?? req.sender, receivedAt: new Date().toISOString() }, 10);
       if (!created && job.status === 'published') {
+        if (req.command === 're-review') {
+          // A fresh review of a commit Falcon already reviewed: the rules may have changed since, or the first review was wrong.
+          if (store.chatRoundsForPr(req.repo, req.number) >= config.chat.maxRoundsPerPr) { refuse(`this PR has used its ${config.chat.maxRoundsPerPr} manual review rounds.${config.github.pollSeconds > 0 ? ' Push a new commit for an automatic review.' : ' Ask a team member to review it.'}`); continue; }
+          store.requeue(job.id, 0, `chat re-review by ${req.sender}`, true);
+          store.setChatRequest(req.id, { status: 'queued', jobId: job.id, note: FRESH_REVIEW });
+          metrics.feedback.inc({ repo: req.repo, signal: 'chat_fresh' });
+          resolved++;
+          continue;
+        }
         const result = job.resultJson ? (JSON.parse(job.resultJson) as { reviewUrl?: string }) : {};
         store.setChatRequest(req.id, { status: 'delivered', jobId: job.id, note: 'already reviewed at this head' });
-        store.queueChatReply(`already:${req.id}`, req.space, req.thread, `${req.repo}#${req.number} was already reviewed at ${meta.headSha.slice(0, 8)}.${result.reviewUrl ? ` Review: ${result.reviewUrl}` : ''}${req.command === 're-review' ? (config.github.pollSeconds > 0 ? ' Push a new commit for a fresh review.' : ' Push a new commit and post the link again for a fresh review.') : ''}`);
+        store.queueChatReply(`already:${req.id}`, req.space, req.thread, `${req.repo}#${req.number} was already reviewed at ${meta.headSha.slice(0, 8)}.${result.reviewUrl ? ` Review: ${result.reviewUrl}` : ''} Post "re-review" with the link for a fresh review.`);
         resolved++;
         continue;
       }

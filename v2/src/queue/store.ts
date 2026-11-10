@@ -56,6 +56,9 @@ create table if not exists steps(
 
 const now = () => new Date().toISOString();
 /** Deterministic id from a key (UUID v5 over a fixed namespace), so idempotent inserts need no lookups. */
+/** The note on a Chat request that was granted a fresh review of a commit Falcon had already reviewed. */
+export const FRESH_REVIEW = 'fresh review';
+
 export function uuid5(key: string): string {
   const hash = createHash('sha1').update('falcon-outbox:' + key).digest();
   hash[6] = (hash[6]! & 0x0f) | 0x50; hash[8] = (hash[8]! & 0x3f) | 0x80;
@@ -143,8 +146,9 @@ export class Store {
     this.event(jobId, status, opts.error ? { error: opts.error } : null);
   }
 
-  requeue(jobId: string, delaySeconds: number, reason: string): void {
-    this.db.prepare(`update jobs set status='queued', lease_owner=null, lease_until=null, ready_after=?, error=?, updated_at=? where id=?`)
+  /** `fresh` also drops the stored result, so the next run reviews again and does not replay a kept review. */
+  requeue(jobId: string, delaySeconds: number, reason: string, fresh = false): void {
+    this.db.prepare(`update jobs set status='queued', lease_owner=null, lease_until=null, ready_after=?, error=?, updated_at=?${fresh ? ', result_json=null' : ''} where id=?`)
       .run(Date.now() / 1000 + delaySeconds, reason, now(), jobId);
     this.event(jobId, 'requeued', { reason, delaySeconds });
   }
@@ -219,8 +223,11 @@ export class Store {
     return new Set((this.db.prepare('select distinct number from chat_requests where repo=?').all(repo) as Array<{ number: number }>).map((r) => r.number));
   }
 
+  /** Rounds a PR has used: one per commit asked for, plus one per fresh review of a commit already reviewed. */
   chatRoundsForPr(repo: string, number: number): number {
-    return (this.db.prepare(`select count(distinct coalesce(job_id, id)) as n from chat_requests where repo=? and number=? and status in ('queued','delivered')`).get(repo, number) as { n: number }).n;
+    const row = this.db.prepare(`select count(distinct coalesce(job_id, id)) as jobs, sum(case when note=? then 1 else 0 end) as fresh
+      from chat_requests where repo=? and number=? and status in ('queued','delivered')`).get(FRESH_REVIEW, repo, number) as { jobs: number; fresh: number | null };
+    return row.jobs + (row.fresh ?? 0);
   }
 
   /** Idempotent by key: the same reply for the same reason is queued once, however often intake sees the event. */
