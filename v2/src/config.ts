@@ -18,6 +18,8 @@ export const ConfigSchema = z.object({
     repos: z.array(z.string().regex(/^[\w.-]+\/[\w.-]+$/)).min(1).default(['ROKT/launch-engineering']),
     /** Seconds between looks at GitHub for changed PRs. 0 turns this off: only PRs requested in Chat are reviewed. */
     pollSeconds: z.number().int().refine((n) => n === 0 || n >= 10, 'must be 0 (off) or at least 10').default(30),
+    /** A check that has been pending for longer than this is treated as stalled, so it does not hold up a review. */
+    stalledCheckMinutes: z.number().int().min(5).default(60),
     webhookPort: z.number().int().min(0).default(0),
   }).prefault({}),
   /** Google Chat as the request channel: a Chat app identity, events over Pub/Sub, replies through a durable outbox. */

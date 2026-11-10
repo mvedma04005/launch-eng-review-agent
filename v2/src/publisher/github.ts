@@ -12,7 +12,8 @@ export const GATE_NAME = 'Merge gate';
 /** Minimal GitHub surface the engine needs; a fake implements this in tests. */
 export interface GitHubPort {
   pull(repo: string, number: number): Promise<PullMeta>;
-  ci(repo: string, sha: string): Promise<CiState>;
+  /** `stalledAfterMs`: a check pending for longer than this is stalled, not running, and holds nothing up. */
+  ci(repo: string, sha: string, stalledAfterMs?: number): Promise<CiState>;
   /** Reviews already posted by this engine at the given head (identified by marker). */
   ownReviews(repo: string, number: number, headSha: string): Promise<Array<{ id: number; htmlUrl: string }>>;
   /** Logins whose latest review on exactly this head is an approval. */
@@ -44,7 +45,7 @@ export class OctokitGitHub implements GitHubPort {
     };
   }
 
-  async ci(repo: string, sha: string): Promise<CiState> {
+  async ci(repo: string, sha: string, stalledAfterMs = Infinity): Promise<CiState> {
     const r = split(repo);
     const [combined, checks] = await Promise.all([
       this.octokit.repos.getCombinedStatusForRef({ ...r, ref: sha }),
@@ -54,8 +55,11 @@ export class OctokitGitHub implements GitHubPort {
     const runs = checks.filter((c) => c.name !== CHECK_NAME && c.name !== GATE_NAME);
     const statuses = combined.data.statuses;
     if (!runs.length && !statuses.length) return 'none';
-    if (runs.some((c) => c.status !== 'completed') || (combined.data.state === 'pending' && statuses.length)) return 'pending';
-    if (runs.some((c) => ['failure', 'timed_out', 'cancelled', 'action_required', 'startup_failure'].includes(c.conclusion ?? '')) || combined.data.state === 'failure') return 'failure';
+    // A check that has sat pending for a long time is stalled, not running: a blocked build step waits for a person.
+    const cutoff = Date.now() - stalledAfterMs;
+    const live = (since: string | null | undefined) => !since || Date.parse(since) > cutoff;
+    if (runs.some((c) => c.status !== 'completed' && live(c.started_at)) || statuses.some((s) => s.state === 'pending' && live(s.updated_at))) return 'pending';
+    if (runs.some((c) => ['failure', 'timed_out', 'cancelled', 'action_required', 'startup_failure'].includes(c.conclusion ?? '')) || statuses.some((s) => s.state === 'failure' || s.state === 'error')) return 'failure';
     return 'success';
   }
 

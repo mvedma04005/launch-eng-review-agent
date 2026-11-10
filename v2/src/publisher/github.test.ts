@@ -45,3 +45,21 @@ test('changedPaths: renamed files count under both names, and a list at the cap 
   const capped = { paginate: async () => Array.from({ length: 3000 }, (_, i) => ({ filename: `f${i}` })), pulls: { listFiles: {} } } as unknown as Octokit;
   assert.equal(await new OctokitGitHub(capped, null).changedPaths('acme/demo', 3), null);
 });
+
+test('ci: a check pending for longer than the limit is stalled and holds nothing up; a recent one still does', async () => {
+  const HOUR = 3_600_000;
+  const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
+  const github = (statuses: Array<{ state: string; updated_at: string }>, runs: Array<Record<string, unknown>> = []) => new OctokitGitHub({
+    repos: { getCombinedStatusForRef: async () => ({ data: { state: 'pending', statuses } }) },
+    checks: { listForRef: {} },
+    paginate: async () => runs,
+  } as unknown as Octokit, null);
+  const green = { state: 'success', updated_at: ago(26 * HOUR) };
+  const stuck = { state: 'pending', updated_at: ago(26 * HOUR) };
+  assert.equal(await github([green, stuck]).ci('acme/demo', HEAD, HOUR), 'success', 'a status pending for a day is stalled');
+  assert.equal(await github([green, stuck]).ci('acme/demo', HEAD), 'pending', 'without a limit it still waits');
+  assert.equal(await github([green, { state: 'pending', updated_at: ago(5 * 60_000) }]).ci('acme/demo', HEAD, HOUR), 'pending', 'a build that started five minutes ago is running');
+  assert.equal(await github([stuck, { state: 'failure', updated_at: ago(HOUR) }]).ci('acme/demo', HEAD, HOUR), 'failure', 'a failure still counts when the pending check is stalled');
+  assert.equal(await github([green], [{ name: 'build', status: 'in_progress', conclusion: null, started_at: ago(3 * HOUR) }]).ci('acme/demo', HEAD, HOUR), 'success', 'a check run stuck in progress is stalled too');
+  assert.equal(await github([green], [{ name: 'build', status: 'in_progress', conclusion: null, started_at: ago(60_000) }]).ci('acme/demo', HEAD, HOUR), 'pending');
+});
