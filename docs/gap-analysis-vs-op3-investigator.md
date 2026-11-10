@@ -16,13 +16,14 @@ Decision: build our own, on a dedicated Mac, borrowing the OP3 team's proven des
 | Alerts | Datadog monitors: page on sustained stall, never on one failure | **Added.** Stall, spend near cap, repeated failures; edge-triggered to a Chat or Slack webhook; logged when none |
 | GitHub rate limits | Budgeted pollers, rate-limit preflight and telemetry | **Added.** Octokit throttling plugin backs off on primary and secondary limits and counts them |
 | Confidence and verdict discipline | Nine gates with evidence; medium confidence is comment-only; 750-line cap | Added earlier: confidence in the result, comment-only on medium, non-withdrawal notice, `maxChangedLines` |
+| Fast pickup from Chat | Chat app identity; events over Pub/Sub; "👀 Looking" before GitHub is asked; app-authenticated poll for bare links; durable idempotent replies; three manual rounds per PR | **Added.** Same design: Pub/Sub pull, immediate acknowledgement through the outbox, resolver with GitHub backoff, poll fallback, round cap, per-thread outcome delivery |
+| Scoped to one repository | Hard-wired to `ROKT/op3` | **Added as config, enforced everywhere.** `github.repos` is the allowlist; Chat refuses other links in-thread; the poller and worker refuse them; an empty list fails startup |
 
 ## Still open, in priority order
 
 | Capability | OP3 Investigator | Falcon v2 | Plan |
 | --- | --- | --- | --- |
-| Intake by command | `@op3-investigator adversarial review` on the PR with requester permission checks, bot allowlist, edit-history check; `re-review`, `override` in Chat; three manual rounds per PR | Automatic polling only; command parser exists but no poller | Phase 1: poll PR comments for `/falcon review` and `/falcon re-review`, require write permission, dedupe by comment id, cap manual rounds |
-| Google Chat as a request and summary channel | Chat app identity, allowlisted spaces, Pub/Sub, attempt-scoped request ids | None | Decision needed. If kept, a Chat app (not a human) posting a one-line summary per review into the LE space, same durable outbox pattern as v1 |
+| Intake by GitHub comment command | `@op3-investigator adversarial review` on the PR with requester permission checks, bot allowlist, edit-history check | Chat intake and `re-review` in Chat with manual round caps are done; no PR-comment command | Phase 1 if wanted: poll PR comments for `/falcon review`, require write permission, dedupe by comment id |
 | Structured coverage evidence | Nine mandatory gates each with evidence; host rejects approvals with uncertain or missing gates | Lenses are free text; findings and confidence are structured | Phase 1 with the LE policy pack: gates per lens with evidence, host-enforced before approve |
 | Repeat-review semantics | Delta review: do not repeat resolved comments; reuse earlier findings | "Still open from an earlier head" marker only | Phase 2: carry resolved thread state and prior finding outcomes into the prompt and the renderer |
 | Human approval before bot approval on risky changes | Approval withheld on schema, contract, integration or authorization changes until a non-author human approves the exact head | Not implemented | Phase 2 policy option: `verdict.requireHumanApprovalFor` globs, checked against reviews on the head |
@@ -44,7 +45,6 @@ Decision: build our own, on a dedicated Mac, borrowing the OP3 team's proven des
 
 ## Decisions for you
 
-1. Google Chat: keep as a summary channel through a Chat app, or rely on GitHub only?
-2. Command intake on the PR (`/falcon review`): wanted in phase 1?
-3. Bedrock or the Anthropic API for inference?
-4. Who owns the launch-engineering policy pack, and what are its gates?
+1. Bedrock or the Anthropic API for inference?
+2. Who owns the launch-engineering policy pack, and what are its gates?
+3. Is a `/falcon review` PR-comment command wanted in addition to Chat?

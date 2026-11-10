@@ -45,6 +45,8 @@ limits:
 http: { port: 8088 }
 ```
 
+Front door: a PR link posted in the launch-engineering Google Chat space is acknowledged within seconds and reviewed; only `ROKT/launch-engineering` links are accepted. Setup in [`deploy/MAC.md`](deploy/MAC.md).
+
 Dedicated Mac install: `bash deploy/install-mac.sh` as the service user, then fill `~/.config/falcon/env`. Runbook: [`deploy/MAC.md`](deploy/MAC.md). Other commands: `falcon job <id>` (usage, tool-call trail, events), `falcon replay <id>` (republish a retained review or re-run a held job).
 
 Layout: `src/policy` (packs, merge, enforcement), `src/queue` (SQLite store with leases), `src/evidence` (git mirror, worktree, diff anchors), `src/reviewer` (tools, validation, prompts, Claude), `src/publisher` (render, GitHub), `src/ingress` (auth, polling), `src/feedback`, `src/learning`, `src/worker.ts`, `src/serve.ts`, `src/cli.ts`. Engine policy: `policies/default.yaml`.

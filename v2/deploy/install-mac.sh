@@ -26,8 +26,14 @@ chmod 600 "$CONF_DIR/env"
 stateDir: $STATE
 github:
   appId: 0            # the Falcon GitHub App id
-  repos: [ROKT/launch-engineering]
+  repos: [ROKT/launch-engineering]   # the allowlist; nothing else is ever reviewed
   pollSeconds: 30
+chat:
+  enabled: true
+  spaces: [spaces/REPLACE_ME]
+  pubsub: { project: REPLACE_ME, subscription: falcon-chat-pull }
+  pollSeconds: 5
+  maxRoundsPerPr: 3
 workers: { concurrency: 6, perRepoConcurrency: 4, isolation: process }
 limits:
   perReview: { maxCostUsd: 10, maxMinutes: 25 }

@@ -15,6 +15,19 @@ One Mac, one service user, one launchd agent, state in that user's Library folde
 
 The launcher refuses to start if the env file is not mode 600. Secrets never appear in the plist or the process list.
 
+## Google Chat setup (one time, in Google Cloud)
+
+Falcon is a Chat *app*, not a person. Events reach the Mac through a Pub/Sub subscription the daemon pulls from, so nothing needs an inbound URL.
+
+1. In a Google Cloud project, enable the Google Chat API and the Pub/Sub API.
+2. Create a service account (for example `falcon-chat`), download a JSON key, and put it in `~/.config/falcon/env` as `FALCON_GOOGLE_SERVICE_ACCOUNT_JSON='{...}'` on one line.
+3. Create a Pub/Sub topic (for example `falcon-chat-events`) and a pull subscription on it (for example `falcon-chat-pull`). Grant `chat-api-push@system.gserviceaccount.com` the Pub/Sub Publisher role on the topic, and the service account the Pub/Sub Subscriber role on the subscription.
+4. In the Chat API configuration page: name it Falcon, give it an avatar, enable joining spaces and group conversations, set the connection type to Cloud Pub/Sub with that topic, and make it visible to the people or groups who will use it.
+5. Add the Falcon app to the launch-engineering review space. Put the space id (`spaces/...`) in `chat.spaces` and the project and subscription in `chat.pubsub`.
+6. Bare links without a mention are picked up by polling only if a Workspace admin grants the app `chat.app.messages.readonly`. Until then, post `@Falcon <PR link>`.
+
+Expected timing: a mention reaches the Mac within about a second, "👀 Looking" appears within another second or two, and the review follows at the pace of the queue. Other repositories' links are refused in the thread; only `ROKT/launch-engineering` is ever reviewed.
+
 ## Stage, then enable
 
 Run with `dryRun: true` for a few days. Every eligible PR is reviewed end to end and the rendered review is kept in the store, but nothing is posted. Read them with `falcon jobs` and `falcon job <id>` or on the dashboard at `http://127.0.0.1:8088/`. When the output is right, set `dryRun: false` and restart.
