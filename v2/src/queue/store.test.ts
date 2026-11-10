@@ -6,6 +6,11 @@ import type { ReviewRequest } from '../types.ts';
 const req = (over: Partial<ReviewRequest> = {}): ReviewRequest => ({ repo: 'ROKT/x', number: 1, headSha: 'a'.repeat(40), baseSha: 'b'.repeat(40), baseRef: 'main', trigger: 'poll', receivedAt: new Date().toISOString(), ...over });
 const limits = { perRepo: 2, global: 4 };
 
+test('a writer waits for a busy database instead of failing', () => {
+  const store = new Store(':memory:');
+  assert.deepEqual({ ...store.db.prepare('pragma busy_timeout').get() }, { timeout: 15000 });
+});
+
 test('enqueue is idempotent per head and supersedes older unpublished heads', () => {
   const store = new Store(':memory:');
   const first = store.enqueue(req());

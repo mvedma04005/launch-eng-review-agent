@@ -72,6 +72,8 @@ export class Store {
   constructor(path: string) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
+    // The daemon and every review child write this file. Wait for the other writer instead of failing with "database is locked".
+    this.db.exec('pragma busy_timeout = 15000');
     this.db.exec(SCHEMA);
   }
 
