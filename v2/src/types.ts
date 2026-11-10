@@ -64,6 +64,8 @@ export interface Finding {
 
 export interface ReviewOutput {
   summary: string;
+  /** Medium confidence means a material question remains; the verdict is then comment-only regardless of policy mode. */
+  confidence: 'high' | 'medium';
   findings: Finding[];
   reviewedFiles: string[];
   lenses: string[];

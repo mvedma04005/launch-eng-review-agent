@@ -73,7 +73,7 @@ test('mirror + worktree: fetch, merge base, diff, confined reads, grep, and host
 
     const baseRead = async (path: string) => (path === 'handler.py' ? 'import os\nreturn user\ndone\n' : null);
     const result = await validateSubmission({
-      summary: 'ok', reviewed_files: ['handler.py'], lenses_completed: ['correctness'], questions: [],
+      summary: 'ok', confidence: 'high', reviewed_files: ['handler.py'], lenses_completed: ['correctness'], questions: [],
       findings: [
         { severity: 'high', path: 'handler.py', side: 'RIGHT', line: 2, title: 'Null user crashes', scenario: 's', impact: 'i', evidence: 'user.name', fix: 'guard' },
         { severity: 'low', path: 'handler.py', side: 'RIGHT', line: 2, title: 'Wrong quote', scenario: 's', impact: 'i', evidence: 'does-not-exist', fix: 'f' },

@@ -40,6 +40,8 @@ export const PolicyPackSchema = z.object({
   lenses: z.array(z.string().min(1)).default(['correctness', 'security', 'operability']),
   budgets: z.object({
     maxChangedFiles: z.number().int().min(1).default(300),
+    /** Additions plus deletions across in-scope files. Larger PRs are asked to split; the review would not be reliable. */
+    maxChangedLines: z.number().int().min(50).default(750),
     maxFileBytes: z.number().int().min(1024).default(400_000),
     maxToolCalls: z.number().int().min(5).default(80),
     maxMinutes: z.number().int().min(1).default(25),

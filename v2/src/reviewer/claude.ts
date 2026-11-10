@@ -102,7 +102,7 @@ export const claudeReviewer: Reviewer = {
     if (!state.accepted) throw new Incomplete('The model did not produce a verifiable review.');
     const { submission, findings } = state.accepted;
     return {
-      output: { summary: submission.summary.trim(), findings, reviewedFiles: submission.reviewed_files, lenses: submission.lenses_completed, questions: submission.questions },
+      output: { summary: submission.summary.trim(), confidence: submission.confidence, findings, reviewedFiles: submission.reviewed_files, lenses: submission.lenses_completed, questions: submission.questions },
       usage,
     };
   },

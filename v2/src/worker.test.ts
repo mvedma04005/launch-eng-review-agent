@@ -67,7 +67,7 @@ const fakeReviewer = (findings: Array<{ path: string; line: number; evidence: st
     assert.equal(opts.policy.verdict.mode, 'request_changes', 'repository overlay applied');
     return {
       output: {
-        summary: 'Null user crashes handler.', reviewedFiles: opts.turn.changedFiles, lenses: opts.policy.lenses, questions: [],
+        summary: 'Null user crashes handler.', confidence: 'high' as const, reviewedFiles: opts.turn.changedFiles, lenses: opts.policy.lenses, questions: [],
         findings: findings.map((f, i) => ({ id: `f${i}`.padEnd(12, '0'), ruleId: f.ruleId, severity: f.severity, blocking: false, path: f.path, line: f.line, side: 'RIGHT' as const, title: `Finding ${i}`, scenario: 's', impact: 'i', evidence: f.evidence, fix: 'guard', fingerprint: `fp${i}` })),
       },
       usage: { inputTokens: 10, cachedInputTokens: 0, cacheCreationTokens: 0, outputTokens: 5, toolCalls: 3, modelCalls: 1, wallMs: 10, estimatedCostUsd: 0.0001 },

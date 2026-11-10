@@ -108,6 +108,8 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     const inScopeFiles = changed.filter((p) => inScope(policy, p));
     if (!inScopeFiles.length) return done('skipped', 'No in-scope files changed.');
     if (inScopeFiles.length > policy.budgets.maxChangedFiles) return done('held', `${inScopeFiles.length} changed files exceeds the policy budget of ${policy.budgets.maxChangedFiles}.`);
+    const changedLines = anchors.files.filter((f) => inScopeFiles.includes(f.path)).reduce((n, f) => n + f.additions + f.deletions, 0);
+    if (changedLines > policy.budgets.maxChangedLines) return done('skipped', `${changedLines} changed lines exceeds the policy budget of ${policy.budgets.maxChangedLines}. Split the PR into smaller, focused PRs so the review can assess the changes and their interactions reliably.`);
     const baseRead = (path: string) => mirrorShow(mirror!, mergeBase, path);
     const instructionDocs = collectInstructionDocs(worktree, inScopeFiles, policy);
     const requiredDocs: Array<{ path: string; text: string }> = [];

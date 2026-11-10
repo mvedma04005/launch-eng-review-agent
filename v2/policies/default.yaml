@@ -26,6 +26,7 @@ verdict:
 lenses: [correctness, security, operability]
 budgets:
   maxChangedFiles: 300
+  maxChangedLines: 750   # additions + deletions in scope; above this the PR is asked to split
   maxFileBytes: 400000
   maxToolCalls: 80
   maxMinutes: 25

@@ -149,9 +149,22 @@ One Node process, `falcon serve`, under a launchd agent with `KeepAlive`. State 
 | 2 | Feedback collection live; lessons injected; eval set accumulating | Measured false-positive rate falls week over week. |
 | 3 | Repository policy packs; teams that want it opt into request-changes or approve mode; rule proposals as PRs | Teams own their policies; the old agent is retired. |
 
+## Relationship to OP3 Investigator
+
+The OP3 team runs a production review bot with the same shape: GitHub App identity, host-prepared immutable evidence, a sandboxed Claude run, a host-validated result contract with gates and confidence, Postgres leases, Kubernetes Job per review, Datadog metrics. It is hard-wired to `ROKT/op3` and OP3's policy, so launch-engineering cannot onboard without them generalizing it. Details and recommendation: [op3-investigator-assessment.md](op3-investigator-assessment.md).
+
+Falcon v2 aligns with its proven rules so a later merge is a tenant, not a rewrite:
+
+- A reviewer confidence of `high` or `medium` is part of the result. Medium is always comment-only, whatever the policy mode allows, and the review says so.
+- PRs above `budgets.maxChangedLines` (default 750 additions plus deletions in scope) are asked to split rather than reviewed unreliably.
+- Comment-only reviews carry a notice that they do not withdraw earlier approvals or change requests.
+- Publication parks for operator replay with the finding retained, instead of discarding a finished review (next).
+- Alerts page on sustained stall (oldest queued age, no completion in a window), never on one failed job.
+
 ## Open decisions
 
-1. Keep Google Chat as a notifier (summary posted to a space via an incoming webhook), or drop it and rely on GitHub notifications?
+1. Keep Google Chat as a notifier (summary posted to a space via an incoming webhook), or drop it and rely on GitHub notifications? OP3 Investigator keeps the space as both intake and summary channel through a Chat app identity, and people use it heavily.
+6. Open the multi-tenant conversation with `@ROKT/op3` now, so Falcon v2 can become launch-engineering's policy and eval set inside their service later?
 2. Drop STAMP entirely? The design has no approve-without-review path; if one is needed it should be a labeled, audited GitHub action, not a chat phrase.
 3. Where do policy packs live: a central `ROKT/falcon-policy` repository with per-repository overlays, or only in each repository?
 4. Initial repository set and the model budget per review.
