@@ -22,7 +22,8 @@ test('overBudget stops a review on tokens or dollars and stays quiet within limi
   const budget = { maxInputTokens: 1000, maxOutputTokens: 500, maxCostUsd: 1 };
   const ok = { ...emptyUsage(), inputTokens: 900, outputTokens: 100, estimatedCostUsd: 0.5 };
   assert.equal(overBudget(ok, budget), null);
-  assert.match(overBudget({ ...ok, cachedInputTokens: 200 }, budget)!, /input tokens 1100/);
+  assert.equal(overBudget({ ...ok, cachedInputTokens: 50_000 }, budget), null, 'cache re-reads of earlier turns do not count; dollars bound them');
+  assert.match(overBudget({ ...ok, cacheCreationTokens: 200 }, budget)!, /new input tokens 1100/);
   assert.match(overBudget({ ...ok, outputTokens: 501 }, budget)!, /output tokens/);
   assert.match(overBudget({ ...ok, estimatedCostUsd: 1.5 }, budget)!, /\$1\.50 exceeds/);
   assert.equal(overBudget({ ...ok, estimatedCostUsd: null }, budget), null, 'unpriced models are limited by tokens only');

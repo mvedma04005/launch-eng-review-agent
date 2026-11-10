@@ -27,8 +27,10 @@ export interface ReviewBudget { maxInputTokens: number; maxOutputTokens: number;
 
 /** The reason a running review must stop now, or null while it is within budget. Checked after every model call. */
 export function overBudget(usage: Usage, budget: ReviewBudget): string | null {
-  const input = usage.inputTokens + usage.cachedInputTokens + usage.cacheCreationTokens;
-  if (input > budget.maxInputTokens) return `input tokens ${input} exceed the review budget of ${budget.maxInputTokens}`;
+  // New text only. A tool loop re-reads the whole conversation from cache on every turn; counting those re-reads
+  // stopped ordinary reviews at about twenty turns. Their cost is real but small, and maxCostUsd bounds it.
+  const input = usage.inputTokens + usage.cacheCreationTokens;
+  if (input > budget.maxInputTokens) return `new input tokens ${input} exceed the review budget of ${budget.maxInputTokens}`;
   if (usage.outputTokens > budget.maxOutputTokens) return `output tokens ${usage.outputTokens} exceed the review budget of ${budget.maxOutputTokens}`;
   if (usage.estimatedCostUsd !== null && usage.estimatedCostUsd > budget.maxCostUsd) {
     return `estimated cost $${usage.estimatedCostUsd.toFixed(2)} exceeds the review budget of $${budget.maxCostUsd.toFixed(2)}`;
