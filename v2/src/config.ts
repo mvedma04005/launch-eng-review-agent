@@ -30,6 +30,17 @@ export const ConfigSchema = z.object({
     concurrency: z.number().int().min(1).default(8),
     perRepoConcurrency: z.number().int().min(1).default(4),
     leaseSeconds: z.number().int().min(60).default(900),
+    /** process: each review runs in its own child process with a hard kill timer, so one bad review cannot take the daemon down. */
+    isolation: z.enum(['process', 'inline']).default('process'),
+    /** Publication retries before a finished review is parked for `falcon replay`. */
+    maxPublicationAttempts: z.number().int().min(1).default(12),
+  }).prefault({}),
+  /** Full pipeline, nothing posted to GitHub. Use it to stage a new host or policy against real PRs. */
+  dryRun: z.boolean().default(false),
+  alerts: z.object({
+    stallMinutes: z.number().int().min(5).default(30),
+    spendWarnFraction: z.number().min(0.1).max(1).default(0.8),
+    failuresPerHour: z.number().int().min(1).default(5),
   }).prefault({}),
   /** Hard ceilings the operator sets centrally. Repository policy budgets are clamped to these. */
   limits: z.object({

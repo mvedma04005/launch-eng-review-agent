@@ -136,9 +136,9 @@ Cost is estimated from a per-model price table in `src/pricing.ts` (overridable)
 
 `jobs` (lease, attempts, status, result), `events` (audit trail), `findings` (stable fingerprint, GitHub comment id), `finding_outcomes` (signal, actor), `reviews` (GitHub review and check-run ids, marker), `usage` (tokens, estimated cost and wall time per job, by repository and time for the daily caps), `lessons`, `cursors` (poll position per repository). All in one SQLite file under the state directory.
 
-## Deployment on a fleet Mac
+## Deployment on a dedicated Mac
 
-One Node process, `falcon serve`, under a launchd agent with `KeepAlive`. State in `~/Library/Application Support/falcon`. Secrets as environment variables injected by the launch agent from the Keychain or a secrets manager: the GitHub App private key, the Anthropic API key, optionally a webhook secret and a notification webhook. Polling needs no inbound port; if webhooks are wanted later, a Cloudflare Tunnel or Tailscale Funnel in front of the webhook port works. A Dockerfile for a container host is a one-day addition because nothing in the engine is macOS-specific.
+The runbook is [`v2/deploy/MAC.md`](../v2/deploy/MAC.md) and the installer is `v2/deploy/install-mac.sh`. One Node process, `falcon serve`, under a launchd agent with `KeepAlive`; each review in a child process with a hard deadline; `dryRun: true` for the first week. State in `~/Library/Application Support/falcon`. Secrets as environment variables injected by the launch agent from the Keychain or a secrets manager: the GitHub App private key, the Anthropic API key, optionally a webhook secret and a notification webhook. Polling needs no inbound port; if webhooks are wanted later, a Cloudflare Tunnel or Tailscale Funnel in front of the webhook port works. A Dockerfile for a container host is a one-day addition because nothing in the engine is macOS-specific.
 
 ## Migration
 
@@ -150,6 +150,8 @@ One Node process, `falcon serve`, under a launchd agent with `KeepAlive`. State 
 | 3 | Repository policy packs; teams that want it opt into request-changes or approve mode; rule proposals as PRs | Teams own their policies; the old agent is retired. |
 
 ## Relationship to OP3 Investigator
+
+The capability-by-capability comparison, what was closed and what remains, is [gap-analysis-vs-op3-investigator.md](gap-analysis-vs-op3-investigator.md).
 
 The OP3 team runs a production review bot with the same shape: GitHub App identity, host-prepared immutable evidence, a sandboxed Claude run, a host-validated result contract with gates and confidence, Postgres leases, Kubernetes Job per review, Datadog metrics. It is hard-wired to `ROKT/op3` and OP3's policy, so launch-engineering cannot onboard without them generalizing it. Details and recommendation: [op3-investigator-assessment.md](op3-investigator-assessment.md).
 
@@ -172,6 +174,6 @@ Falcon v2 aligns with its proven rules so a later merge is a tenant, not a rewri
 
 ## What exists now and what is next
 
-Implemented and tested in `v2/`: per-review token, dollar, time and tool-call limits with operator ceilings; daily spend caps; Prometheus metrics; status server with HTML dashboard and JSON API; CLI status, jobs and job detail; domain types; policy schema, loader, merge and enforcement; SQLite store with idempotent enqueue, lease-based claiming, outcomes and lessons; git mirror, worktree, diff parser and anchor set; host-side finding validation; the reviewer's tool surface and Claude invocation with verifier; review rendering; GitHub publishing with the 422 fallback and check runs; polling ingress; feedback classification; lesson derivation; the worker; a CLI with dry run; a daemon loop.
+Implemented and tested in `v2/`: trusted policy from the base branch; retained reviews with publication retry, parking and `falcon replay`; in-progress and completion check runs with hold reasons; redaction and size bounds; per-review tool-call trail; child-process isolation per review; daemon dry-run mode; stall, spend and failure alerts to a webhook; GitHub throttling; Mac launchd installer; per-review token, dollar, time and tool-call limits with operator ceilings; daily spend caps; Prometheus metrics; status server with HTML dashboard and JSON API; CLI status, jobs and job detail; domain types; policy schema, loader, merge and enforcement; SQLite store with idempotent enqueue, lease-based claiming, outcomes and lessons; git mirror, worktree, diff parser and anchor set; host-side finding validation; the reviewer's tool surface and Claude invocation with verifier; review rendering; GitHub publishing with the 422 fallback and check runs; polling ingress; feedback classification; lesson derivation; the worker; a CLI with dry run; a daemon loop.
 
 Next: webhook receiver, reactions and resolution poller, the "line changed on next push" detector, alerting, `falcon eval`, rule-proposal generation, launchd plist and Dockerfile, and an end-to-end dry run against real PRs once an Anthropic key and the GitHub App exist.

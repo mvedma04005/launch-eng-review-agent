@@ -137,3 +137,27 @@ export interface Lesson {
   lastUsedAt: string | null;
   retiredAt: string | null;
 }
+
+/** One tool call the reviewer made; the audit trail behind "why did it say that". */
+export interface ReviewStep {
+  seq: number;
+  at: string;
+  tool: string;
+  /** Bounded, secret-free summary of the arguments. */
+  input: string;
+  durationMs: number;
+  outcome: 'ok' | 'error' | 'budget';
+}
+
+/** A finished review waiting to be published; retried without another model run. */
+export interface PendingPublication {
+  headSha: string;
+  event: 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT';
+  body: string;
+  comments: Array<{ path: string; line: number; side: Side; body: string; findingId: string }>;
+  checkConclusion: 'success' | 'neutral' | 'action_required';
+  blockingCount: number;
+  summary: string;
+  attempts: number;
+  renderedAt: string;
+}

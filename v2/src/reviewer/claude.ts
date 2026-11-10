@@ -4,7 +4,7 @@ import type { Anchors } from '../evidence/diff.ts';
 import type { Worktree } from '../evidence/git.ts';
 import type { PolicyPack } from '../policy/schema.ts';
 import { DEFAULT_PRICES, emptyUsage, estimateCostUsd, overBudget, type ModelPrice, type ReviewBudget } from '../pricing.ts';
-import type { Finding, Lesson, PullMeta, ReviewOutput, Usage } from '../types.ts';
+import type { Finding, Lesson, PullMeta, ReviewOutput, ReviewStep, Usage } from '../types.ts';
 import { buildTools, type ToolState } from './tools.ts';
 import { systemPrompt, userTurn, type UserTurnInput } from './prompt.ts';
 import { VerificationSchema } from './schema.ts';
@@ -27,6 +27,8 @@ export interface ReviewerOptions {
   baseRead: (path: string) => Promise<string | null>;
   turn: Omit<UserTurnInput, 'meta' | 'anchors' | 'inlineDiffBytes'>;
   signal?: AbortSignal;
+  /** Receives every tool call for the audit trail. */
+  onStep?: (step: ReviewStep) => void;
 }
 
 /** Interface the worker depends on, so tests and dry runs can substitute a fake. */
@@ -41,7 +43,7 @@ export const claudeReviewer: Reviewer = {
     const prices = opts.prices ?? DEFAULT_PRICES;
     const state: ToolState = { calls: 0, accepted: null, rejectedSubmissions: 0 };
     const policy: PolicyPack = { ...opts.policy, budgets: { ...opts.policy.budgets, maxToolCalls: opts.budget.maxToolCalls } };
-    const tools = buildTools(opts.worktree, opts.anchors, policy, { baseRead: opts.baseRead, changedFiles: opts.turn.changedFiles }, state);
+    const tools = buildTools(opts.worktree, opts.anchors, policy, { baseRead: opts.baseRead, changedFiles: opts.turn.changedFiles }, state, opts.onStep);
     const system = systemPrompt(opts.policy, opts.lessons);
     const user = userTurn({ ...opts.turn, meta: opts.meta, anchors: opts.anchors, inlineDiffBytes: opts.policy.budgets.inlineDiffBytes });
     const usage = emptyUsage();

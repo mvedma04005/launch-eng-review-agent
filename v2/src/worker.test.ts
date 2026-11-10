@@ -7,15 +7,16 @@ import { join } from 'node:path';
 import type Anthropic from '@anthropic-ai/sdk';
 import { ConfigSchema } from './config.ts';
 import { log } from './log.ts';
-import type { GitHubPort } from './publisher/github.ts';
-import type { RenderedReview } from './publisher/render.ts';
+import type { CheckConclusion, GitHubPort, Publishable } from './publisher/github.ts';
+import { buildRedactor } from './publisher/redact.ts';
 import { Store } from './queue/store.ts';
 import type { Reviewer } from './reviewer/claude.ts';
 import type { PullMeta } from './types.ts';
-import { processJob } from './worker.ts';
+import { processJob, type WorkerContext } from './worker.ts';
 
 const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } }).trim();
 
+/** Base branch carries the trusted policy (request_changes). The PR tries to rewrite it to exclude everything. */
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'falcon-worker-'));
   const origin = join(root, 'origin');
@@ -24,13 +25,14 @@ function fixture() {
   writeFileSync(join(origin, 'CLAUDE.md'), '# Conventions\nUse the shared client.\n');
   writeFileSync(join(origin, 'svc.py'), 'def handler(user):\n    return user\n');
   writeFileSync(join(origin, 'package-lock.json'), '{}\n');
+  mkdirSync(join(origin, '.falcon'));
+  writeFileSync(join(origin, '.falcon', 'policy.yaml'), 'version: 1\nname: repo\nverdict: { mode: request_changes }\nsuppressions:\n  - { rule: noisy-rule, paths: ["**"], reason: test }\n');
   git(origin, 'add', '.'); git(origin, 'commit', '-q', '-m', 'base');
   const baseSha = git(origin, 'rev-parse', 'HEAD');
   git(origin, 'checkout', '-q', '-b', 'feature');
   writeFileSync(join(origin, 'svc.py'), 'def handler(user):\n    return user.name\n');
   writeFileSync(join(origin, 'package-lock.json'), '{"changed": true}\n');
-  mkdirSync(join(origin, '.falcon'));
-  writeFileSync(join(origin, '.falcon', 'policy.yaml'), 'version: 1\nname: repo\nverdict: { mode: request_changes }\nsuppressions:\n  - { rule: noisy-rule, paths: ["**"], reason: test }\n');
+  writeFileSync(join(origin, '.falcon', 'policy.yaml'), 'version: 1\nname: attacker\nverdict: { mode: comment }\nscope: { exclude: ["**"] }\n');
   git(origin, 'add', '.'); git(origin, 'commit', '-q', '-m', 'change');
   const headSha = git(origin, 'rev-parse', 'HEAD');
   git(origin, 'update-ref', 'refs/pull/3/head', headSha);
@@ -39,56 +41,67 @@ function fixture() {
 }
 
 class FakeGitHub implements GitHubPort {
-  posted: RenderedReview[] = [];
-  checks: string[] = [];
-  reject422Once = false;
+  posted: Publishable[] = [];
+  checks: Array<{ status: 'in_progress' | 'completed'; conclusion?: CheckConclusion; id: number | null }> = [];
+  failPostsRemaining = 0;
   meta: PullMeta;
   ciState: 'none' | 'pending' | 'success' | 'failure';
   existing: Array<{ id: number; htmlUrl: string }> = [];
+  private nextCheckId = 500;
   constructor(meta: PullMeta, ciState: 'none' | 'pending' | 'success' | 'failure' = 'success') { this.meta = meta; this.ciState = ciState; }
   async pull() { return this.meta; }
   async ci() { return this.ciState; }
   async ownReviews() { return this.existing; }
-  async postReview(_r: string, _n: string | number, _h: string, review: RenderedReview) {
-    if (this.reject422Once) { this.reject422Once = false; const e = new Error('Unprocessable') as Error & { status: number }; e.status = 422; throw e; }
+  async postReview(_r: string, _n: number, _h: string, review: Publishable) {
+    if (this.failPostsRemaining > 0) { this.failPostsRemaining--; const e = new Error('bad gateway') as Error & { status: number }; e.status = 502; throw e; }
     this.posted.push(review);
     return { id: 1, htmlUrl: 'https://example.test/review/1', inlineDropped: false, commentIds: new Map(review.comments.map((c, i) => [c.findingId, 100 + i])) };
   }
-  async checkRun(_r: string, _h: string, conclusion: RenderedReview['checkConclusion']) { this.checks.push(conclusion); return 7; }
+  async startCheckRun() { const id = this.nextCheckId++; this.checks.push({ status: 'in_progress', id }); return id; }
+  async completeCheckRun(_r: string, _h: string, id: number | null, conclusion: CheckConclusion) { this.checks.push({ status: 'completed', conclusion, id }); return id ?? this.nextCheckId++; }
   async fileAtRef() { return null; }
 }
 
-const fakeReviewer = (findings: Array<{ path: string; line: number; evidence: string; severity: 'critical' | 'high' | 'medium'; ruleId?: string }>): Reviewer => ({
-  async review(opts) {
-    // The fake behaves like the real reviewer's host validation would: it only emits what the worktree supports.
-    assert.ok(opts.turn.changedFiles.includes('svc.py'));
-    assert.ok(!opts.turn.changedFiles.includes('package-lock.json'), 'lockfile excluded by policy scope');
-    assert.equal(opts.turn.instructionDocs[0]?.path, 'CLAUDE.md');
-    assert.equal(opts.policy.verdict.mode, 'request_changes', 'repository overlay applied');
-    return {
-      output: {
-        summary: 'Null user crashes handler.', confidence: 'high' as const, reviewedFiles: opts.turn.changedFiles, lenses: opts.policy.lenses, questions: [],
-        findings: findings.map((f, i) => ({ id: `f${i}`.padEnd(12, '0'), ruleId: f.ruleId, severity: f.severity, blocking: false, path: f.path, line: f.line, side: 'RIGHT' as const, title: `Finding ${i}`, scenario: 's', impact: 'i', evidence: f.evidence, fix: 'guard', fingerprint: `fp${i}` })),
-      },
-      usage: { inputTokens: 10, cachedInputTokens: 0, cacheCreationTokens: 0, outputTokens: 5, toolCalls: 3, modelCalls: 1, wallMs: 10, estimatedCostUsd: 0.0001 },
-    };
-  },
-  async verify(_c, _m, finding) { return { real: finding.line === 2, confidence: 0.9, reason: finding.line === 2 ? 'confirmed' : 'line 1 is the signature' }; },
+const auth = { mode: 'token' as const, octokitFor: async () => { throw new Error('unused'); }, gitTokenFor: async () => 'tok', botLogin: async () => 'falcon[bot]', installationIdFor: async () => null };
+const meta = (origin: string, headSha: string, baseSha: string, over: Partial<PullMeta> = {}): PullMeta => ({
+  repo: 'acme/demo', number: 3, title: 'Use name', body: 'desc', author: 'ann', authorType: 'User', draft: false, state: 'open', merged: false, headSha, baseSha,
+  baseRef: 'main', headRef: 'feature', changedFiles: 3, additions: 2, deletions: 2, labels: [], htmlUrl: 'https://example.test/pr/3', cloneUrl: origin, ...over,
 });
+const configFor = (root: string) => ConfigSchema.parse({ stateDir: join(root, 'state'), policy: { defaultPack: new URL('../policies/default.yaml', import.meta.url).pathname } });
 
-test('worker runs a PR end to end: gates, git evidence, repo policy, verification, publish, feedback ids', async () => {
+function fakeReviewer(findings: Array<{ path: string; line: number; evidence: string; severity: 'critical' | 'high' | 'medium'; ruleId?: string }>, calls: { n: number }): Reviewer {
+  return {
+    async review(opts) {
+      calls.n++;
+      assert.ok(opts.turn.changedFiles.includes('svc.py'), 'svc.py stays in scope: the PR cannot exclude itself');
+      assert.ok(!opts.turn.changedFiles.includes('package-lock.json'), 'lockfile excluded by the engine pack');
+      assert.equal(opts.policy.verdict.mode, 'request_changes', 'the base branch policy governs, not the PR copy');
+      assert.ok(opts.turn.instructionDocs.some((d) => d.path === 'CLAUDE.md'), 'instruction files come from the base branch');
+      assert.ok(opts.turn.instructionDocs.some((d) => d.path === '(note)' && /changes \.falcon\/policy\.yaml/.test(d.text)), 'the reviewer is told the PR edits the policy');
+      opts.onStep?.({ seq: 1, at: new Date().toISOString(), tool: 'read_file', input: 'svc.py', durationMs: 3, outcome: 'ok' });
+      return {
+        output: {
+          summary: 'Null user crashes handler. token=ghp_abcdefghijklmnopqrstuvwxyz0123456789', confidence: 'high', reviewedFiles: opts.turn.changedFiles, lenses: opts.policy.lenses, questions: [],
+          findings: findings.map((f, i) => ({ id: `f${i}`.padEnd(12, '0'), ruleId: f.ruleId, severity: f.severity, blocking: false, path: f.path, line: f.line, side: 'RIGHT' as const, title: `Finding ${i}`, scenario: 's', impact: 'i', evidence: f.evidence, fix: 'guard', fingerprint: `fp${i}` })),
+        },
+        usage: { inputTokens: 10, cachedInputTokens: 0, cacheCreationTokens: 0, outputTokens: 5, toolCalls: 3, modelCalls: 1, wallMs: 10, estimatedCostUsd: 0.0001 },
+      };
+    },
+    async verify(_c, _m, finding) { return { real: finding.line === 2, confidence: 0.9, reason: finding.line === 2 ? 'confirmed' : 'line 1 is the signature' }; },
+  };
+}
+
+test('worker runs a PR end to end: base-branch policy, git evidence, verification, redaction, check run, publish, feedback ids, steps', async () => {
   const { root, origin, baseSha, headSha } = fixture();
-  const config = ConfigSchema.parse({ stateDir: join(root, 'state'), policy: { defaultPack: new URL('../policies/default.yaml', import.meta.url).pathname } });
   const store = new Store(':memory:');
-  const meta: PullMeta = { repo: 'acme/demo', number: 3, title: 'Use name', body: 'desc', author: 'ann', authorType: 'User', draft: false, state: 'open', merged: false, headSha, baseSha, baseRef: 'main', headRef: 'feature', changedFiles: 3, additions: 2, deletions: 2, labels: [], htmlUrl: 'https://example.test/pr/3', cloneUrl: origin };
-  const github = new FakeGitHub(meta);
+  const github = new FakeGitHub(meta(origin, headSha, baseSha));
+  const calls = { n: 0 };
   const reviewer = fakeReviewer([
     { path: 'svc.py', line: 2, evidence: 'user.name', severity: 'high' },
     { path: 'svc.py', line: 1, evidence: 'def handler', severity: 'critical' },
     { path: 'svc.py', line: 2, evidence: 'user.name', severity: 'medium', ruleId: 'noisy-rule' },
-  ]);
-  const auth = { mode: 'token' as const, octokitFor: async () => { throw new Error('unused'); }, gitTokenFor: async () => 'tok', botLogin: async () => 'falcon[bot]', installationIdFor: async () => null };
-  const ctx = { config, store, auth, anthropic: {} as Anthropic, reviewer, log, dryRun: false, githubFor: async () => github };
+  ], calls);
+  const ctx: WorkerContext = { config: configFor(root), store, auth, anthropic: {} as Anthropic, reviewer, log, dryRun: false, githubFor: async () => github, redactor: buildRedactor(['super-secret-value']) };
   const { job } = store.enqueue({ repo: 'acme/demo', number: 3, headSha, baseSha, baseRef: 'main', trigger: 'manual', receivedAt: 'now' });
   const leased = store.claim('t', 60, { perRepo: 1, global: 1 })!;
 
@@ -97,33 +110,51 @@ test('worker runs a PR end to end: gates, git evidence, repo policy, verificatio
   assert.equal(github.posted.length, 1);
   const review = github.posted[0]!;
   assert.equal(review.event, 'REQUEST_CHANGES', 'one verified blocking finding remains');
-  assert.equal(review.blocking.length, 1, 'verifier demoted the signature-line finding; suppression dropped the noisy rule');
-  assert.equal(review.comments.length, 2, 'both surviving findings sit on changed lines and go inline');
-  assert.ok(review.comments.some((c) => /verifier disagrees/.test(c.body)), 'demoted finding explains the verifier result inline');
-  assert.deepEqual(github.checks, ['action_required']);
+  assert.equal(review.comments.length, 2, 'verifier demoted one, suppression dropped one, both survivors inline');
+  assert.ok(review.comments.some((c) => /verifier disagrees/.test(c.body)));
+  assert.doesNotMatch(review.body, /ghp_abcdefghijklmnopqrstuvwxyz/, 'token-shaped text is redacted before publishing');
+  assert.match(review.body, /\[redacted github token\]/);
+  assert.deepEqual(github.checks.map((c) => c.status + (c.conclusion ? ':' + c.conclusion : '')), ['in_progress', 'completed:action_required']);
+  assert.equal(github.checks[1]!.id, github.checks[0]!.id, 'the in-progress check run is completed, not duplicated');
   assert.equal(store.job(job.id)?.status, 'published');
   assert.equal(store.findingByComment(100)?.path, 'svc.py', 'inline comment ids are stored for feedback');
-
-  // Same head again: skipped without a model call.
-  github.existing = [{ id: 1, htmlUrl: 'https://example.test/review/1' }];
-  const again = store.enqueue({ repo: 'acme/demo', number: 3, headSha, baseSha, baseRef: 'main', trigger: 'comment', receivedAt: 'now' });
-  assert.equal(again.created, false);
+  assert.equal(store.steps(job.id).length, 1, 'tool calls are recorded');
+  assert.equal(calls.n, 1);
 });
 
-test('worker holds on failed CI, requeues on pending CI, and skips drafts without touching git', async () => {
+test('a finished review survives publication failures and is republished without another model run', async () => {
   const { root, origin, baseSha, headSha } = fixture();
-  const config = ConfigSchema.parse({ stateDir: join(root, 'state'), policy: { defaultPack: new URL('../policies/default.yaml', import.meta.url).pathname } });
   const store = new Store(':memory:');
-  const meta: PullMeta = { repo: 'acme/demo', number: 3, title: 't', body: '', author: 'ann', authorType: 'User', draft: false, state: 'open', merged: false, headSha, baseSha, baseRef: 'main', headRef: 'f', changedFiles: 1, additions: 1, deletions: 1, labels: [], htmlUrl: 'u', cloneUrl: origin };
+  const github = new FakeGitHub(meta(origin, headSha, baseSha));
+  github.failPostsRemaining = 1;
+  const calls = { n: 0 };
+  const config = configFor(root);
+  const ctx: WorkerContext = { config, store, auth, anthropic: {} as Anthropic, reviewer: fakeReviewer([{ path: 'svc.py', line: 2, evidence: 'user.name', severity: 'high' }], calls), log, dryRun: false, githubFor: async () => github };
+  const { job } = store.enqueue({ repo: 'acme/demo', number: 3, headSha, baseSha, baseRef: 'main', trigger: 'poll', receivedAt: 'now' });
+  const first = await processJob(ctx, store.claim('t', 60, { perRepo: 1, global: 1 })!, 't');
+  assert.equal(first.status, 'deferred');
+  assert.match(first.reason!, /publication retry 1/);
+  assert.equal(store.job(job.id)?.status, 'queued');
+  assert.ok(store.pending(store.job(job.id)!), 'the rendered review is retained');
+
+  const again = store.claim('t2', 60, { perRepo: 1, global: 1 }, Date.now() / 1000 + 600)!;
+  const second = await processJob(ctx, again, 't2');
+  assert.equal(second.status, 'published');
+  assert.equal(calls.n, 1, 'the model ran once');
+  assert.equal(github.posted.length, 1);
+  assert.equal(store.job(job.id)?.status, 'published');
+});
+
+test('worker holds on failed CI, defers on pending CI, and skips drafts without touching git', async () => {
+  const { root, origin, baseSha, headSha } = fixture();
+  const config = configFor(root);
   const reviewer: Reviewer = { review: async () => { throw new Error('model must not be called'); }, verify: async () => undefined };
-  const auth = { mode: 'token' as const, octokitFor: async () => { throw new Error('unused'); }, gitTokenFor: async () => 'tok', botLogin: async () => null, installationIdFor: async () => null };
   for (const [ci, draft, expected] of [['failure', false, 'held'], ['pending', false, 'deferred'], ['success', true, 'skipped']] as const) {
-    const github = new FakeGitHub({ ...meta, draft }, ci);
+    const github = new FakeGitHub(meta(origin, headSha, baseSha, { draft }), ci);
     const s = new Store(':memory:');
     const { job } = s.enqueue({ repo: 'acme/demo', number: 3, headSha, baseSha, baseRef: 'main', trigger: 'poll', receivedAt: 'now' });
     const outcome = await processJob({ config, store: s, auth, anthropic: {} as Anthropic, reviewer, log, dryRun: false, githubFor: async () => github }, s.claim('t', 60, { perRepo: 1, global: 1 })!, 't');
     assert.equal(outcome.status, expected, `ci=${ci} draft=${draft}`);
     if (expected === 'deferred') assert.equal(s.job(job.id)?.status, 'queued');
   }
-  store.close();
 });

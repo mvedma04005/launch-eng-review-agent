@@ -14,18 +14,21 @@ import { findingsSummary, processJob } from './worker.ts';
 const USAGE = `falcon: PR review engine
 
   falcon review <pr-url> [--post]     Review one PR. Dry run by default: prints the review, posts nothing.
-  falcon serve                        Run the daemon (polling ingress, workers, status server when http.port is set).
+  falcon serve                        Run the daemon (polling ingress, workers, alerts, status server when http.port is set).
   falcon status                       Queue snapshot: counts by status and repository, jobs in review, spend today.
   falcon jobs [--limit N]             Recent jobs with outcome, wall time and estimated cost.
-  falcon job <id>                     One job with its usage and event trail.
+  falcon job <id>                     One job with its usage, tool-call trail and event trail.
+  falcon replay <id>                  Re-run a held or failed job. A retained finished review is republished without another model run.
+  falcon run-job <id> --owner <w>     Internal: run one already-leased job (used by process isolation).
 
 Environment: ANTHROPIC_API_KEY; GITHUB_TOKEN (token mode) or FALCON_GITHUB_PRIVATE_KEY with github.appId in falcon.yaml (app mode).`;
 
 async function main(argv: string[]): Promise<number> {
-  const { positionals, values } = parseArgs({ args: argv, allowPositionals: true, options: { post: { type: 'boolean', default: false }, config: { type: 'string' }, limit: { type: 'string' } } });
+  const { positionals, values } = parseArgs({ args: argv, allowPositionals: true, options: { post: { type: 'boolean', default: false }, config: { type: 'string' }, limit: { type: 'string' }, owner: { type: 'string' } } });
   const [command, arg] = positionals;
   const config = loadConfig(values.config);
   const out = (s: string) => process.stdout.write(s + '\n');
+  const openStore = () => new Store(join(config.stateDir, 'falcon.sqlite3'));
 
   if (command === 'review' && arg) {
     const { repo, number } = parsePullUrl(arg);
@@ -40,9 +43,19 @@ async function main(argv: string[]): Promise<number> {
     if (outcome.rendered) {
       out(`\n${outcome.rendered.body}\n\n--- inline comments (${outcome.rendered.comments.length}) ---`);
       for (const c of outcome.rendered.comments) out(`\n${c.path}:${c.line} (${c.side})\n${c.body}`);
-      out(`\n--- findings ---\n${findingsSummary(outcome.output?.findings ?? [])}\n--- usage ---\n${JSON.stringify(outcome.usage)}`);
+      out(`\n--- findings ---\n${findingsSummary(outcome.output?.findings ?? [])}\n--- tool calls ---`);
+      for (const s of store.steps(leased.id)) out(`${String(s.seq).padStart(3)} ${s.tool.padEnd(13)} ${String(s.durationMs).padStart(6)}ms ${s.outcome.padEnd(6)} ${s.input}`);
+      out(`--- usage ---\n${JSON.stringify(outcome.usage)}`);
     }
     out(`\nstatus: ${outcome.status}${outcome.reason ? ` (${outcome.reason})` : ''}${outcome.reviewUrl ? ` ${outcome.reviewUrl}` : ''}`);
+    store.close();
+    return outcome.status === 'held' ? 2 : 0;
+  }
+  if (command === 'run-job' && arg && values.owner) {
+    const store = openStore();
+    const job = store.job(arg);
+    if (!job || job.status !== 'leased' || job.leaseOwner !== values.owner) { process.stderr.write('run-job: job is not leased to this owner\n'); store.close(); return 1; }
+    const outcome = await processJob({ config, store, auth: githubAuthFromEnv(config), anthropic: new Anthropic(), reviewer: claudeReviewer, log, dryRun: config.dryRun }, job, values.owner);
     store.close();
     return outcome.status === 'held' ? 2 : 0;
   }
@@ -53,24 +66,30 @@ async function main(argv: string[]): Promise<number> {
     return 0;
   }
   if (command === 'status') {
-    const store = new Store(join(config.stateDir, 'falcon.sqlite3'));
+    const store = openStore();
     out(JSON.stringify(store.snapshot(), null, 2));
     store.close();
     return 0;
   }
   if (command === 'jobs') {
-    const store = new Store(join(config.stateDir, 'falcon.sqlite3'));
+    const store = openStore();
     const rows = store.recentJobs(Math.min(500, Number(values.limit ?? 30) || 30));
     out(['job      pr                              status      att  wall    cost     updated                   note', ...rows.map((j) =>
       `${j.id.slice(0, 8)} ${(j.repo + '#' + j.number).padEnd(31)} ${j.status.padEnd(11)} ${String(j.attempts).padEnd(4)} ${(j.wallMs == null ? '' : Math.round(j.wallMs / 1000) + 's').padEnd(7)} ${(j.costUsd == null ? '' : '$' + j.costUsd.toFixed(3)).padEnd(8)} ${j.updatedAt} ${j.error ?? ''}`)].join('\n'));
     store.close();
     return 0;
   }
-  if (command === 'job' && arg) {
-    const store = new Store(join(config.stateDir, 'falcon.sqlite3'));
+  if ((command === 'job' || command === 'replay') && arg) {
+    const store = openStore();
     const job = store.job(arg) ?? store.recentJobs(500).find((j) => j.id.startsWith(arg));
     if (!job) { out('no such job'); store.close(); return 1; }
-    out(JSON.stringify({ job, usage: store.usageFor(job.id), events: store.eventsFor(job.id) }, null, 2));
+    if (command === 'replay') {
+      if (!['held', 'failed', 'skipped'].includes(job.status)) { out(`job is ${job.status}; only held, failed or skipped jobs can be replayed`); store.close(); return 1; }
+      store.requeue(job.id, 0, `operator replay${store.pending(job) ? ' (retained review will be republished)' : ''}`);
+      out(`queued ${job.id}${store.pending(job) ? ' with its retained review' : ' for a fresh review'}`);
+    } else {
+      out(JSON.stringify({ job, usage: store.usageFor(job.id), steps: store.steps(job.id), events: store.eventsFor(job.id) }, null, 2));
+    }
     store.close();
     return 0;
   }

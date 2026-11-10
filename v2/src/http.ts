@@ -45,7 +45,7 @@ function route(req: IncomingMessage, res: ServerResponse, store: Store): void {
   if (jobMatch) {
     const job = store.job(jobMatch[1]!);
     if (!job) return send(res, 404, 'application/json', '{"error":"not found"}');
-    return send(res, 200, 'application/json', JSON.stringify({ job, usage: store.usageFor(job.id), events: store.eventsFor(job.id) }));
+    return send(res, 200, 'application/json', JSON.stringify({ job, usage: store.usageFor(job.id), steps: store.steps(job.id), events: store.eventsFor(job.id) }));
   }
   if (url.pathname === '/') return send(res, 200, 'text/html; charset=utf-8', dashboard(store));
   send(res, 404, 'text/plain', 'not found');

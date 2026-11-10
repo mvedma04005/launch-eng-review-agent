@@ -45,4 +45,6 @@ limits:
 http: { port: 8088 }
 ```
 
+Dedicated Mac install: `bash deploy/install-mac.sh` as the service user, then fill `~/.config/falcon/env`. Runbook: [`deploy/MAC.md`](deploy/MAC.md). Other commands: `falcon job <id>` (usage, tool-call trail, events), `falcon replay <id>` (republish a retained review or re-run a held job).
+
 Layout: `src/policy` (packs, merge, enforcement), `src/queue` (SQLite store with leases), `src/evidence` (git mirror, worktree, diff anchors), `src/reviewer` (tools, validation, prompts, Claude), `src/publisher` (render, GitHub), `src/ingress` (auth, polling), `src/feedback`, `src/learning`, `src/worker.ts`, `src/serve.ts`, `src/cli.ts`. Engine policy: `policies/default.yaml`.

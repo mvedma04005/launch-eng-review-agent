@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { Finding, FindingOutcome, Job, JobStatus, Lesson, ReviewRequest, Usage } from '../types.ts';
+import type { Finding, FindingOutcome, Job, JobStatus, Lesson, PendingPublication, ReviewRequest, ReviewStep, Usage } from '../types.ts';
 
 const SCHEMA = `
 pragma journal_mode = WAL;
@@ -38,6 +38,9 @@ create table if not exists lessons(
   confidence real not null, uses integer not null default 0, created_at text not null, last_used_at text, retired_at text);
 create index if not exists lessons_repo on lessons(repo, retired_at);
 create table if not exists cursors(key text primary key, value text not null);
+create table if not exists steps(
+  job_id text not null references jobs(id), seq integer not null, at text not null, tool text not null,
+  input text not null, duration_ms integer not null, outcome text not null, primary key(job_id, seq));
 `;
 
 const now = () => new Date().toISOString();
@@ -123,6 +126,39 @@ export class Store {
     this.db.prepare(`update jobs set status='queued', lease_owner=null, lease_until=null, ready_after=?, error=?, updated_at=? where id=?`)
       .run(Date.now() / 1000 + delaySeconds, reason, now(), jobId);
     this.event(jobId, 'requeued', { reason, delaySeconds });
+  }
+
+  /** Saves a finished review so publication can be retried, or replayed by an operator, without another model run. */
+  savePending(jobId: string, pending: PendingPublication): void {
+    this.db.prepare('update jobs set result_json=?, updated_at=? where id=?').run(JSON.stringify({ pending }), now(), jobId);
+    this.event(jobId, 'review_rendered', { head: pending.headSha, event: pending.event, comments: pending.comments.length });
+  }
+
+  pending(job: Pick<Job, 'resultJson' | 'headSha'>): PendingPublication | null {
+    if (!job.resultJson) return null;
+    try {
+      const parsed = JSON.parse(job.resultJson) as { pending?: PendingPublication };
+      return parsed.pending && parsed.pending.headSha === job.headSha ? parsed.pending : null;
+    } catch { return null; }
+  }
+
+  recordStep(jobId: string, step: ReviewStep): void {
+    this.db.prepare('insert or replace into steps(job_id, seq, at, tool, input, duration_ms, outcome) values(?,?,?,?,?,?,?)')
+      .run(jobId, step.seq, step.at, step.tool, step.input, step.durationMs, step.outcome);
+  }
+
+  steps(jobId: string): ReviewStep[] {
+    return (this.db.prepare('select seq, at, tool, input, duration_ms, outcome from steps where job_id=? order by seq').all(jobId) as Array<{ seq: number; at: string; tool: string; input: string; duration_ms: number; outcome: string }>)
+      .map((r) => ({ seq: r.seq, at: r.at, tool: r.tool, input: r.input, durationMs: r.duration_ms, outcome: r.outcome as ReviewStep['outcome'] }));
+  }
+
+  failedSince(sinceIso: string): number {
+    return (this.db.prepare(`select count(*) as n from jobs where status='failed' and updated_at>=?`).get(sinceIso) as { n: number }).n;
+  }
+
+  lastProgressAt(): string | null {
+    const row = this.db.prepare(`select max(updated_at) as at from jobs where status in ('published','skipped','held')`).get() as { at: string | null };
+    return row.at;
   }
 
   job(id: string): Job | null {

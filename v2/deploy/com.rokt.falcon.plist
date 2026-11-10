@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Installed by deploy/install-mac.sh into ~/Library/LaunchAgents for the dedicated service user. -->
+  <key>Label</key><string>com.rokt.falcon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__FALCON_HOME__/deploy/falcon-launch.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>__FALCON_HOME__</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>15</integer>
+  <key>ExitTimeOut</key><integer>120</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>__FALCON_STATE__/logs/falcon.out.log</string>
+  <key>StandardErrorPath</key><string>__FALCON_STATE__/logs/falcon.err.log</string>
+</dict>
+</plist>

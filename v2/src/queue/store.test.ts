@@ -70,3 +70,18 @@ test('lessons are scoped by path prefix and bounded', () => {
   assert.deepEqual(store.lessons('ROKT/x', ['src/a.ts'], 10).map((l) => l.text), ['Repo-wide lesson.']);
   assert.deepEqual(store.lessons('ROKT/x', ['Orbit/x.js'], 1).map((l) => l.text), ['Orbit uses Aurelia 1.x intentionally.']);
 });
+
+test('pending publications and tool-call steps round-trip', () => {
+  const store = new Store(':memory:');
+  const { job } = store.enqueue(req());
+  assert.equal(store.pending(job), null);
+  store.savePending(job.id, { headSha: job.headSha, event: 'COMMENT', body: 'b', comments: [], checkConclusion: 'neutral', blockingCount: 0, summary: 's', attempts: 2, renderedAt: 'now' });
+  assert.equal(store.pending(store.job(job.id)!)?.attempts, 2);
+  assert.equal(store.pending({ ...store.job(job.id)!, headSha: 'z'.repeat(40) }), null, 'a review for another head is never replayed');
+  store.recordStep(job.id, { seq: 1, at: 'now', tool: 'read_file', input: 'a.ts:1-', durationMs: 4, outcome: 'ok' });
+  store.recordStep(job.id, { seq: 2, at: 'now', tool: 'search', input: 'foo', durationMs: 9, outcome: 'budget' });
+  assert.deepEqual(store.steps(job.id).map((s) => [s.seq, s.tool, s.outcome]), [[1, 'read_file', 'ok'], [2, 'search', 'budget']]);
+  store.finish(job.id, 'failed', { error: 'x' });
+  assert.equal(store.failedSince('1970-01-01T00:00:00Z'), 1);
+  assert.equal(store.lastProgressAt(), null, 'failed is not progress');
+});

@@ -1,5 +1,23 @@
 import { App } from '@octokit/app';
+import { throttling } from '@octokit/plugin-throttling';
 import { Octokit } from '@octokit/rest';
+import { log as baseLog } from '../log.ts';
+import { metrics } from '../metrics.ts';
+
+/** Octokit that backs off on primary and secondary rate limits instead of failing the review. */
+const throttle = {
+  onRateLimit: (retryAfter: number, options: { method: string; url: string }, _octokit: unknown, retryCount: number) => {
+    metrics.deferred.inc({ repo: 'github', reason: 'rate_limit' });
+    baseLog.warn({ retryAfter, method: options.method, url: options.url, retryCount }, 'GitHub rate limit; backing off');
+    return retryCount < 3;
+  },
+  onSecondaryRateLimit: (retryAfter: number, options: { method: string; url: string }, _octokit: unknown, retryCount: number) => {
+    metrics.deferred.inc({ repo: 'github', reason: 'secondary_rate_limit' });
+    baseLog.warn({ retryAfter, method: options.method, url: options.url, retryCount }, 'GitHub secondary rate limit; backing off');
+    return retryCount < 3;
+  },
+};
+const ThrottledOctokit = Octokit.plugin(throttling).defaults({ throttle });
 import type { Config } from '../config.ts';
 import type { Store } from '../queue/store.ts';
 import type { ReviewRequest } from '../types.ts';
@@ -18,7 +36,7 @@ export interface GitHubAuth {
 export function githubAuthFromEnv(config: Config, env = process.env): GitHubAuth {
   const pem = env[config.github.privateKeyEnv];
   if (config.github.appId && pem) {
-    const app = new App({ appId: config.github.appId, privateKey: pem, Octokit });
+    const app = new App({ appId: config.github.appId, privateKey: pem, Octokit: ThrottledOctokit as unknown as typeof Octokit });
     const installations = new Map<string, number>();
     const resolveInstallation = async (repo: string): Promise<number> => {
       const hit = installations.get(repo);
@@ -48,7 +66,7 @@ export function githubAuthFromEnv(config: Config, env = process.env): GitHubAuth
   }
   const token = env[config.github.tokenEnv];
   if (!token) throw new Error(`No GitHub credentials: set ${config.github.privateKeyEnv} with github.appId, or ${config.github.tokenEnv} for token mode.`);
-  const octokit = new Octokit({ auth: token });
+  const octokit = new ThrottledOctokit({ auth: token }) as unknown as Octokit;
   let login: string | null = null;
   return {
     mode: 'token',

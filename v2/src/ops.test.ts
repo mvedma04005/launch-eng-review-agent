@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
+import { AlertState, evaluateAlerts } from './alerts.ts';
 import { ConfigSchema } from './config.ts';
 import { registerStoreGauges, startStatusServer } from './http.ts';
 import { log } from './log.ts';
@@ -92,4 +93,20 @@ test('status server serves health, metrics, queue snapshot, jobs and the dashboa
     server.close();
     store.close();
   }
+});
+
+test('alerts fire on sustained stall, spend near cap and repeated failures, and clear edge-triggered', () => {
+  const config = ConfigSchema.parse({ limits: { daily: { globalUsd: 100 } }, alerts: { stallMinutes: 30, failuresPerHour: 3 } });
+  const snapshot = { at: 'now', byStatus: { queued: 4 }, byRepo: [], leased: [], oldestQueuedAgeSec: 45 * 60, spendTodayUsd: 85 };
+  const now = new Date('2026-11-10T12:00:00Z');
+  const active = evaluateAlerts(config, { snapshot, lastProgressAt: new Date('2026-11-10T11:00:00Z'), failedLastHour: 3, now });
+  assert.deepEqual([...active.keys()].sort(), ['repeated_failures', 'spend_near_cap', 'stalled']);
+  assert.equal(evaluateAlerts(config, { snapshot, lastProgressAt: new Date('2026-11-10T11:50:00Z'), failedLastHour: 0, now }).has('stalled'), false, 'recent progress means the queue is slow, not stalled');
+  assert.equal(evaluateAlerts(config, { snapshot: { ...snapshot, byStatus: {}, spendTodayUsd: 1 }, lastProgressAt: null, failedLastHour: 0, now }).size, 0);
+  const state = new AlertState();
+  assert.equal(state.transition(active).length, 3, 'three new conditions announced');
+  assert.equal(state.transition(active).length, 0, 'nothing repeated while they persist');
+  const cleared = state.transition(new Map());
+  assert.equal(cleared.length, 3);
+  assert.ok(cleared.every((m) => m.startsWith('🟢 Cleared')));
 });
