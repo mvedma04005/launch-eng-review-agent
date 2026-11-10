@@ -100,3 +100,10 @@ test('only a team member who is not the author can override', () => {
   assert.equal(overrideBy(p, 'eve', ['mallory']), null, 'not on the team');
   assert.equal(overrideBy(p, 'eve', []), null);
 });
+
+test('the engine pack lets a repository opt into approvals', () => {
+  const base = loadPolicyFile(new URL('../../policies/default.yaml', import.meta.url).pathname);
+  const merged = mergePolicies(base, parsePolicy('version: 1\nname: le\nverdict: { mode: approve }', 'le'));
+  assert.equal(merged.verdict.mode, 'approve');
+  assert.equal(base.verdict.mode, 'comment', 'repositories without a pack still only comment');
+});

@@ -17,9 +17,10 @@ scope:
     - "**/generated/**"
 verdict:
   mode: comment
-  # Repositories may opt into request_changes in their own .falcon/policy.yaml; raising this to approve lets them
-  # also opt into approvals. This is the one knob that decides how much authority the bot can have anywhere.
-  maxMode: request_changes
+  # The default mode stays comment: a repository with no .falcon/policy.yaml only comments. A repository may opt into
+  # request_changes or approve in its own pack; this ceiling clamps anything higher. It is the one knob that decides
+  # how much authority the bot can have anywhere.
+  maxMode: approve
   blockOn: [critical, high]
   checkRun: true
   verifyBlocking: true
