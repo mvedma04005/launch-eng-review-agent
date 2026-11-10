@@ -110,12 +110,12 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
   let checkId: number | null = null;
   let checksEnabled = false;
   try {
-    if (!isAllowedRepo(ctx.config, job.repo)) return done('skipped', `${job.repo} is not in the repository allowlist (${ctx.config.github.repos.join(', ')}).`);
+    if (!isAllowedRepo(ctx.config, job.repo)) return await done('skipped', `${job.repo} is not in the repository allowlist (${ctx.config.github.repos.join(', ')}).`);
     const meta = await github.pull(job.repo, job.number);
-    if (meta.state !== 'open' || meta.merged) return done('skipped', 'PR is closed or merged.');
-    if (meta.draft) return done('skipped', 'PR is a draft; it will be reviewed when marked ready.');
-    if (meta.headSha !== job.headSha) return done('skipped', `Head moved to ${meta.headSha.slice(0, 12)}; a newer job covers it.`);
-    if (meta.authorType === 'Bot') return done('skipped', 'Bot-authored PR.');
+    if (meta.state !== 'open' || meta.merged) return await done('skipped', 'PR is closed or merged.');
+    if (meta.draft) return await done('skipped', 'PR is a draft; it will be reviewed when marked ready.');
+    if (meta.headSha !== job.headSha) return await done('skipped', `Head moved to ${meta.headSha.slice(0, 12)}; a newer job covers it.`);
+    if (meta.authorType === 'Bot') return await done('skipped', 'Bot-authored PR.');
 
     const existing = await github.ownReviews(job.repo, job.number, job.headSha);
     if (existing.length) return { ...(await done('skipped', 'Already reviewed at this head.')), reviewUrl: existing[0]!.htmlUrl };
@@ -131,7 +131,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
 
     const ci = await github.ci(job.repo, job.headSha);
     if (ci === 'pending') return defer(90, 'CI still running', 'ci_pending');
-    if (ci === 'failure') return done('held', 'CI failed at this head; fix CI and the next push is reviewed automatically.');
+    if (ci === 'failure') return await done('held', 'CI failed at this head; fix CI and the next push is reviewed automatically.');
 
     const capReason = dailyCapReason(ctx.store, ctx.config, job.repo);
     if (capReason) return defer(secondsUntilNextUtcDay(), capReason, 'daily_cap');
@@ -160,23 +160,23 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     const override = overrideBy(policy, meta.author, await github.approvers(job.repo, job.number, job.headSha));
     if (!override && policy.outsiders.requirePlan && !isTeamMember(policy, meta.author)) {
       const missing = missingPlanSections(meta.body, policy.outsiders.planHeadings);
-      if (missing.length) return done('skipped', `This PR needs a short write-up before review. Add or fill in these sections in the description: ${missing.map((h) => `## ${h}`).join(', ')}. Say what problem this solves and how the change solves it, in a few sentences each. ${RERUN}`, 'block');
+      if (missing.length) return await done('skipped', `This PR needs a short write-up before review. Add or fill in these sections in the description: ${missing.map((h) => `## ${h}`).join(', ')}. Say what problem this solves and how the change solves it, in a few sentences each. ${RERUN}`, 'block');
     }
     const budget = effectiveBudget(ctx.config, policy);
     // Deleted files are part of the change: their lines count toward the size limit and the reviewer sees them.
     const changed = anchors.files.map((f) => f.path);
     const excluded = changed.filter((p) => !inScope(policy, p));
     const inScopeFiles = changed.filter((p) => inScope(policy, p));
-    if (!inScopeFiles.length) return done('skipped', 'No in-scope files changed.');
-    if (inScopeFiles.length > policy.budgets.maxChangedFiles) return done('held', `${inScopeFiles.length} changed files exceeds the policy budget of ${policy.budgets.maxChangedFiles}.`, true);
+    if (!inScopeFiles.length) return await done('skipped', 'No in-scope files changed.');
+    if (inScopeFiles.length > policy.budgets.maxChangedFiles) return await done('held', `${inScopeFiles.length} changed files exceeds the policy budget of ${policy.budgets.maxChangedFiles}.`, true);
     const changedLines = anchors.files.filter((f) => inScopeFiles.includes(f.path)).reduce((n, f) => n + f.additions + f.deletions, 0);
-    if (changedLines > policy.budgets.maxChangedLines && override) return done('skipped', `${changedLines} changed lines is over the limit of ${policy.budgets.maxChangedLines}; overridden by @${override}, not reviewed.`, 'pass');
-    if (changedLines > policy.budgets.maxChangedLines) return done('skipped', `${changedLines} changed lines exceeds the policy budget of ${policy.budgets.maxChangedLines}. Split the PR into smaller, focused PRs so the review can assess the changes and their interactions reliably. ${RERUN}`, 'block');
+    if (changedLines > policy.budgets.maxChangedLines && override) return await done('skipped', `${changedLines} changed lines is over the limit of ${policy.budgets.maxChangedLines}; overridden by @${override}, not reviewed.`, 'pass');
+    if (changedLines > policy.budgets.maxChangedLines) return await done('skipped', `${changedLines} changed lines exceeds the policy budget of ${policy.budgets.maxChangedLines}. Split the PR into smaller, focused PRs so the review can assess the changes and their interactions reliably. ${RERUN}`, 'block');
     const instructionDocs = await collectInstructionDocs(trustedRead, inScopeFiles, policy);
     const requiredDocs: Array<{ path: string; text: string }> = [];
     for (const p of policy.context.required) {
       const text = await trustedRead(p);
-      if (text === null) return done('held', `Required context file ${p} is missing on the default branch.`, true);
+      if (text === null) return await done('held', `Required context file ${p} is missing on the default branch.`, true);
       requiredDocs.push({ path: p, text });
     }
     if (policyChangedInPr) instructionDocs.unshift({ path: '(note)', text: `This PR changes ${ctx.config.policy.repoPath}. The review was governed by the default branch's version; treat the PR's version as a change under review.` });

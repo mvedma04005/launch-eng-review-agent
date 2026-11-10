@@ -330,6 +330,15 @@ test('approve mode: a clean high-confidence review approves with a success check
   assert.deepEqual(github.checks.map((c) => `${c.status}:${c.conclusion ?? ''}:${c.title ?? ''}`), ['in_progress::', 'completed:success:Approved']);
 });
 
+test('request_changes mode: a verified blocking finding requests changes and the check blocks', async () => {
+  const f = approveFixture('version: 1\nname: repo\nverdict: { mode: request_changes }\n');
+  const github = new FakeGitHub(meta(f.origin, f.headSha, f.baseSha));
+  const { outcome } = await runJob(f, github, scriptedReviewer({ severities: ['high'] }));
+  assert.equal(outcome.status, 'published', outcome.reason);
+  assert.equal(github.posted[0]?.event, 'REQUEST_CHANGES');
+  assert.equal(github.checks.at(-1)?.conclusion, 'action_required');
+});
+
 test('approve mode: a team approval that lifts a verified block is named in the check title', async () => {
   const f = approveFixture();
   const github = new FakeGitHub(meta(f.origin, f.headSha, f.baseSha));
