@@ -1,0 +1,26 @@
+{
+  "name": "falcon-review-engine",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PR review engine: GitHub App ingress, durable queue, policy packs, Claude reviewer, idempotent publisher, feedback loop.",
+  "type": "module",
+  "engines": { "node": ">=22.18" },
+  "bin": { "falcon": "./bin/falcon.js" },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types 'src/**/*.test.ts'",
+    "falcon": "node --experimental-strip-types src/cli.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.7.0",
+    "@octokit/app": "^16.1.4",
+    "@octokit/rest": "^22.0.0",
+    "pino": "^9.6.0",
+    "yaml": "^2.7.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.0"
+  }
+}

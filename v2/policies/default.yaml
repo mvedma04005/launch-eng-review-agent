@@ -1,0 +1,78 @@
+# Engine-wide policy pack. Repositories refine it with .falcon/policy.yaml (same schema).
+version: 1
+name: engine-default
+description: Material correctness, security and operability review. Style is never a finding.
+scope:
+  include: ["**"]
+  exclude:
+    - "**/*.lock"
+    - "**/package-lock.json"
+    - "**/pnpm-lock.yaml"
+    - "**/yarn.lock"
+    - "**/__snapshots__/**"
+    - "**/*.snap"
+    - "**/*.min.js"
+    - "**/dist/**"
+    - "**/vendor/**"
+    - "**/generated/**"
+verdict:
+  mode: comment
+  # Repositories may opt into request_changes in their own .falcon/policy.yaml; raising this to approve lets them
+  # also opt into approvals. This is the one knob that decides how much authority the bot can have anywhere.
+  maxMode: request_changes
+  blockOn: [critical, high]
+  checkRun: true
+  verifyBlocking: true
+lenses: [correctness, security, operability]
+budgets:
+  maxChangedFiles: 300
+  maxFileBytes: 400000
+  maxToolCalls: 80
+  maxMinutes: 25
+  inlineDiffBytes: 200000
+context:
+  instructionFiles: [AGENTS.md, CLAUDE.md]
+standards:
+  - title: What blocks a merge
+    text: |
+      Only substantiated, material problems block: exploitable vulnerabilities, broken authorization or trust
+      boundaries, data loss or corruption, real correctness or concurrency bugs, broken service contracts,
+      unsafe migrations, and realistic reliability or performance failures. Formatting, naming, import order,
+      preferred abstractions, speculative future scale, and missing tests alone never block.
+  - title: How to review
+    text: |
+      Understand the intent, contracts, state ownership and failure behavior of the change first, then trace the
+      implementation through its callers and consumers using the repository tools. Prefer the smallest practical
+      fix. Honest uncertainty is a question, not an invented blocker. A clean approval is a successful review.
+rules:
+  - id: secrets-in-code
+    title: No credentials or tokens committed
+    severity: critical
+    guidance: Any literal secret, private key, or token in source or config is critical. Quote only a harmless substring.
+  - id: authz-boundary
+    title: Authorization and trust boundaries hold
+    severity: high
+    guidance: New or changed endpoints, handlers and jobs must enforce the same authentication and authorization as their neighbors; untrusted input is validated before use.
+  - id: data-integrity
+    title: No data loss or unsafe migration
+    severity: high
+    guidance: Schema changes, backfills and deletes must be reversible or guarded; writes must not silently drop or corrupt data.
+  - id: concurrency
+    title: Shared state is safe under concurrency
+    severity: high
+    guidance: Races, missing idempotency on retried operations, and unguarded shared mutable state are findings when a realistic interleaving breaks behavior.
+  - id: contract-break
+    title: Service and API contracts are preserved
+    severity: high
+    guidance: Changes to request or response shapes, events, or persisted formats must remain compatible with existing consumers or migrate them in the same change.
+  - id: error-handling
+    title: Failures are handled, not hidden
+    severity: medium
+    guidance: Swallowed exceptions, missing timeouts, and unbounded retries are findings when they would hide or amplify a production failure.
+  - id: operability
+    title: The change can be run and diagnosed
+    severity: medium
+    guidance: New behavior that cannot be observed, configured, or rolled back when it misbehaves is a finding when the blast radius is real.
+feedback:
+  learn: true
+  maxLessons: 40

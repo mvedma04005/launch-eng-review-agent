@@ -13,3 +13,5 @@ progress.md
 *.sqlite3
 *.db
 .DS_Store
+node_modules/
+v2/falcon.yaml
