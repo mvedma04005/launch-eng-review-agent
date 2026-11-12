@@ -19,7 +19,7 @@ const OPS = '@rokt/gtm-operations-customer-operations';
 const FALCON = 'falcon-review[bot]';
 
 const verdict = (files: string[], approvers: string[], team = ['Lee', 'mvedma04005']) =>
-  gateVerdict({ files, codeowners: CODEOWNERS, teamOwner: '@ROKT/launch-engineering', team, approvers, falcon: FALCON }).verdict;
+  gateVerdict({ files, codeowners: CODEOWNERS, team, approvers, falcon: FALCON }).verdict;
 
 test('ownersOf takes the last matching CODEOWNERS line', () => {
   const cases: Record<string, string[]> = {
@@ -51,12 +51,13 @@ test('ownersOf follows the CODEOWNERS pattern shapes', () => {
   for (const [pattern, path, matches] of cases) assert.equal(ownersOf(path, `${pattern} @x`).length === 1, matches, `${pattern} ${path}`);
 });
 
-test('Falcon counts wherever the team is an owner, and nowhere else', () => {
-  assert.equal(verdict(['Orbit/a.py', 'supplementals/ops-records-api/infra/rds.tf'], [FALCON]), 'pass');
-  assert.equal(verdict(['prism-qa/src/app.ts'], [FALCON]), 'pass');
-  assert.equal(verdict(['merlin-chrome-extension-suite/a.js'], [FALCON]), 'wait');
-  assert.equal(verdict(['supplementals/ops-records-api/x/issuebot.py'], [FALCON]), 'wait');
-  assert.equal(verdict(['rokt-pixel-helper/manifest.json'], [FALCON]), 'wait');
+test('a team member or Falcon covers every path, whoever CODEOWNERS gives it to', () => {
+  for (const path of ['Orbit/a.py', 'supplementals/ops-records-api/infra/rds.tf', 'prism-qa/src/app.ts', 'rokt-pixel-helper/manifest.json']) {
+    assert.equal(verdict([path], [FALCON]), 'pass', path);
+    assert.equal(verdict([path], ['LEE']), 'pass', path);
+    assert.equal(verdict([path], ['alex']), 'wait', path); // Another owner team's approval alone is not enough.
+  }
+  assert.equal(verdict(['Orbit/a.py'], ['lee'], []), 'wait'); // No team list in the pack yet.
 });
 
 test('Falcon never covers the files that decide who may merge', () => {
@@ -66,25 +67,24 @@ test('Falcon never covers the files that decide who may merge', () => {
   }
 });
 
-test('a person counts only as an owner', () => {
-  assert.equal(verdict(['Orbit/a.py'], ['LEE']), 'pass');
-  assert.equal(verdict(['Orbit/a.py'], ['alex']), 'wait');
-  assert.equal(verdict(['Orbit/a.py'], ['lee'], []), 'wait'); // No team list in the pack yet.
-  assert.equal(verdict(['merlin-chrome-extension-suite/a.js'], ['pep-rokt']), 'pass');
-  assert.equal(verdict(['supplementals/ops-records-api/x/issuebot.py'], ['lee']), 'wait');
-});
-
-test('another owner team is unknown, never a guess', () => {
-  assert.equal(verdict(['prism-qa/src/app.ts'], ['alex']), 'unknown');
-  assert.equal(verdict(['rokt-pixel-helper/manifest.json'], ['lee']), 'wait');
+test('where CODEOWNERS names people, one of them must approve as well', () => {
+  const issuebot = 'supplementals/ops-records-api/x/issuebot.py';
+  assert.equal(verdict([issuebot], [FALCON]), 'wait');
+  assert.equal(verdict([issuebot], ['lee']), 'wait');
+  assert.equal(verdict([issuebot], ['oz-rokt']), 'wait'); // The owner alone: still needs the team or Falcon.
+  assert.equal(verdict([issuebot], ['oz-rokt', FALCON]), 'pass');
+  assert.equal(verdict([issuebot], ['liamstoryrokt', 'lee']), 'pass');
+  assert.equal(verdict(['merlin-chrome-extension-suite/a.js'], ['pep-rokt', FALCON]), 'pass');
 });
 
 test('every file needs cover, and an unknown Falcon login counts for nothing', () => {
   const files = ['Orbit/a.py', 'merlin-chrome-extension-suite/a.js'];
-  assert.deepEqual(gateVerdict({ files, codeowners: CODEOWNERS, teamOwner: LE, team: [], approvers: [FALCON], falcon: FALCON }), { verdict: 'wait', uncovered: ['merlin-chrome-extension-suite/a.js'] });
+  assert.deepEqual(gateVerdict({ files, codeowners: CODEOWNERS, team: ['lee'], approvers: [FALCON], falcon: FALCON }), { verdict: 'wait', uncovered: ['merlin-chrome-extension-suite/a.js'] });
   assert.equal(verdict(files, [FALCON, 'pep-rokt']), 'pass');
   assert.equal(verdict([], [FALCON]), 'wait');
-  assert.equal(gateVerdict({ files: ['Orbit/a.py'], codeowners: CODEOWNERS, teamOwner: LE, team: [], approvers: [FALCON], falcon: null }).verdict, 'wait');
+  assert.equal(gateVerdict({ files: ['Orbit/a.py'], codeowners: CODEOWNERS, team: [], approvers: [FALCON], falcon: null }).verdict, 'wait');
+  // A bot is never a person, also when its login is unknown and someone lists it in the team.
+  assert.equal(gateVerdict({ files: ['.falcon/policy.yaml'], codeowners: CODEOWNERS, team: ['lee', FALCON], approvers: [FALCON], falcon: null }).verdict, 'wait');
 });
 
 test('a line break in a file name does not skip the more specific CODEOWNERS line', () => {

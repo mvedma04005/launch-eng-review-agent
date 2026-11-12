@@ -30,19 +30,18 @@ export interface GateDeps {
   falcon: string | null;
   /** Path of the repository's policy pack, which holds the team list. */
   repoPack: string;
-  /** The PRs requested in Chat. The gate judges no others. */
-  requested: Set<number>;
+  /** The PRs requested in Chat: the gate judges no others. Null: it judges every open PR into the default branch. */
+  requested: Set<number> | null;
   dryRun: boolean;
 }
 
 function describe({ verdict, uncovered }: GateVerdict, approvers: string[], tooMany: boolean, moved: boolean): { title: string; summary: string } {
   const who = approvers.length ? `Approved on this commit by ${approvers.join(', ')}.` : 'Nobody has approved this commit yet.';
   const list = uncovered.slice(0, 10).map((f) => `\`${f}\``).join(', ') + (uncovered.length > 10 ? ` and ${uncovered.length - 10} more` : '');
-  if (verdict === 'pass') return { title: 'Approved by an owner or Falcon', summary: `${who} Every changed file has an approval from one of its owners.` };
+  if (verdict === 'pass') return { title: 'Approved by an owner or Falcon', summary: `${who} A team member or Falcon approved, and every file that names its owners has one of them.` };
   if (moved) return { title: 'Waiting: the PR changed while it was being checked', summary: 'The PR was pushed to or edited during the check. It is checked again on the next pass.' };
   if (tooMany) return { title: 'Waiting: too many files to check', summary: 'This PR changes more files than GitHub lists, so the list of files may be incomplete. Split the PR.' };
-  if (verdict === 'unknown') return { title: 'Waiting: cannot confirm the approver is an owner', summary: `${who} These files have an owner team whose members Falcon cannot read: ${list}.` };
-  return { title: 'Waiting for an owner or Falcon to approve', summary: `${who} No owner approval covers: ${list || 'this change'}.` };
+  return { title: 'Waiting for an owner or Falcon to approve', summary: `${who} Still needs an approval from a team member or Falcon, or from a named owner, for: ${list || 'this change'}.` };
 }
 
 /**
@@ -64,14 +63,15 @@ async function readPull(github: GatePort, repo: string, number: number, author: 
 }
 
 /**
- * One pass over the open PRs into the default branch that were requested in Chat. It judges the ones that changed since the last pass, and
+ * One pass over the open PRs into the default branch (only those requested in Chat, unless `requested` is null). It judges the ones that changed since the last pass, and
  * all of them when the rules changed or half an hour has gone by, and posts the check when the decision differs
  * from the last one posted. Returns the number of checks posted.
  */
 export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()): Promise<number> {
   const { github, store, log } = deps;
-  if (!deps.requested.size) return 0;
-  const open = (await github.openPulls(repo)).filter((p) => p.baseRef === p.defaultBranch && deps.requested.has(p.number));
+  const requested = deps.requested;
+  // A PR that already has a check keeps being judged, so a pass is withdrawn even after the PR leaves the list.
+  const open = (await github.openPulls(repo)).filter((p) => p.baseRef === p.defaultBranch && (!requested || requested.has(p.number) || store.cursor(`gate:${repo}#${p.number}`) !== null));
   if (!open.length) return 0;
   // Owners and the team list come from the default branch, never from the PR being judged.
   const branch = open[0]!.defaultBranch;
@@ -107,7 +107,7 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
       const read = await readPull(github, repo, p.number, p.author);
       if (!read.open || read.baseRef !== branch) continue; // Closed or retargeted since it was listed.
       // A PR that will not hold still gets a wait, never a skip: an old pass must not survive because the PR keeps moving.
-      const result: GateVerdict = !read.steady || read.files === null ? { verdict: 'wait', uncovered: [] } : gateVerdict({ files: read.files, codeowners, teamOwner: deps.teamOwner, team, approvers: read.approvers, falcon: deps.falcon });
+      const result: GateVerdict = !read.steady || read.files === null ? { verdict: 'wait', uncovered: [] } : gateVerdict({ files: read.files, codeowners, team, approvers: read.approvers, falcon: deps.falcon });
       // `moved` never equals a judged state, so the next pass posts the real verdict.
       const state = read.steady ? `${read.headSha}:${result.verdict}:${read.approvers.join(',')}:${result.uncovered.length}` : `${read.headSha}:moved`;
       const key = `gate:${repo}#${p.number}`;

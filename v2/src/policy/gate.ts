@@ -10,9 +10,7 @@ export interface GateInput {
   files: string[];
   /** CODEOWNERS text from the default branch. */
   codeowners: string;
-  /** The CODEOWNERS entry Falcon stands in for, e.g. `@ROKT/launch-engineering`. */
-  teamOwner: string;
-  /** Logins of that team, from the policy pack. */
+  /** Logins of the team, from the policy pack. */
   team: string[];
   /** Logins whose latest verdict on the current commit is an approval. */
   approvers: string[];
@@ -20,8 +18,8 @@ export interface GateInput {
   falcon: string | null;
 }
 
-/** `pass`: every file is covered. `wait`: some file is not. `unknown`: only another team's membership is in doubt. */
-export interface GateVerdict { verdict: 'pass' | 'wait' | 'unknown'; uncovered: string[] }
+/** `pass`: every file is covered. `wait`: `uncovered` lists the files that still need an approval. */
+export interface GateVerdict { verdict: 'pass' | 'wait'; uncovered: string[] }
 
 /** A CODEOWNERS pattern as the globs that match the same paths. */
 function ownerGlobs(pattern: string): string[] {
@@ -44,28 +42,23 @@ export function ownersOf(path: string, codeowners: string): string[] {
 }
 
 /**
- * The merge gate's rule: every changed file needs an approval, on the current commit, from one of its
- * CODEOWNERS owners. Where the team is an owner, Falcon's approval counts too, except on the gate's own files.
+ * The merge gate's rule, the same for every path: an approval on the current commit from a team member or from
+ * Falcon. Two limits. Falcon never covers the gate's own files. And where CODEOWNERS names people, not a team
+ * one of those people must approve as well: the team or Falcon does not replace them.
  */
 export function gateVerdict(input: GateInput): GateVerdict {
   const lower = (s: string) => s.toLowerCase();
-  const teamOwner = lower(input.teamOwner);
   const team = new Set(input.team.map(lower));
   const falcon = input.falcon ? lower(input.falcon) : null;
   const approvers = input.approvers.map(lower);
   const falconApproved = falcon !== null && approvers.includes(falcon);
-  const people = approvers.filter((a) => a !== falcon);
-  const wait: string[] = [];
-  const unknown: string[] = [];
-  for (const path of input.files) {
+  const people = approvers.filter((a) => a !== falcon && !a.endsWith('[bot]'));
+  const teamApproved = people.some((p) => team.has(p));
+  const uncovered = input.files.filter((path) => {
+    if (!teamApproved && (!falconApproved || isGateFile(path))) return true;
     const owners = ownersOf(path, input.codeowners);
-    const gateFile = isGateFile(path);
-    if (owners.includes(teamOwner) && (people.some((p) => team.has(p)) || (falconApproved && !gateFile))) continue;
-    if (owners.some((o) => !o.includes('/') && people.includes(o.replace(/^@/, '')))) continue;
-    // Falcon's App cannot read team membership, so a person's approval on another team's file stays unknown.
-    const otherTeam = owners.some((o) => o.includes('/') && o !== teamOwner);
-    (otherTeam && people.some((p) => !team.has(p)) ? unknown : wait).push(path);
-  }
-  if (wait.length || !input.files.length) return { verdict: 'wait', uncovered: wait };
-  return unknown.length ? { verdict: 'unknown', uncovered: unknown } : { verdict: 'pass', uncovered: [] };
+    const named = owners.length > 0 && owners.every((o) => !o.includes('/'));
+    return named && !owners.some((o) => people.includes(o.replace(/^@/, '')));
+  });
+  return { verdict: uncovered.length || !input.files.length ? 'wait' : 'pass', uncovered };
 }

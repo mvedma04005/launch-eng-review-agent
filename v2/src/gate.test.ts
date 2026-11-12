@@ -63,12 +63,12 @@ test('an approval in the same second as the cursor is still seen', async () => {
   assert.equal(f.posts.at(-1)!.passed, true);
 });
 
-test('without a pack, or with an invalid one, only Falcon and named owners count', async () => {
+test('without a pack, or with an invalid one, only Falcon counts, and a named owner alone is not enough', async () => {
   for (const pack of [undefined, 'version: [not, a, pack']) {
     const files: Record<string, string> = { '.github/CODEOWNERS': CODEOWNERS, ...(pack ? { '.falcon/policy.yaml': pack } : {}) };
     const f = fixture([pull(1, { approvers: ['lee'] }), pull(2, { files: ['merlin/a.js'], approvers: ['pep'] }), pull(3, { approvers: [FALCON] })], {}, files);
     await sweepGate(f.deps, REPO, T0);
-    assert.deepEqual(f.posts.map((p) => [p.sha, p.passed]), [['sha1', false], ['sha2', true], ['sha3', true]]);
+    assert.deepEqual(f.posts.map((p) => [p.sha, p.passed]), [['sha1', false], ['sha2', false], ['sha3', true]]);
   }
 });
 
@@ -170,6 +170,10 @@ test('only PRs requested in Chat get a check, and a request for an old PR is pic
   // PR 1 is requested later. Its update time is older than the cursor, and the half-hour pass is not due.
   assert.equal(await sweepGate({ ...f.deps, requested: new Set([1, 2]) }, REPO, T0 + MINUTE), 1);
   assert.deepEqual(f.posts.map((p) => p.sha), ['sha2', 'sha1']);
+  // No list at all (gate.everyPull): every open PR into the default branch is judged.
+  const all = fixture([pull(1, { approvers: ['lee'] }), pull(2)], { requested: null });
+  assert.equal(await sweepGate(all.deps, REPO, T0), 2);
+  assert.deepEqual(all.posts.map((p) => [p.sha, p.passed]), [['sha1', true], ['sha2', false]]);
   const none = fixture([pull(1, { approvers: ['lee'] })], { requested: new Set() });
   assert.equal(await sweepGate(none.deps, REPO, T0), 0);
   assert.deepEqual(none.posts, []);

@@ -92,7 +92,9 @@ export const ConfigSchema = z.object({
     enabled: z.boolean().default(false),
     /** The CODEOWNERS entry Falcon stands in for, e.g. `@ROKT/launch-engineering`. Required when enabled. */
     teamOwner: z.string().default(''),
-    /** Seconds between passes over the PRs requested in Chat. */
+    /** Judge every open PR into the default branch, not only the ones requested in Chat. Turn it on before the check is required to merge: a PR nobody posted in Chat still needs its check. */
+    everyPull: z.boolean().default(false),
+    /** Seconds between passes. */
     pollSeconds: z.number().int().min(10).default(30),
   }).prefault({}),
   notify: z.object({
