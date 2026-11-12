@@ -82,8 +82,10 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   }
   const pack = await github.fileAtRef(repo, branch, deps.repoPack);
   let team: string[] = [];
+  let humanPaths: string[] = [];
   try {
-    if (pack !== null) team = parsePolicy(pack, deps.repoPack).team.members;
+    // ponytail: the repository pack only; a comment-only list in the engine's central pack is not read here.
+    if (pack !== null) { const parsed = parsePolicy(pack, deps.repoPack); team = parsed.team.members; humanPaths = parsed.verdict.commentOnly; }
   } catch (error) {
     log.warn({ err: error, repo }, 'merge gate: the policy pack is invalid, so no team member counts');
   }
@@ -107,7 +109,7 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
       const read = await readPull(github, repo, p.number, p.author);
       if (!read.open || read.baseRef !== branch) continue; // Closed or retargeted since it was listed.
       // A PR that will not hold still gets a wait, never a skip: an old pass must not survive because the PR keeps moving.
-      const result: GateVerdict = !read.steady || read.files === null ? { verdict: 'wait', uncovered: [] } : gateVerdict({ files: read.files, codeowners, team, approvers: read.approvers, falcon: deps.falcon });
+      const result: GateVerdict = !read.steady || read.files === null ? { verdict: 'wait', uncovered: [] } : gateVerdict({ files: read.files, codeowners, team, humanPaths, approvers: read.approvers, falcon: deps.falcon });
       // `moved` never equals a judged state, so the next pass posts the real verdict.
       const state = read.steady ? `${read.headSha}:${result.verdict}:${read.approvers.join(',')}:${result.uncovered.length}` : `${read.headSha}:moved`;
       const key = `gate:${repo}#${p.number}`;

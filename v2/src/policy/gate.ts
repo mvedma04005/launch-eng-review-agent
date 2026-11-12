@@ -12,6 +12,8 @@ export interface GateInput {
   codeowners: string;
   /** Logins of the team, from the policy pack. */
   team: string[];
+  /** Globs from the pack's verdict.commentOnly: paths a person must approve. Falcon's approval never covers them. */
+  humanPaths?: string[];
   /** Logins whose latest verdict on the current commit is an approval. */
   approvers: string[];
   /** Falcon's own login, or null when it is unknown; then its approval counts for nothing. */
@@ -43,8 +45,8 @@ export function ownersOf(path: string, codeowners: string): string[] {
 
 /**
  * The merge gate's rule, the same for every path: an approval on the current commit from a team member or from
- * Falcon. Two limits. Falcon never covers the gate's own files. And where CODEOWNERS names people, not a team
- * one of those people must approve as well: the team or Falcon does not replace them.
+ * Falcon. Two limits. Falcon never covers the gate's own files or the pack's comment-only paths. And where CODEOWNERS
+ * names people, not a team, one of those people must approve as well: the team or Falcon does not replace them.
  */
 export function gateVerdict(input: GateInput): GateVerdict {
   const lower = (s: string) => s.toLowerCase();
@@ -54,8 +56,12 @@ export function gateVerdict(input: GateInput): GateVerdict {
   const falconApproved = falcon !== null && approvers.includes(falcon);
   const people = approvers.filter((a) => a !== falcon && !a.endsWith('[bot]'));
   const teamApproved = people.some((p) => team.has(p));
+  const humanPaths = input.humanPaths ?? [];
   const uncovered = input.files.filter((path) => {
-    if (!teamApproved && (!falconApproved || isGateFile(path))) return true;
+    // Falcon only comments on the pack's comment-only paths, but an approval it gave before the list changed is still
+    // on the PR. The gate must not count it there.
+    const falconCovers = falconApproved && !isGateFile(path) && !humanPaths.some((g) => minimatch(path, g));
+    if (!teamApproved && !falconCovers) return true;
     const owners = ownersOf(path, input.codeowners);
     const named = owners.length > 0 && owners.every((o) => !o.includes('/'));
     return named && !owners.some((o) => people.includes(o.replace(/^@/, '')));

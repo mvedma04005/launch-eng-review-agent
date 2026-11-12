@@ -67,6 +67,13 @@ test('Falcon never covers the files that decide who may merge', () => {
   }
 });
 
+test('Falcon never covers a path the pack keeps for a person', () => {
+  const run = (files: string[], approvers: string[]) => gateVerdict({ files, codeowners: CODEOWNERS, team: ['lee'], humanPaths: ['**/infra/**', '**/*.tf'], approvers, falcon: FALCON });
+  assert.deepEqual(run(['Orbit/a.py', 'Orbit/infra/kube/values.yaml', 'x/main.tf'], [FALCON]), { verdict: 'wait', uncovered: ['Orbit/infra/kube/values.yaml', 'x/main.tf'] });
+  assert.equal(run(['Orbit/infra/kube/values.yaml'], [FALCON, 'lee']).verdict, 'pass');
+  assert.equal(run(['Orbit/a.py'], [FALCON]).verdict, 'pass');
+});
+
 test('where CODEOWNERS names people, one of them must approve as well', () => {
   const issuebot = 'supplementals/ops-records-api/x/issuebot.py';
   assert.equal(verdict([issuebot], [FALCON]), 'wait');
