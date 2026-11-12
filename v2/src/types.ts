@@ -73,6 +73,8 @@ export interface ReviewOutput {
   lenses: string[];
   /** Model-reported open questions that are not findings. */
   questions: string[];
+  /** The ways the reviewer tried to break the change, and what it read to decide. */
+  risks?: Array<{ risk: string; held: boolean; checked: string }>;
 }
 
 export type Verdict = 'approve' | 'request_changes' | 'comment';

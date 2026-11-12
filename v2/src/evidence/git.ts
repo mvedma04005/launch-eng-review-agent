@@ -83,7 +83,7 @@ export class Mirror {
   }
 
   async diff(baseSha: string, headSha: string): Promise<Anchors> {
-    const text = await git(['diff', '--no-color', '--no-ext-diff', '-M', '--unified=3', `${checkSha(baseSha)}..${checkSha(headSha)}`], this.path);
+    const text = await git(['-c', 'core.quotePath=false', 'diff', '--no-color', '--no-ext-diff', '-M', '--unified=3', `${checkSha(baseSha)}..${checkSha(headSha)}`], this.path);
     return parseUnifiedDiff(text);
   }
 

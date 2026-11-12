@@ -36,7 +36,7 @@ budgets:
   maxCostUsd: 6          # per review, estimated from list prices; the engine config clamps this
   inlineDiffBytes: 200000
 context:
-  instructionFiles: [AGENTS.md, CLAUDE.md]
+  instructionFiles: [AGENTS.md, CLAUDE.md, REVIEW.md]
 standards:
   - title: What blocks a merge
     text: |
@@ -48,7 +48,8 @@ standards:
     text: |
       Understand the intent, contracts, state ownership and failure behavior of the change first, then trace the
       implementation through its callers and consumers using the repository tools. Prefer the smallest practical
-      fix. Honest uncertainty is a question, not an invented blocker. A clean approval is a successful review.
+      fix. Honest uncertainty is a question, not an invented blocker. An approval says you tried to break the change
+      and could not.
 rules:
   - id: secrets-in-code
     title: No credentials or tokens committed

@@ -9,6 +9,7 @@ import type { GitHubAuth } from './ingress/github.ts';
 import type { Logger } from './log.ts';
 import { metrics } from './metrics.ts';
 import { isGateFile } from './policy/gate.ts';
+import { minimatch } from './policy/glob.ts';
 import { applyPolicy, inScope, isTeamMember, loadPolicyFile, mergePolicies, overrideBy, parsePolicy } from './policy/load.ts';
 import { missingPlanSections } from './policy/plan.ts';
 import type { PolicyPack } from './policy/schema.ts';
@@ -166,8 +167,10 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     // The first changed file that decides who may merge: the policy pack or CODEOWNERS.
     const gateFile = anchors.files.flatMap((f) => [f.path, f.oldPath]).find((p) => p === ctx.config.policy.repoPath || isGateFile(p)) ?? null;
     const loaded = await loadPolicyFor(ctx, job.repo, trustedRead);
-    // A PR that edits the policy pack or CODEOWNERS is a human's call: comment only, whatever the pack allows.
-    const policy: PolicyPack = gateFile ? { ...loaded, verdict: { ...loaded.verdict, mode: 'comment' } } : loaded;
+    // The first changed path the pack keeps for a person (verdict.commentOnly), for example infrastructure.
+    const humanPath = anchors.files.flatMap((f) => [f.path, f.oldPath]).find((p) => p && loaded.verdict.commentOnly.some((g) => minimatch(p, g))) ?? null;
+    // A PR that edits the policy pack, CODEOWNERS or such a path is a human's call: comment only, whatever the mode.
+    const policy: PolicyPack = gateFile || humanPath ? { ...loaded, verdict: { ...loaded.verdict, mode: 'comment' } } : loaded;
     checksEnabled = policy.verdict.checkRun;
     const override = overrideBy(policy, meta.author, await github.approvers(job.repo, job.number, job.headSha));
     if (!override && policy.outsiders.requirePlan && !isTeamMember(policy, meta.author)) {
@@ -221,7 +224,9 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     // A review that does not account for every in-scope file is incomplete: medium confidence, comment-only.
     const unreviewed = inScopeFiles.filter((p) => !output.reviewedFiles.includes(p));
     if (unreviewed.length) log.info({ unreviewed }, 'review did not cover every in-scope file');
-    const summary = gateFile ? `This PR changes ${gateFile}, so Falcon only comments: a human must review policy changes.\n\n${output.summary}` : output.summary;
+    const summary = gateFile ? `This PR changes ${gateFile}, so Falcon only comments: a human must review policy changes.\n\n${output.summary}`
+      : humanPath ? `This PR changes ${humanPath}, so Falcon only comments: the policy pack keeps this path for a person's approval.\n\n${output.summary}`
+      : output.summary;
     const finalOutput: ReviewOutput = { ...output, summary, findings: kept, confidence: unreviewed.length ? 'medium' : output.confidence };
     const rendered = sanitize(renderReview(policy, meta, finalOutput, anchors, prior, override), redactor);
     const toPublish = toPending(rendered, job.headSha, boundBytes(redactor.apply(finalOutput.summary), LIMITS.summary));
@@ -370,7 +375,8 @@ async function mirrorShow(mirror: Mirror, sha: string, path: string): Promise<st
   } catch { return null; }
 }
 
-function excerpt(text: string, line: number, radius = 25): string {
+// 150 lines each side: with 25 the second opinion disputed every finding that needed more than one screen of code.
+function excerpt(text: string, line: number, radius = 150): string {
   const lines = text.split('\n');
   const start = Math.max(1, line - radius);
   const end = Math.min(lines.length, line + radius);

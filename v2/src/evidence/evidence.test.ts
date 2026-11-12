@@ -88,7 +88,7 @@ test('mirror + worktree: fetch, merge base, diff, confined reads, grep, and host
 
     const baseRead = async (path: string) => (path === 'handler.py' ? 'import os\nreturn user\ndone\n' : null);
     const result = await validateSubmission({
-      summary: 'ok', confidence: 'high', reviewed_files: ['handler.py'], lenses_completed: ['correctness'], questions: [],
+      summary: 'ok', confidence: 'high', reviewed_files: ['handler.py'], lenses_completed: ['correctness'], questions: [], risks: [{ risk: 'null user', held: true, checked: 'handler.py' }, { risk: 'bad import', held: false, checked: 'handler.py' }],
       findings: [
         { severity: 'high', path: 'handler.py', side: 'RIGHT', line: 2, title: 'Null user crashes', scenario: 's', impact: 'i', evidence: 'user.name', fix: 'guard' },
         { severity: 'low', path: 'handler.py', side: 'RIGHT', line: 2, title: 'Wrong quote', scenario: 's', impact: 'i', evidence: 'does-not-exist', fix: 'f' },
@@ -106,4 +106,10 @@ test('mirror + worktree: fetch, merge base, diff, confined reads, grep, and host
   } finally {
     await mirror.removeWorktree(join(root, 'wt', 'job1'));
   }
+});
+
+test('a diff header that cannot be read fails the review instead of hiding the file', () => {
+  // git quotes a name that holds a quote, a backslash or a control character; the plain header pattern does not match it.
+  const quoted = 'diff --git "a/infra/x\\ty.tf" "b/infra/x\\ty.tf"\nnew file mode 100644\n--- /dev/null\n+++ "b/infra/x\\ty.tf"\n@@ -0,0 +1 @@\n+x\n';
+  assert.throws(() => parseUnifiedDiff(quoted), /Cannot read a changed file's name/);
 });

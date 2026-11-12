@@ -111,7 +111,7 @@ export const claudeReviewer: Reviewer = {
     if (!state.accepted) throw new Incomplete('The model did not produce a verifiable review.');
     const { submission, findings } = state.accepted;
     return {
-      output: { summary: submission.summary.trim(), confidence: submission.confidence, findings, reviewedFiles: submission.reviewed_files, lenses: submission.lenses_completed, questions: submission.questions },
+      output: { summary: submission.summary.trim(), confidence: submission.confidence, findings, reviewedFiles: submission.reviewed_files, lenses: submission.lenses_completed, questions: submission.questions, risks: submission.risks },
       usage,
     };
   },
@@ -122,10 +122,10 @@ export const claudeReviewer: Reviewer = {
       model,
       max_tokens: 4000,
       output_config: { format: zodOutputFormat(VerificationSchema), effort: 'medium' },
-      system: 'You independently verify one code-review finding. Judge only from the source shown. Be skeptical of findings that depend on assumptions about code you cannot see; say so and lower confidence.',
+      system: 'You independently verify one code-review finding. Judge from the source shown. Answer real=false only when that source contradicts the finding: the cited code does not do what the finding says. When the finding depends on code or facts you cannot see, keep real=true, say what you could not check, and lower confidence.',
       messages: [{ role: 'user', content: `Finding (${finding.severity}) at ${finding.path}:${finding.line}\nTitle: ${finding.title}\nScenario: ${finding.scenario}\nImpact: ${finding.impact}\nEvidence: ${finding.evidence}\n\nSource around the cited line:\n\`\`\`\n${excerpt}\n\`\`\`` }],
     });
     const parsed = response.parsed_output;
-    return parsed ? { real: parsed.real, confidence: parsed.confidence, reason: parsed.reason } : { real: false, confidence: 0, reason: 'verifier returned no structured result' };
+    return parsed ? { real: parsed.real, confidence: parsed.confidence, reason: parsed.reason.slice(0, 800) } : { real: false, confidence: 0, reason: 'verifier returned no structured result' };
   },
 };

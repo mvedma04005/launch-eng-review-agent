@@ -394,6 +394,22 @@ test('policy and instruction files come from the default branch when the PR targ
   assert.equal(unknown.posted.length, 0);
 });
 
+test('approve mode: a PR that touches a commentOnly path only comments', async () => {
+  const pack = (globs: string) => `version: 1\nname: repo\nverdict: { mode: approve, commentOnly: [${globs}] }\nteam: { members: [lee] }\n`;
+  // svc.py matches: the same clean review that would approve is published as a comment, with the reason.
+  const held = approveFixture(pack('"**/*.py"'));
+  const github = new FakeGitHub(meta(held.origin, held.headSha, held.baseSha));
+  const { outcome } = await runJob(held, github, scriptedReviewer());
+  assert.equal(outcome.status, 'published', outcome.reason);
+  assert.equal(github.posted[0]?.event, 'COMMENT');
+  assert.match(github.posted[0]?.body ?? '', /changes svc\.py, so Falcon only comments/);
+  // No changed file matches: the PR is approved as before.
+  const free = approveFixture(pack('"**/infra/**"'));
+  const other = new FakeGitHub(meta(free.origin, free.headSha, free.baseSha));
+  await runJob(free, other, scriptedReviewer());
+  assert.equal(other.posted[0]?.event, 'APPROVE');
+});
+
 test('approve mode: a PR that edits CODEOWNERS only comments', async () => {
   const f = approveFixture();
   git(f.origin, 'checkout', '-q', 'feature');

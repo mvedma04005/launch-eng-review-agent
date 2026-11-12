@@ -26,6 +26,9 @@ export async function validateSubmission(sub: ReviewSubmission, ctx: ValidationC
   const changed = new Set(ctx.changedFiles);
   const missing = ctx.changedFiles.filter((f) => !sub.reviewed_files.includes(f));
   if (missing.length) errors.push(`reviewed_files omits ${missing.length} changed file(s): ${missing.slice(0, 5).join(', ')}${missing.length > 5 ? ', …' : ''}. Inspect them or state why they need no review.`);
+  if (sub.risks.length < 2) errors.push('risks needs at least two entries: name the two most likely ways this change breaks, investigate each, and say what you checked.');
+  if (sub.risks.some((r) => r.held) && !sub.findings.length) errors.push('a risk is marked held but there is no finding: report it as a finding with its rank, or set held to false and say what ruled it out.');
+  if (sub.risks.some((r) => /<!--/.test(r.risk + r.checked))) errors.push('risks: HTML comments are not allowed.');
   const seen = new Set<string>();
   for (const [i, f] of sub.findings.entries()) {
     const where = `finding[${i}] ${f.path}:${f.line}`;

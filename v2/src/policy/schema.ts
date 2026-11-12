@@ -33,6 +33,8 @@ export const PolicyPackSchema = z.object({
     /** Ceiling a repository overlay may opt into. Set centrally by the operator; an overlay cannot raise it. */
     maxMode: z.enum(['comment', 'approve', 'request_changes']).default('request_changes'),
     blockOn: z.array(severity).default(['critical', 'high']),
+    /** Changed paths a person must approve: a PR that touches one gets comments from Falcon, never an approval. */
+    commentOnly: z.array(glob).default([]),
     checkRun: z.boolean().default(true),
     /** Blocking findings must pass the verifier before they can block. */
     verifyBlocking: z.boolean().default(true),

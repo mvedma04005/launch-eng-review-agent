@@ -22,13 +22,19 @@ export const ReviewSubmissionSchema = z.object({
   lenses_completed: z.array(z.string()),
   findings: z.array(FindingInputSchema),
   questions: z.array(z.string().max(1000)).default([]).describe('Open questions for the author that are not findings.'),
+  risks: z.array(z.object({
+    risk: z.string().min(3).max(300).describe('One way this change could break something or let through what it should refuse.'),
+    held: z.boolean().describe('True when the risk is real and you reported it as a finding.'),
+    checked: z.string().min(3).max(600).describe('What you read to decide, with file names.'),
+  })).max(8).default([]).describe('Two to eight risks you tried to prove, most serious first.'),
 });
 export type ReviewSubmission = z.infer<typeof ReviewSubmissionSchema>;
 
 export const VerificationSchema = z.object({
   real: z.boolean().describe('True only if the cited code, read in context, actually has the described problem.'),
   confidence: z.number().min(0).max(1),
-  reason: z.string().max(800),
+  // No length limit here: an over-long reason failed the parse and held the whole review. The caller clips it.
+  reason: z.string().describe('Two or three sentences.'),
 });
 
 export const LessonSchema = z.object({

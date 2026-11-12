@@ -17,7 +17,8 @@ export interface RenderedReview {
   overridden: boolean;
 }
 
-const sevLabel: Record<Finding['severity'], string> = { critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low', info: 'Info' };
+// P0 and P1 must be fixed before merge (they are the pack's default blockOn); P2 and P3 are the author's call.
+const sevLabel: Record<Finding['severity'], string> = { critical: 'P0', high: 'P1', medium: 'P2', low: 'P3', info: 'Note' };
 
 export function decideVerdict(policy: PolicyPack, findings: Finding[], confidence: ReviewOutput['confidence'] = 'high', override: string | null = null): { verdict: Verdict; blocking: Finding[]; overridden: boolean } {
   const severe = findings.filter((f) => f.blocking || policy.verdict.blockOn.includes(f.severity));
@@ -61,6 +62,7 @@ export function renderReview(policy: PolicyPack, meta: PullMeta, output: ReviewO
     '',
     output.findings.length ? `${output.findings.length} finding(s): ${countBy(output.findings)}.` : 'No findings.',
     ...(bodyFindings.length ? ['', ...bodyFindings] : []),
+    ...(output.risks?.length ? ['', '#### What I tried to break', ...output.risks.map((r) => `- ${r.held ? '**Found:**' : 'Ruled out:'} ${oneLine(r.risk)} ${oneLine(r.checked)}`)] : []),
     ...(output.questions.length ? ['', '#### Questions for the author', ...output.questions.map((q) => `- ${q}`)] : []),
     '',
     `<sub>Reviewed head \`${meta.headSha.slice(0, 12)}\` against policy \`${policy.name}\` with ${output.confidence} confidence. Lenses: ${output.lenses.join(', ')}. Tests were not executed; CI is reported separately.${notice} Reply \`/falcon wrong <finding-id>\` or \`/falcon why <finding-id>\` on any finding.</sub>`,
@@ -70,9 +72,10 @@ export function renderReview(policy: PolicyPack, meta: PullMeta, output: ReviewO
   return { event, verdict, body: lines.join('\n'), comments, checkConclusion: blocking.length && output.confidence === 'high' ? 'action_required' : verdict === 'approve' ? 'success' : 'neutral', blocking, overridden };
 }
 
+const oneLine = (s: string) => s.replace(/\s+/g, ' ').trim();
 function sevRank(f: Finding): number { return ['critical', 'high', 'medium', 'low', 'info'].indexOf(f.severity); }
 function countBy(findings: Finding[]): string {
   const counts = new Map<string, number>();
-  for (const f of findings) counts.set(f.severity, (counts.get(f.severity) ?? 0) + 1);
+  for (const f of findings) counts.set(sevLabel[f.severity], (counts.get(sevLabel[f.severity]) ?? 0) + 1);
   return [...counts.entries()].map(([s, n]) => `${n} ${s}`).join(', ');
 }

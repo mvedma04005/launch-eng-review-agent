@@ -44,7 +44,7 @@ export function mergePolicies(base: PolicyPack, overlay: PolicyPack): PolicyPack
     ...overlay,
     name: `${base.name}+${overlay.name}`,
     scope: { include: overlay.scope.include, exclude: [...base.scope.exclude, ...overlay.scope.exclude] },
-    verdict: { ...base.verdict, ...overlay.verdict, mode, maxMode: base.verdict.maxMode },
+    verdict: { ...base.verdict, ...overlay.verdict, mode, maxMode: base.verdict.maxMode, commentOnly: [...base.verdict.commentOnly, ...overlay.verdict.commentOnly] },
     lenses: overlay.lenses.length ? overlay.lenses : base.lenses,
     budgets: { ...base.budgets, ...overlay.budgets },
     context: {

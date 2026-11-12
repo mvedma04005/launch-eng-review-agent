@@ -24,7 +24,9 @@ export function parseUnifiedDiff(text: string): Anchors {
   const chunks = text.split(/^(?=diff --git )/m).filter((c) => c.startsWith('diff --git '));
   for (const chunk of chunks) {
     const header = chunk.match(/^diff --git a\/(.+?) b\/(.+)$/m);
-    if (!header) continue;
+    // A header that does not parse is a changed file the review would never see (git quotes names with a quote, a
+    // backslash or a control character). Failing the review is safe; skipping the file is not.
+    if (!header) throw new Error(`Cannot read a changed file's name from the diff: ${chunk.split('\n', 1)[0]!.slice(0, 200)}`);
     let oldPath = unquote(header[1]!), path = unquote(header[2]!);
     const renameTo = chunk.match(/^rename to (.+)$/m);
     const renameFrom = chunk.match(/^rename from (.+)$/m);

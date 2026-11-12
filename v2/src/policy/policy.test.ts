@@ -115,3 +115,10 @@ test('team logins are trimmed and may carry one leading @', () => {
   assert.ok(isTeamMember(p, 'bob'));
   assert.throws(() => parsePolicy('version: 1\nname: t\nteam: { members: ["@"] }', 't'), /team\.members/);
 });
+
+test('commentOnly paths from the central pack and the repository pack both apply', () => {
+  const base = parsePolicy('version: 1\nname: base\nverdict: { maxMode: approve, commentOnly: ["**/infra/**"] }\n', 'base');
+  const merged = mergePolicies(base, parsePolicy('version: 1\nname: repo\nverdict: { mode: approve, commentOnly: ["**/*.tf"] }\n', 'repo'));
+  assert.deepEqual(merged.verdict.commentOnly, ['**/infra/**', '**/*.tf']);
+  assert.deepEqual(mergePolicies(base, parsePolicy('version: 1\nname: repo\nverdict: { mode: approve }\n', 'repo')).verdict.commentOnly, ['**/infra/**']);
+});
