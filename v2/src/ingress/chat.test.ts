@@ -8,7 +8,7 @@ import { generateKeyPairSync, verify } from 'node:crypto';
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { chatOutcomeText, deliverOutcome, extractPullRequests, flushChatOutbox, handleChatMessage, parseChatCommand, parseChatEvent, keylessPublicJwks, resolvePendingChatRequests, serviceAccountTokens, signedNote, type ChatApi, type ChatMessage } from './chat.ts';
+import { GoogleChatApi, chatOutcomeText, deliverOutcome, extractPullRequests, flushChatOutbox, handleChatMessage, parseChatCommand, parseChatEvent, keylessPublicJwks, resolvePendingChatRequests, serviceAccountTokens, signedNote, type ChatApi, type ChatMessage } from './chat.ts';
 
 const SPACE = 'spaces/AAQAixK3auw';
 const config = ConfigSchema.parse({ chat: { enabled: true, spaces: [SPACE], maxRoundsPerPr: 2 } });
@@ -126,6 +126,20 @@ test('the outbox sends once per reply, retries transient failures and parks perm
   assert.equal(store.pendingChatReplies(10_000, 10).length, 1);
   assert.equal(await flushChatOutbox(store, chat, log, 10_000), 1);
   assert.equal(store.pendingChatReplies(100_000, 10).length, 0);
+});
+
+test('a reply to a deleted request is never posted top-level: Chat is told to fail, and the outbox parks it', async () => {
+  const store = new Store(':memory:');
+  store.queueChatReply('k1', SPACE, `${SPACE}/threads/gone`, 'review');
+  const calls: URL[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: URL) => { calls.push(url); return new Response('{"error":{"status":"NOT_FOUND"}}', { status: 404 }); }) as typeof fetch;
+  try {
+    assert.equal(await flushChatOutbox(store, new GoogleChatApi({ token: async () => 't' }), log, 1000), 0);
+  } finally { globalThis.fetch = realFetch; }
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.searchParams.get('messageReplyOption'), 'REPLY_MESSAGE_OR_FAIL');
+  assert.equal(store.pendingChatReplies(1e9, 10).length, 0, 'parked for good, never retried');
 });
 
 test('outcome text follows the OP3 shape and holds carry the reason', () => {

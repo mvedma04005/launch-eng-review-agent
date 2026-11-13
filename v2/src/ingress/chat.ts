@@ -90,7 +90,8 @@ export class GoogleChatApi implements ChatApi {
 
   async reply(space: string, thread: string, text: string, requestId: string) {
     const url = new URL(`https://chat.googleapis.com/v1/${space}/messages`);
-    url.searchParams.set('messageReplyOption', 'REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD');
+    // A deleted request has no thread left. Fail (404, which the outbox parks) rather than post top-level in the space; the review is still on the PR.
+    url.searchParams.set('messageReplyOption', 'REPLY_MESSAGE_OR_FAIL');
     url.searchParams.set('requestId', requestId);
     const response = await fetch(url, { method: 'POST', headers: await this.headers(), body: JSON.stringify({ text, thread: { name: thread } }) });
     if (!response.ok) throw new ChatHttpError(response.status, await response.text());
