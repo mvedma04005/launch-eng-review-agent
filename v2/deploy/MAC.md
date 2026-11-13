@@ -30,7 +30,11 @@ The launcher refuses to start if the env file is not mode 600. Secrets never app
 Falcon is a Chat *app*, not a person. Events reach the Mac through a Pub/Sub subscription the daemon pulls from, so nothing needs an inbound URL.
 
 1. In a Google Cloud project, enable the Google Chat API and the Pub/Sub API.
-2. Create a service account (for example `falcon-chat`), download a JSON key, and put it in `~/.config/falcon/env` as `FALCON_GOOGLE_SERVICE_ACCOUNT_JSON='{...}'` on one line.
+2. Create a service account (for example `falcon-chat`) with no key. Sign in keyless (workload identity federation), so no Google credential is ever downloaded:
+   - On the Mac, run `falcon keyless-key ~/.config/falcon/chat-signing.pem`. It creates an owner-only signing key that never leaves the host and prints only the public half (a JWKS).
+   - In the project, create a workload identity pool with an OIDC provider that carries that JWKS, an issuer URL of your choice, and an attribute condition on the subject. Grant the pool's subject `roles/iam.workloadIdentityUser` on the service account. Enable the IAM Credentials and Security Token Service APIs.
+   - Put the config, which holds no secret, in `~/.config/falcon/env` on one line: `FALCON_GOOGLE_SERVICE_ACCOUNT_JSON='{"audience":"//iam.googleapis.com/projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>","service_account":"<email>","issuer":"<issuer URL>","subject":"<subject>","key_id":"<kid from the JWKS>","signing_key_file":"/Users/<you>/.config/falcon/chat-signing.pem"}'`.
+   - Falcon signs a five-minute note with the local key, and Google swaps it for a one-hour token for the service account. To revoke, delete the provider. A downloaded JSON key in the same variable still works, but it is long-lived and a security scanner will flag it.
 3. Create a Pub/Sub topic (for example `falcon-chat-events`) and a pull subscription on it (for example `falcon-chat-pull`). Grant `chat-api-push@system.gserviceaccount.com` the Pub/Sub Publisher role on the topic, and the service account the Pub/Sub Subscriber role on the subscription.
 4. In the Chat API configuration page: name it Falcon, give it an avatar, enable joining spaces and group conversations, set the connection type to Cloud Pub/Sub with that topic, and make it visible to the people or groups who will use it.
 5. Add the Falcon app to the launch-engineering review space. Put the space id (`spaces/...`) in `chat.spaces` and the project and subscription in `chat.pubsub`.

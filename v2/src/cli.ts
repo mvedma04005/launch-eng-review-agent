@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { loadConfig } from './config.ts';
 import { buildContext } from './context.ts';
+import { keylessPublicJwks } from './ingress/chat.ts';
 import { githubAuthFromEnv, parsePullUrl } from './ingress/github.ts';
 import { log } from './log.ts';
 import { OctokitGitHub } from './publisher/github.ts';
@@ -18,6 +19,7 @@ const USAGE = `falcon: PR review engine
   falcon jobs [--limit N]             Recent jobs with outcome, wall time and estimated cost.
   falcon job <id>                     One job with its usage, tool-call trail and event trail.
   falcon replay <id>                  Re-run a held or failed job. A retained finished review is republished without another model run.
+  falcon keyless-key <file>           Create this host's Chat signing key if absent and print its public half (JWKS) for the trust setup. Never prints the private key.
   falcon run-job <id> --owner <w>     Internal: run one already-leased job (used by process isolation).
 
 Environment: ANTHROPIC_API_KEY; GITHUB_TOKEN (token mode) or FALCON_GITHUB_PRIVATE_KEY with github.appId in falcon.yaml (app mode).`;
@@ -28,6 +30,8 @@ async function main(argv: string[]): Promise<number> {
   const config = loadConfig(values.config);
   const out = (s: string) => process.stdout.write(s + '\n');
   const openStore = () => new Store(join(config.stateDir, 'falcon.sqlite3'));
+
+  if (command === 'keyless-key' && arg) { out(JSON.stringify(keylessPublicJwks(arg))); return 0; }
 
   if (command === 'review' && arg) {
     const { repo, number } = parsePullUrl(arg);

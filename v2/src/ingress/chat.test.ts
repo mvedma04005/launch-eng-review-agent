@@ -4,7 +4,11 @@ import { ConfigSchema, isAllowedRepo } from '../config.ts';
 import { log } from '../log.ts';
 import { Store } from '../queue/store.ts';
 import type { PullMeta } from '../types.ts';
-import { chatOutcomeText, deliverOutcome, extractPullRequests, flushChatOutbox, handleChatMessage, parseChatCommand, parseChatEvent, resolvePendingChatRequests, type ChatApi, type ChatMessage } from './chat.ts';
+import { generateKeyPairSync, verify } from 'node:crypto';
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { chatOutcomeText, deliverOutcome, extractPullRequests, flushChatOutbox, handleChatMessage, parseChatCommand, parseChatEvent, keylessPublicJwks, resolvePendingChatRequests, serviceAccountTokens, signedNote, type ChatApi, type ChatMessage } from './chat.ts';
 
 const SPACE = 'spaces/AAQAixK3auw';
 const config = ConfigSchema.parse({ chat: { enabled: true, spaces: [SPACE], maxRoundsPerPr: 2 } });
@@ -162,4 +166,37 @@ test('re-review runs a published commit again, drops the stored result, and coun
   await resolvePendingChatRequests(ctx, async () => meta(), 3000);
   assert.equal(store.job(job.id)!.status, 'published');
   assert.ok(store.pendingChatReplies(Date.now() / 1000 + 1, 30).some((r) => /used its 2 manual review rounds/.test(r.text)));
+});
+
+test('keyless sign-in: the note is signed by the local key, names the trust provider, and expires in minutes', () => {
+  const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const keyFile = join(mkdtempSync(join(tmpdir(), 'falcon-keyless-')), 'signing.pem');
+  writeFileSync(keyFile, privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600 });
+  const cfg = { audience: '//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/falcon/providers/host', service_account: 'falcon-chat@example.iam.gserviceaccount.com', issuer: 'https://falcon.example', subject: 'falcon-host', key_id: 'k1', signing_key_file: keyFile };
+
+  const [h, p, sig] = signedNote(cfg, 1_000_000).split('.') as [string, string, string];
+  const header = JSON.parse(Buffer.from(h, 'base64url').toString());
+  const claims = JSON.parse(Buffer.from(p, 'base64url').toString());
+  assert.deepEqual(header, { alg: 'RS256', typ: 'JWT', kid: 'k1' });
+  assert.deepEqual(claims, { iss: 'https://falcon.example', sub: 'falcon-host', aud: `https:${cfg.audience}`, iat: 1000, exp: 1300 });
+  assert.ok(verify('RSA-SHA256', Buffer.from(`${h}.${p}`), publicKey, Buffer.from(sig, 'base64url')), 'the public key verifies the note');
+
+  assert.ok(serviceAccountTokens(JSON.stringify(cfg), ['s']).token, 'a keyless config is accepted');
+  assert.ok(serviceAccountTokens(JSON.stringify({ client_email: 'a@b', private_key: 'x' }), ['s']).token, 'a JSON key is still accepted');
+  assert.throws(() => serviceAccountTokens(JSON.stringify({ audience: cfg.audience }), ['s']), /keyless config needs/, 'a partial keyless config is refused by name');
+  assert.throws(() => serviceAccountTokens('{}', ['s']), /client_email and private_key/, 'an empty config is refused');
+});
+
+test('keyless key: created once, owner-only, and only the public half is returned', () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'falcon-keyless-')), 'signing.pem');
+  const jwks = keylessPublicJwks(file);
+  const key = jwks.keys[0]!;
+  assert.deepEqual(Object.keys(key).sort(), ['alg', 'e', 'kid', 'kty', 'n', 'use'], 'no private field such as d');
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+  const pem = readFileSync(file, 'utf8');
+  assert.deepEqual(keylessPublicJwks(file), jwks, 'a second call returns the same key');
+  assert.equal(readFileSync(file, 'utf8'), pem, 'and does not rewrite the file');
+
+  const [h, p, sig] = signedNote({ audience: '//a', service_account: 's', issuer: 'https://i', subject: 'x', key_id: key.kid, signing_key_file: file }).split('.') as [string, string, string];
+  assert.ok(verify('RSA-SHA256', Buffer.from(`${h}.${p}`), { key, format: 'jwk' }, Buffer.from(sig, 'base64url')), 'the printed public key verifies a note from the file');
 });

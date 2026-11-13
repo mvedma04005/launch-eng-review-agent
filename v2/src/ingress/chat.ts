@@ -1,4 +1,6 @@
-import { JWT } from 'google-auth-library';
+import { createHash, createPublicKey, createSign, generateKeyPairSync } from 'node:crypto';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { IdentityPoolClient, JWT } from 'google-auth-library';
 import { isAllowedRepo, type Config } from '../config.ts';
 import type { Logger } from '../log.ts';
 import { metrics } from '../metrics.ts';
@@ -17,11 +19,48 @@ export const PUBSUB_SCOPES = ['https://www.googleapis.com/auth/pubsub'];
 
 export interface TokenProvider { token(): Promise<string> }
 
-/** Service-account credentials from the JSON key Google issues; never from a person's login. */
+/** Keyless sign-in: Google trusts the public half of a key that never leaves this host (workload identity federation). */
+export interface KeylessConfig { audience: string; service_account: string; issuer: string; subject: string; key_id: string; signing_key_file: string }
+const KEYLESS_FIELDS = ['audience', 'service_account', 'issuer', 'subject', 'key_id', 'signing_key_file'] as const;
+
+/** A five-minute note signed by the host's own key. Google swaps it for a one-hour token; the note itself opens nothing else. */
+export function signedNote(cfg: KeylessConfig, nowMs = Date.now()): string {
+  const b64 = (o: object) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const iat = Math.floor(nowMs / 1000);
+  const body = `${b64({ alg: 'RS256', typ: 'JWT', kid: cfg.key_id })}.${b64({ iss: cfg.issuer, sub: cfg.subject, aud: `https:${cfg.audience}`, iat, exp: iat + 300 })}`;
+  // The key is read on every note, so a replaced key file takes effect without a restart.
+  return `${body}.${createSign('RSA-SHA256').update(body).sign(readFileSync(cfg.signing_key_file, 'utf8'), 'base64url')}`;
+}
+
+/** Creates the host's signing key if the file is absent (owner-only, never overwritten) and returns only its public half, in the form Google's trust provider takes. */
+export function keylessPublicJwks(file: string): { keys: { kty: string; n: string; e: string; kid: string; alg: string; use: string }[] } {
+  if (!existsSync(file)) writeFileSync(file, generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600, flag: 'wx' });
+  const { kty, n, e } = createPublicKey(readFileSync(file, 'utf8')).export({ format: 'jwk' }) as { kty: string; n: string; e: string };
+  const kid = createHash('sha256').update(JSON.stringify({ e, kty, n })).digest('base64url'); // RFC 7638 thumbprint, so the id follows the key
+  return { keys: [{ kty, n, e, kid, alg: 'RS256', use: 'sig' }] };
+}
+
+/** Service-account credentials, never a person's login: a keyless config (preferred), or the JSON key Google issues. */
 export function serviceAccountTokens(json: string, scopes: string[]): TokenProvider {
-  const key = JSON.parse(json) as { client_email?: string; private_key?: string };
-  if (!key.client_email || !key.private_key) throw new Error('service account JSON needs client_email and private_key');
-  const client = new JWT({ email: key.client_email, key: key.private_key, scopes });
+  const key = JSON.parse(json) as { client_email?: string; private_key?: string } & Partial<KeylessConfig>;
+  let client: JWT | IdentityPoolClient;
+  if (key.audience) {
+    const missing = KEYLESS_FIELDS.filter((f) => !key[f]);
+    if (missing.length) throw new Error(`keyless config needs ${missing.join(', ')}`);
+    const cfg = key as KeylessConfig;
+    client = new IdentityPoolClient({
+      type: 'external_account',
+      audience: cfg.audience,
+      subject_token_type: 'urn:ietf:params:oauth:token-type:jwt',
+      token_url: 'https://sts.googleapis.com/v1/token',
+      service_account_impersonation_url: `https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${cfg.service_account}:generateAccessToken`,
+      subject_token_supplier: { getSubjectToken: async () => signedNote(cfg) },
+      scopes,
+    });
+  } else {
+    if (!key.client_email || !key.private_key) throw new Error('service account JSON needs client_email and private_key');
+    client = new JWT({ email: key.client_email, key: key.private_key, scopes });
+  }
   return {
     async token() {
       const { token } = await client.getAccessToken();
