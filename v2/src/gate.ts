@@ -16,6 +16,8 @@ export interface GatePort {
   approvers(repo: string, number: number, headSha: string): Promise<string[]>;
   fileAtRef(repo: string, ref: string, path: string): Promise<string | null>;
   postGate(repo: string, headSha: string, passed: boolean, title: string, summary: string): Promise<void>;
+  /** The merge queue of a branch: each queued PR with the commit GitHub tests it on. Empty when the branch has no queue. */
+  queueEntries(repo: string, branch: string): Promise<Array<{ number: number; headSha: string }>>;
 }
 
 export interface GateDeps {
@@ -28,6 +30,8 @@ export interface GateDeps {
   repoPack: string;
   /** The PRs requested in Chat: the gate judges no others. Null: it judges every open PR into the default branch. */
   requested: Set<number> | null;
+  /** Base branches judged besides the default branch. */
+  branches?: string[];
   dryRun: boolean;
 }
 
@@ -66,8 +70,9 @@ async function readPull(github: GatePort, repo: string, number: number, author: 
 export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()): Promise<number> {
   const { github, store, log } = deps;
   const requested = deps.requested;
+  const extra = deps.branches ?? [];
   // A PR that already has a check keeps being judged, so a pass is withdrawn even after the PR leaves the list.
-  const open = (await github.openPulls(repo)).filter((p) => p.baseRef === p.defaultBranch && (!requested || requested.has(p.number) || store.cursor(`gate:${repo}#${p.number}`) !== null));
+  const open = (await github.openPulls(repo)).filter((p) => (p.baseRef === p.defaultBranch || extra.includes(p.baseRef)) && (!requested || requested.has(p.number) || store.cursor(`gate:${repo}#${p.number}`) !== null));
   if (!open.length) return 0;
   // The team list and the person-only paths come from the default branch, never from the PR being judged.
   const branch = open[0]!.defaultBranch;
@@ -99,7 +104,7 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   for (const p of pulls) {
     try {
       const read = await readPull(github, repo, p.number, p.author);
-      if (!read.open || read.baseRef !== branch) continue; // Closed or retargeted since it was listed.
+      if (!read.open || (read.baseRef !== branch && !extra.includes(read.baseRef))) continue; // Closed or retargeted since it was listed.
       // A PR that will not hold still gets a wait, never a skip: an old pass must not survive because the PR keeps moving.
       const result: GateVerdict = !read.steady || read.files === null ? { verdict: 'wait', uncovered: [] } : gateVerdict({ files: read.files, team, humanPaths, approvers: read.approvers, falcon: deps.falcon });
       // `moved` never equals a judged state, so the next pass posts the real verdict.
@@ -118,6 +123,27 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
     } catch (error) {
       failed = true;
       log.warn({ err: error, repo, number: p.number }, 'merge gate failed for one PR');
+    }
+  }
+  // Queue commits. GitHub tests a queued PR on a commit of its own, and that commit needs the check too. It
+  // carries the decision on the PR's own commit: GitHub only queues a PR whose own commit passed, and a push
+  // to the PR takes it out of the queue.
+  for (const base of new Set(open.map((p) => p.baseRef))) {
+    try {
+      for (const entry of await github.queueEntries(repo, base)) {
+        const passed = (store.cursor(`gate:${repo}#${entry.number}`) ?? '').split(':')[1] === 'pass';
+        // ponytail: one cursor per queue commit, never removed; prune by age if the table ever matters.
+        const key = `gateq:${repo}:${entry.headSha}`;
+        if (store.cursor(key) === String(passed)) continue;
+        log.info({ repo, number: entry.number, head: entry.headSha, passed, dryRun: deps.dryRun }, 'merge gate decided for a queue commit');
+        if (deps.dryRun) continue;
+        await github.postGate(repo, entry.headSha, passed, passed ? 'Approved by Launch Engineering or Falcon' : 'Waiting for Launch Engineering or Falcon to approve', `Merge queue commit for #${entry.number}. It carries the decision on the pull request's own commit.`);
+        store.setCursor(key, String(passed));
+        posted++;
+      }
+    } catch (error) {
+      failed = true;
+      log.warn({ err: error, repo, base }, 'merge gate failed for the merge queue');
     }
   }
   // After a failure the cursors stay, so the next pass judges the same PRs again; the ones already posted are skipped.

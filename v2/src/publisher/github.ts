@@ -154,6 +154,18 @@ export class OctokitGitHub implements GitHubPort {
     await this.octokit.checks.create({ ...split(repo), name: GATE_NAME, head_sha: headSha, output: { title, summary }, ...(passed ? { status: 'completed' as const, conclusion: 'success' as const } : { status: 'in_progress' as const, started_at: new Date().toISOString() }) });
   }
 
+  /**
+   * The merge queue of a branch, read from the temporary branches GitHub makes for it
+   * (`gh-readonly-queue/<base>/pr-<number>-<sha>`), so it needs no permission beyond reading the repository.
+   */
+  async queueEntries(repo: string, branch: string): Promise<Array<{ number: number; headSha: string }>> {
+    const refs = await this.octokit.paginate(this.octokit.git.listMatchingRefs, { ...split(repo), ref: `heads/gh-readonly-queue/${branch}/`, per_page: 100 });
+    return refs.flatMap((r) => {
+      const number = /\/pr-(\d+)-[0-9a-f]+$/.exec(r.ref)?.[1];
+      return number ? [{ number: Number(number), headSha: r.object.sha }] : [];
+    });
+  }
+
   async fileAtRef(repo: string, ref: string, path: string): Promise<string | null> {
     try {
       const { data } = await this.octokit.repos.getContent({ ...split(repo), ref, path });

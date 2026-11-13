@@ -17,6 +17,7 @@ function fixture(pulls: Pull[], over: Partial<GateDeps> = {}, files: Record<stri
   const posts: Array<{ sha: string; passed: boolean; title: string }> = [];
   const cursors = new Map<string, string>();
   const hooks: { onFiles?: (p: Pull) => void } = {};
+  const queue: Array<{ number: number; headSha: string; branch: string }> = [];
   const find = (number: number) => pulls.find((x) => x.number === number)!;
   const github: GatePort = {
     openPulls: async () => pulls.map((p) => ({ ...p, defaultBranch: 'main' })),
@@ -30,9 +31,10 @@ function fixture(pulls: Pull[], over: Partial<GateDeps> = {}, files: Record<stri
     approvers: async (_repo, number) => find(number).approvers,
     fileAtRef: async (_repo, ref, path) => (ref === 'main' ? files[path] ?? null : null),
     postGate: async (_repo, sha, passed, title) => { posts.push({ sha, passed, title }); },
+    queueEntries: async (_repo, branch) => queue.filter((e) => e.branch === branch),
   };
   const deps: GateDeps = { github, store: { cursor: (k) => cursors.get(k) ?? null, setCursor: (k, v) => { cursors.set(k, v); } }, log, falcon: FALCON, repoPack: '.falcon/policy.yaml', requested: new Set(pulls.map((p) => p.number)), dryRun: false, ...over };
-  return { deps, posts, cursors, files, hooks };
+  return { deps, posts, cursors, files, hooks, queue };
 }
 
 test('the gate waits, passes on a Falcon approval, and waits again when the approval goes', async () => {
@@ -177,4 +179,29 @@ test('only PRs requested in Chat get a check, and a request for an old PR is pic
   const none = fixture([pull(1, { approvers: ['lee'] })], { requested: new Set() });
   assert.equal(await sweepGate(none.deps, REPO, T0), 0);
   assert.deepEqual(none.posts, []);
+});
+
+test('a queue commit carries the decision on its own PR: a pass once, a wait until the PR passes', async () => {
+  const approved = pull(1, { approvers: [FALCON] });
+  const waiting = pull(2);
+  const f = fixture([approved, waiting]);
+  await sweepGate(f.deps, REPO, T0);
+  f.posts.length = 0;
+
+  f.queue.push({ number: 1, headSha: 'q1', branch: 'main' }, { number: 2, headSha: 'q2', branch: 'main' }, { number: 1, headSha: 'other', branch: 'release' });
+  assert.equal(await sweepGate(f.deps, REPO, T0 + MINUTE), 2);
+  assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['q1', true], ['q2', false]], 'the queue of a branch no open PR targets is not read');
+  assert.equal(await sweepGate(f.deps, REPO, T0 + 2 * MINUTE), 0, 'a queue commit is posted once');
+
+  waiting.approvers = ['lee'];
+  waiting.updatedAt = '2026-11-10T12:05:00Z';
+  f.posts.length = 0;
+  await sweepGate(f.deps, REPO, T0 + 3 * MINUTE);
+  assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['sha2', true], ['q2', true]], 'the queue commit follows its PR in the same pass');
+});
+
+test('a PR into a listed extra branch is judged like one into the default branch', async () => {
+  const f = fixture([pull(1, { baseRef: 'queue-trial', approvers: ['lee'] }), pull(2, { baseRef: 'stack/base', approvers: ['lee'] })], { branches: ['queue-trial'] });
+  assert.equal(await sweepGate(f.deps, REPO, T0), 1);
+  assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['sha1', true]]);
 });

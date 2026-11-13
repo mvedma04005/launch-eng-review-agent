@@ -72,3 +72,11 @@ Run with `dryRun: true` for a few days. Every eligible PR is reviewed end to end
 ## What this is not
 
 It is one host. If launch-engineering outgrows a single Mac, the same code runs in a container with a Postgres store behind the same interface. That is the "later" the design doc describes, not something the Mac needs today.
+
+## Merge gate and merge queues
+
+With `gate.enabled: true` Falcon posts a second check, "Merge gate", on each open PR into the default branch: green when a team member (the pack's `team.members`) or Falcon approved the latest commit. Make that check required in the repository's ruleset.
+
+A merge queue works with no extra setup. GitHub tests a queued PR on a temporary commit, on a branch named `gh-readonly-queue/<base>/pr-<number>-<sha>`, and a required check must also report there. On every pass the gate reads those branches and gives each queue commit the decision its PR's own commit last got. It needs no permission beyond reading the repository. Allow up to `gate.pollSeconds` (30 by default) before the check appears on a queue commit.
+
+To trial a queue on a side branch before turning it on for the default branch, list the branch in `gate.branches`. PRs into a listed branch are judged like PRs into the default branch.

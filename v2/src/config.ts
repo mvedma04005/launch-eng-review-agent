@@ -94,6 +94,8 @@ export const ConfigSchema = z.object({
     everyPull: z.boolean().default(false),
     /** Seconds between passes. */
     pollSeconds: z.number().int().min(10).default(30),
+    /** Base branches judged besides the default branch, for example a branch that trials a merge queue. */
+    branches: z.array(z.string()).default([]),
   }).prefault({}),
   notify: z.object({
     webhookUrlEnv: z.string().default('FALCON_NOTIFY_WEBHOOK'),
