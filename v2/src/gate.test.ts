@@ -31,7 +31,7 @@ function fixture(pulls: Pull[], over: Partial<GateDeps> = {}, files: Record<stri
     fileAtRef: async (_repo, ref, path) => (ref === 'main' ? files[path] ?? null : null),
     postGate: async (_repo, sha, passed, title) => { posts.push({ sha, passed, title }); },
   };
-  const deps: GateDeps = { github, store: { cursor: (k) => cursors.get(k) ?? null, setCursor: (k, v) => { cursors.set(k, v); } }, log, teamOwner: '@acme/team', falcon: FALCON, repoPack: '.falcon/policy.yaml', requested: new Set(pulls.map((p) => p.number)), dryRun: false, ...over };
+  const deps: GateDeps = { github, store: { cursor: (k) => cursors.get(k) ?? null, setCursor: (k, v) => { cursors.set(k, v); } }, log, falcon: FALCON, repoPack: '.falcon/policy.yaml', requested: new Set(pulls.map((p) => p.number)), dryRun: false, ...over };
   return { deps, posts, cursors, files, hooks };
 }
 
@@ -39,19 +39,19 @@ test('the gate waits, passes on a Falcon approval, and waits again when the appr
   const p = pull(1);
   const f = fixture([p]);
   assert.equal(await sweepGate(f.deps, REPO, T0), 1);
-  assert.deepEqual(f.posts.at(-1), { sha: 'sha1', passed: false, title: 'Waiting for an owner or Falcon to approve' });
+  assert.deepEqual(f.posts.at(-1), { sha: 'sha1', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' });
   assert.equal(await sweepGate(f.deps, REPO, T0), 0, 'nothing changed, nothing posted');
 
   p.approvers = [FALCON];
   p.updatedAt = '2026-11-10T10:05:00Z';
   assert.equal(await sweepGate(f.deps, REPO, T0), 1);
-  assert.deepEqual(f.posts.at(-1), { sha: 'sha1', passed: true, title: 'Approved by an owner or Falcon' });
+  assert.deepEqual(f.posts.at(-1), { sha: 'sha1', passed: true, title: 'Approved by Launch Engineering or Falcon' });
 
   p.approvers = [];
   p.headSha = 'sha1b'; // A push: the approval was on the older commit.
   p.updatedAt = '2026-11-10T10:06:00Z';
   assert.equal(await sweepGate(f.deps, REPO, T0), 1);
-  assert.deepEqual(f.posts.at(-1), { sha: 'sha1b', passed: false, title: 'Waiting for an owner or Falcon to approve' });
+  assert.deepEqual(f.posts.at(-1), { sha: 'sha1b', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' });
 });
 
 test('an approval in the same second as the cursor is still seen', async () => {
@@ -75,7 +75,7 @@ test('without a pack, or with an invalid one, only Falcon counts, and a named ow
 test('a PR into another branch is skipped, and one failing PR does not stop the rest', async () => {
   const f = fixture([pull(1, { baseRef: 'stack/base' }), pull(2, { files: ['boom'] }), pull(3, { approvers: ['lee'] })]);
   assert.equal(await sweepGate(f.deps, REPO, T0), 1);
-  assert.deepEqual(f.posts, [{ sha: 'sha3', passed: true, title: 'Approved by an owner or Falcon' }]);
+  assert.deepEqual(f.posts, [{ sha: 'sha3', passed: true, title: 'Approved by Launch Engineering or Falcon' }]);
   assert.equal(f.cursors.get(`gate:${REPO}`), undefined, 'the cursor stays so the failed PR is read again');
   assert.equal(await sweepGate(f.deps, REPO, T0), 0, 'the PR already posted is not posted twice');
 });
@@ -107,7 +107,7 @@ test('a push while the PR is being read: the new commit is judged, never the old
   let pushed = false;
   f.hooks.onFiles = (x) => { if (!pushed) { pushed = true; x.files = ['Orbit/a.py']; x.headSha = 'sha1b'; x.approvers = []; x.updatedAt = '2026-11-10T10:09:00Z'; } };
   assert.equal(await sweepGate(f.deps, REPO, T0), 1);
-  assert.deepEqual(f.posts, [{ sha: 'sha1b', passed: false, title: 'Waiting for an owner or Falcon to approve' }]);
+  assert.deepEqual(f.posts, [{ sha: 'sha1b', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' }]);
 });
 
 test('a comment while the PR is being read costs one more read, not a wrong or missing verdict', async () => {
@@ -116,7 +116,7 @@ test('a comment while the PR is being read costs one more read, not a wrong or m
   let touched = false;
   f.hooks.onFiles = (x) => { if (!touched) { touched = true; x.updatedAt = '2026-11-10T10:09:00Z'; } }; // Only the update time moves.
   assert.equal(await sweepGate(f.deps, REPO, T0), 1);
-  assert.deepEqual(f.posts, [{ sha: 'sha1', passed: true, title: 'Approved by an owner or Falcon' }]);
+  assert.deepEqual(f.posts, [{ sha: 'sha1', passed: true, title: 'Approved by Launch Engineering or Falcon' }]);
 });
 
 test('a PR that keeps moving loses its pass until it holds still', async () => {
@@ -131,7 +131,7 @@ test('a PR that keeps moving loses its pass until it holds still', async () => {
   assert.equal(await sweepGate(f.deps, REPO, T0), 0, 'still moving on the same commit: the wait stands, nothing new is posted');
   delete f.hooks.onFiles;
   assert.equal(await sweepGate(f.deps, REPO, T0), 1);
-  assert.deepEqual(f.posts.at(-1), { sha: 'sha1', passed: true, title: 'Approved by an owner or Falcon' });
+  assert.deepEqual(f.posts.at(-1), { sha: 'sha1', passed: true, title: 'Approved by Launch Engineering or Falcon' });
 });
 
 test('a PR closed or retargeted while it is being read gets no check', async () => {
@@ -150,7 +150,7 @@ test('a pass does not outlive a change to the rules on the default branch', asyn
   assert.equal(f.posts[0]!.passed, true);
   f.files['.falcon/policy.yaml'] = 'version: 1\nname: repo\nteam: { members: [kim] }\n'; // lee leaves the team; PR 1 is not touched.
   assert.equal(await sweepGate(f.deps, REPO, T0 + MINUTE), 1);
-  assert.deepEqual(f.posts.at(-1), { sha: 'sha1', passed: false, title: 'Waiting for an owner or Falcon to approve' });
+  assert.deepEqual(f.posts.at(-1), { sha: 'sha1', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' });
 });
 
 test('every open PR is judged again after half an hour, so a silent change is still caught', async () => {
@@ -160,7 +160,7 @@ test('every open PR is judged again after half an hour, so a silent change is st
   p.approvers = []; // Withdrawn without moving the PR's update time.
   assert.equal(await sweepGate(f.deps, REPO, T0 + MINUTE), 0);
   assert.equal(await sweepGate(f.deps, REPO, T0 + 31 * MINUTE), 1);
-  assert.deepEqual(f.posts.at(-1), { sha: 'sha1', passed: false, title: 'Waiting for an owner or Falcon to approve' });
+  assert.deepEqual(f.posts.at(-1), { sha: 'sha1', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' });
 });
 
 test('only PRs requested in Chat get a check, and a request for an old PR is picked up on the next pass', async () => {

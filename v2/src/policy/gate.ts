@@ -8,8 +8,6 @@ export const isGateFile = (path: string): boolean => GATE_FILES.some((g) => mini
 export interface GateInput {
   /** Every path the PR changes, old names of renamed files included. */
   files: string[];
-  /** CODEOWNERS text from the default branch. */
-  codeowners: string;
   /** Logins of the team, from the policy pack. */
   team: string[];
   /** Globs from the pack's verdict.commentOnly: paths a person must approve. Falcon's approval never covers them. */
@@ -23,30 +21,10 @@ export interface GateInput {
 /** `pass`: every file is covered. `wait`: `uncovered` lists the files that still need an approval. */
 export interface GateVerdict { verdict: 'pass' | 'wait'; uncovered: string[] }
 
-/** A CODEOWNERS pattern as the globs that match the same paths. */
-function ownerGlobs(pattern: string): string[] {
-  // shortcut: no escaped spaces, `\#` or `{` in patterns; handle them if a CODEOWNERS file starts to use them.
-  const body = pattern.replace(/^\/+|\/+$/g, '');
-  const base = (pattern.replace(/\/+$/, '').includes('/') ? '' : '**/') + body; // No slash inside: any depth.
-  if (pattern.endsWith('/')) return [`${base}/**`]; // A directory: its contents.
-  if (body.endsWith('/*')) return [base]; // Direct children only.
-  return [base, `${base}/**`]; // Anything else also covers what is under it.
-}
-
-/** Owners of one path, lower-cased. GitHub uses the last line that matches. */
-export function ownersOf(path: string, codeowners: string): string[] {
-  let found: string[] = [];
-  for (const line of codeowners.split(/\r?\n/)) {
-    const [pattern, ...owners] = line.split('#')[0]!.trim().split(/\s+/);
-    if (pattern && ownerGlobs(pattern).some((g) => minimatch(path, g))) found = owners.map((o) => o.toLowerCase());
-  }
-  return found;
-}
-
 /**
  * The merge gate's rule, the same for every path: an approval on the current commit from a team member or from
- * Falcon. Two limits. Falcon never covers the gate's own files or the pack's comment-only paths. And where CODEOWNERS
- * names people, not a team, one of those people must approve as well: the team or Falcon does not replace them.
+ * Falcon. One limit: Falcon never covers the gate's own files or the pack's comment-only paths; a team member does.
+ * CODEOWNERS plays no part: nobody else's approval is needed, and nobody else's approval is enough.
  */
 export function gateVerdict(input: GateInput): GateVerdict {
   const lower = (s: string) => s.toLowerCase();
@@ -54,17 +32,11 @@ export function gateVerdict(input: GateInput): GateVerdict {
   const falcon = input.falcon ? lower(input.falcon) : null;
   const approvers = input.approvers.map(lower);
   const falconApproved = falcon !== null && approvers.includes(falcon);
-  const people = approvers.filter((a) => a !== falcon && !a.endsWith('[bot]'));
-  const teamApproved = people.some((p) => team.has(p));
+  // A bot is never a person: no bot login counts as a team member.
+  const teamApproved = approvers.some((a) => a !== falcon && !a.endsWith('[bot]') && team.has(a));
   const humanPaths = input.humanPaths ?? [];
-  const uncovered = input.files.filter((path) => {
-    // Falcon only comments on the pack's comment-only paths, but an approval it gave before the list changed is still
-    // on the PR. The gate must not count it there.
-    const falconCovers = falconApproved && !isGateFile(path) && !humanPaths.some((g) => minimatch(path, g));
-    if (!teamApproved && !falconCovers) return true;
-    const owners = ownersOf(path, input.codeowners);
-    const named = owners.length > 0 && owners.every((o) => !o.includes('/'));
-    return named && !owners.some((o) => people.includes(o.replace(/^@/, '')));
-  });
+  // Falcon only comments on the pack's comment-only paths, but an approval it gave before the list changed is still
+  // on the PR. The gate must not count it there.
+  const uncovered = teamApproved ? [] : input.files.filter((path) => !falconApproved || isGateFile(path) || humanPaths.some((g) => minimatch(path, g)));
   return { verdict: uncovered.length || !input.files.length ? 'wait' : 'pass', uncovered };
 }

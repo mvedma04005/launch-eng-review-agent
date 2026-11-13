@@ -3,8 +3,6 @@ import type { Logger } from './log.ts';
 import { gateVerdict, type GateVerdict } from './policy/gate.ts';
 import { parsePolicy } from './policy/load.ts';
 
-/** Where GitHub looks for CODEOWNERS, in its order. */
-const CODEOWNERS_PATHS = ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS'];
 /** Every open PR is judged again this often, in case a change did not move its update time. */
 const FULL_RECHECK_MS = 30 * 60_000;
 
@@ -24,8 +22,6 @@ export interface GateDeps {
   github: GatePort;
   store: { cursor(key: string): string | null; setCursor(key: string, value: string): void };
   log: Logger;
-  /** The CODEOWNERS entry Falcon stands in for. */
-  teamOwner: string;
   /** Falcon's own login, or null when it is unknown. */
   falcon: string | null;
   /** Path of the repository's policy pack, which holds the team list. */
@@ -38,10 +34,10 @@ export interface GateDeps {
 function describe({ verdict, uncovered }: GateVerdict, approvers: string[], tooMany: boolean, moved: boolean): { title: string; summary: string } {
   const who = approvers.length ? `Approved on this commit by ${approvers.join(', ')}.` : 'Nobody has approved this commit yet.';
   const list = uncovered.slice(0, 10).map((f) => `\`${f}\``).join(', ') + (uncovered.length > 10 ? ` and ${uncovered.length - 10} more` : '');
-  if (verdict === 'pass') return { title: 'Approved by an owner or Falcon', summary: `${who} A team member or Falcon approved, and every file that names its owners has one of them.` };
+  if (verdict === 'pass') return { title: 'Approved by Launch Engineering or Falcon', summary: `${who} A team member or Falcon approved this commit.` };
   if (moved) return { title: 'Waiting: the PR changed while it was being checked', summary: 'The PR was pushed to or edited during the check. It is checked again on the next pass.' };
   if (tooMany) return { title: 'Waiting: too many files to check', summary: 'This PR changes more files than GitHub lists, so the list of files may be incomplete. Split the PR.' };
-  return { title: 'Waiting for an owner or Falcon to approve', summary: `${who} Still needs an approval from a team member or Falcon, or from a named owner, for: ${list || 'this change'}.` };
+  return { title: 'Waiting for Launch Engineering or Falcon to approve', summary: `${who} Still needs an approval from a team member, or from Falcon where Falcon may approve, for: ${list || 'this change'}.` };
 }
 
 /**
@@ -73,13 +69,8 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   // A PR that already has a check keeps being judged, so a pass is withdrawn even after the PR leaves the list.
   const open = (await github.openPulls(repo)).filter((p) => p.baseRef === p.defaultBranch && (!requested || requested.has(p.number) || store.cursor(`gate:${repo}#${p.number}`) !== null));
   if (!open.length) return 0;
-  // Owners and the team list come from the default branch, never from the PR being judged.
+  // The team list and the person-only paths come from the default branch, never from the PR being judged.
   const branch = open[0]!.defaultBranch;
-  let codeowners = '';
-  for (const path of CODEOWNERS_PATHS) {
-    const text = await github.fileAtRef(repo, branch, path);
-    if (text !== null) { codeowners = text; break; }
-  }
   const pack = await github.fileAtRef(repo, branch, deps.repoPack);
   let team: string[] = [];
   let humanPaths: string[] = [];
@@ -90,8 +81,9 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
     log.warn({ err: error, repo }, 'merge gate: the policy pack is invalid, so no team member counts');
   }
 
-  // A pass must not outlive the rule that gave it: a change to CODEOWNERS, the pack or the team entry re-judges every PR.
-  const rules = createHash('sha256').update([codeowners, pack ?? '', deps.teamOwner, deps.falcon ?? ''].join('\0')).digest('hex');
+  // A pass must not outlive the rule that gave it: a change to the pack re-judges every PR. `v2` marks the rule
+  // itself (CODEOWNERS no longer counts), so the first pass after this change re-judges every PR once.
+  const rules = createHash('sha256').update(['v2', pack ?? '', deps.falcon ?? ''].join('\0')).digest('hex');
   const fullKey = `gate:${repo}:full`;
   const [lastRules, lastAt] = (store.cursor(fullKey) ?? ':0').split(':');
   const full = lastRules !== rules || now - Number(lastAt) >= FULL_RECHECK_MS;
@@ -109,7 +101,7 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
       const read = await readPull(github, repo, p.number, p.author);
       if (!read.open || read.baseRef !== branch) continue; // Closed or retargeted since it was listed.
       // A PR that will not hold still gets a wait, never a skip: an old pass must not survive because the PR keeps moving.
-      const result: GateVerdict = !read.steady || read.files === null ? { verdict: 'wait', uncovered: [] } : gateVerdict({ files: read.files, codeowners, team, humanPaths, approvers: read.approvers, falcon: deps.falcon });
+      const result: GateVerdict = !read.steady || read.files === null ? { verdict: 'wait', uncovered: [] } : gateVerdict({ files: read.files, team, humanPaths, approvers: read.approvers, falcon: deps.falcon });
       // `moved` never equals a judged state, so the next pass posts the real verdict.
       const state = read.steady ? `${read.headSha}:${result.verdict}:${read.approvers.join(',')}:${result.uncovered.length}` : `${read.headSha}:moved`;
       const key = `gate:${repo}#${p.number}`;

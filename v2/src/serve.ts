@@ -47,11 +47,10 @@ export async function serve(config: Config, signal: AbortSignal): Promise<void> 
 
   // Merge gate: re-read the open PRs whose approvals changed and post the second check.
   if (config.gate.enabled) {
-    if (!config.gate.teamOwner) throw new Error('gate.enabled requires gate.teamOwner, the CODEOWNERS entry Falcon stands in for');
     every(config.gate.pollSeconds * 1000, 'gate_sweep', async () => {
       for (const repo of config.github.repos) {
         const github = new OctokitGitHub(await ctx.auth.octokitFor(repo), await ctx.auth.botLogin());
-        await sweepGate({ github, store, log, teamOwner: config.gate.teamOwner, falcon: await ctx.auth.botLogin(), repoPack: config.policy.repoPath, requested: config.gate.everyPull ? null : store.chatRequestedPulls(repo), dryRun: config.dryRun }, repo);
+        await sweepGate({ github, store, log, falcon: await ctx.auth.botLogin(), repoPack: config.policy.repoPath, requested: config.gate.everyPull ? null : store.chatRequestedPulls(repo), dryRun: config.dryRun }, repo);
       }
     });
   }

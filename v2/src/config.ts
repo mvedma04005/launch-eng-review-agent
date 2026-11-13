@@ -90,8 +90,6 @@ export const ConfigSchema = z.object({
   /** The merge gate: a second check on every open PR, passing only when its owners or Falcon approved the current commit. */
   gate: z.object({
     enabled: z.boolean().default(false),
-    /** The CODEOWNERS entry Falcon stands in for, e.g. `@ROKT/launch-engineering`. Required when enabled. */
-    teamOwner: z.string().default(''),
     /** Judge every open PR into the default branch, not only the ones requested in Chat. Turn it on before the check is required to merge: a PR nobody posted in Chat still needs its check. */
     everyPull: z.boolean().default(false),
     /** Seconds between passes. */
