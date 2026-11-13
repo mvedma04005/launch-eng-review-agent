@@ -17,8 +17,8 @@ export interface RenderedReview {
   overridden: boolean;
 }
 
-// P0 and P1 must be fixed before merge (they are the pack's default blockOn); P2 and P3 are the author's call.
-const sevLabel: Record<Finding['severity'], string> = { critical: 'P0', high: 'P1', medium: 'P2', low: 'P3', info: 'Note' };
+// P0 and P1 block (the pack's blockOn). P2 and P3 hold the approval (holdOn). Only a nit lets the bot approve.
+const sevLabel: Record<Finding['severity'], string> = { critical: 'P0', high: 'P1', medium: 'P2', low: 'P3', info: 'Nit' };
 
 export function decideVerdict(policy: PolicyPack, findings: Finding[], confidence: ReviewOutput['confidence'] = 'high', override: string | null = null): { verdict: Verdict; blocking: Finding[]; overridden: boolean } {
   const severe = findings.filter((f) => f.blocking || policy.verdict.blockOn.includes(f.severity));

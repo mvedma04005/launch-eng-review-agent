@@ -22,9 +22,10 @@ verdict:
   # how much authority the bot can have anywhere.
   maxMode: approve
   blockOn: [critical, high]
-  # A P2 finding does not block, but the bot does not approve over it: an approval with an open problem attached
-  # tells the author the change is fine. The author fixes it, or a team member approves.
-  holdOn: [medium]
+  # Only a nit (info) lets the bot approve. A P2 or P3 finding does not block, but the bot does not approve over it:
+  # an approval with an open problem attached tells the author the change is fine. The author fixes it, or a team
+  # member approves.
+  holdOn: [medium, low]
   checkRun: true
   verifyBlocking: true
 lenses: [correctness, security, operability]

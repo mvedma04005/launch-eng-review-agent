@@ -71,7 +71,8 @@ test('approve mode never approves past a blocking-severity finding the verifier 
     assert.equal(r.checkConclusion, 'neutral');
     assert.match(r.body, /### Falcon review: Comments only — 1 blocking finding disputed by the verifier/);
   }
-  const clean = renderReview(approve, meta, out([f({ severity: 'low', blocking: false })]), anchors, new Map());
+  // A nit is the only finding the bot approves over.
+  const clean = renderReview(approve, meta, out([f({ severity: 'info', blocking: false })]), anchors, new Map());
   assert.equal(clean.event, 'APPROVE');
   assert.equal(clean.checkConclusion, 'success');
 });
@@ -85,17 +86,21 @@ test('an overridden block says so in the headline and marks the render as overri
   assert.equal(r.event, 'COMMENT');
 });
 
-test('approve mode: a P2 finding holds the approval, a P3 finding does not', () => {
+test('approve mode: only a nit lets the bot approve; P2 and P3 hold the approval', () => {
   const approve = parsePolicy('version: 1\nname: a\nverdict: { mode: approve }', 'a');
   const p2 = f({ severity: 'medium', blocking: false });
   const p3 = f({ severity: 'low', blocking: false });
+  const nit = f({ severity: 'info', blocking: false });
   assert.equal(decideVerdict(approve, [p2]).verdict, 'comment');
-  assert.equal(decideVerdict(approve, [p3]).verdict, 'approve');
-  const out = { summary: 's', confidence: 'high' as const, findings: [p2], reviewedFiles: ['h.py'], lenses: ['correctness'], questions: [] };
+  assert.equal(decideVerdict(approve, [p3]).verdict, 'comment');
+  assert.equal(decideVerdict(approve, [nit]).verdict, 'approve');
+  assert.equal(decideVerdict(approve, [nit, p3]).verdict, 'comment');
+  const out = { summary: 's', confidence: 'high' as const, findings: [p3, nit], reviewedFiles: ['h.py'], lenses: ['correctness'], questions: [] };
   const held = renderReview(approve, meta, out, anchors, new Map());
   assert.equal(held.event, 'COMMENT');
   assert.match(held.body, /Comments only — 1 finding to fix before Falcon approves/);
-  // A pack may choose to approve over P2 again.
+  assert.match(held.body, /1 P3, 1 Nit/);
+  // A pack may choose to approve over P2 and P3 again.
   const loose = parsePolicy('version: 1\nname: a\nverdict: { mode: approve, holdOn: [] }', 'a');
   assert.equal(decideVerdict(loose, [p2]).verdict, 'approve');
 });

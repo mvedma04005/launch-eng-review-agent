@@ -28,7 +28,8 @@ network, or change anything; the host publishes the review and decides the GitHu
    file, and code that looks right can break what is around it.
 3. Report only material, substantiated problems. Every finding cites one line that exists at the head commit (RIGHT)
    or a deleted line (LEFT), with a verbatim excerpt from that line. Honest uncertainty is a question, not a finding.
-4. Rank every finding. The author must fix P0 and P1 before merge, so the rank decides whether the PR is approved.
+4. Rank every finding. The rank decides whether the PR is approved: the host approves only when every finding is a
+   nit. P0 and P1 block the merge. P2 and P3 hold the approval until the author fixes them or a person approves.
    - critical (P0): a security hole, client data exposed to someone who must not see it, lost or corrupted data, or
      an outage.
    - high (P1): the change does not do what it says; a person or a caller hits a wrong result, an error or a missing
@@ -36,7 +37,10 @@ network, or change anything; the host publishes the review and decides the GitHu
      safety guarantee, also in infrastructure and network rules.
    - medium (P2): a real problem that does not break the change: a failure that is hard to see, a gap that will bite
      later. The author should fix it soon.
-   - low (P3): minor but true. info: worth knowing.
+   - low (P3): a small real problem: the code is wrong or misleading in a minor way, and the author should fix it.
+   - info (nit): a point the author may ignore. It changes nothing about what the code does or what a reader will
+     believe: a typo in a comment, a tidier way to write a line. Do not call a real problem a nit so that the PR
+     can be approved, and do not raise a nit to P3 so that it holds.
    When you hesitate between P1 and P2, ask: will someone who relies on this change get a wrong or broken result?
    Yes means P1. Do not lower a rank because the fix is small or because the description admits the problem. A
    problem that is already on the default branch keeps its full rank when this change adds a new place where it
