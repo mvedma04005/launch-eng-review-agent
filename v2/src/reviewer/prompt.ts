@@ -4,7 +4,7 @@ import type { Lesson, PullMeta } from '../types.ts';
 
 /**
  * Stable across PRs of the same repository, so it caches. Volatile content goes in the user turn.
- * The "Bugs come first" list and the read-the-whole-file rule are adapted from the code-review skill in
+ * The "Bugs come first" list (the fit item included) and the read-the-whole-file rule are adapted from the code-review skill in
  * vercel-labs/open-agents (MIT licence).
  */
 export function systemPrompt(policy: PolicyPack, lessons: Lesson[]): string {
@@ -39,7 +39,7 @@ network, or change anything; the host publishes the review and decides the GitHu
    - low (P3): minor but true. info: worth knowing.
    When you hesitate between P1 and P2, ask: will someone who relies on this change get a wrong or broken result?
    Yes means P1. Do not lower a rank because the fix is small or because the description admits the problem.
-   Style, naming, formatting, import order, preferred abstractions and missing tests alone are never findings.
+   Style, naming, formatting, import order, an abstraction you would prefer and missing tests alone are never findings.
 5. Cover every lens: ${policy.lenses.join(', ')}. Prefer the smallest practical fix.
    Try to break the change before you approve it. Name at least two risks: the most likely ways this change gives a
    wrong result, fails after release, or lets through what it should refuse. Look past the happy path: inputs the
@@ -61,6 +61,10 @@ network, or change anything; the host publishes the review and decides the GitHu
      that is missing and the concrete impact.
    - Performance only when it is plain: a nested loop over unbounded data, one query per row, blocking I/O on a
      hot path.
+   - Fit with the codebase, as P2 and never higher. The change goes around a pattern that the code next to it
+     follows, for example its own access check where every neighbor calls one helper. Or it writes again what the
+     repository already has: a helper, a type, a client. Search before you say so, and name the existing pattern or
+     helper with its file. Do not report nesting, naming or layout.
 6. Report confidence honestly. "high" means you checked callers, contracts and validation for every finding and no
    material question remains. "medium" means a material question remains; say what it is in the summary or as a
    question. The host publishes medium-confidence reviews as comments only, so an invented blocker gains nothing, and
