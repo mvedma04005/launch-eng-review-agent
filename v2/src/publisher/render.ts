@@ -29,12 +29,15 @@ export function decideVerdict(policy: PolicyPack, findings: Finding[], confidenc
   if (blocking.length) return { verdict: policy.verdict.mode === 'comment' ? 'comment' : 'request_changes', blocking, overridden: false };
   // A blocking-severity finding the verifier disputes is a human's call: it neither blocks nor lets the PR be approved.
   if (severe.length) return { verdict: 'comment', blocking, overridden: false };
+  // A finding that holds (P2 by default) does not block, but the bot does not approve over an open problem.
+  if (findings.some((f) => policy.verdict.holdOn.includes(f.severity))) return { verdict: 'comment', blocking, overridden: false };
   return { verdict: policy.verdict.mode === 'approve' ? 'approve' : 'comment', blocking, overridden: false };
 }
 
 export function renderReview(policy: PolicyPack, meta: PullMeta, output: ReviewOutput, anchors: Anchors, priorOpen: Map<string, Finding>, override: string | null = null): RenderedReview {
   const { verdict, blocking, overridden } = decideVerdict(policy, output.findings, output.confidence, override);
   const disputed = output.findings.filter((f) => f.blocking).length - blocking.length;
+  const held = output.findings.filter((f) => policy.verdict.holdOn.includes(f.severity)).length;
   const ordered = [...output.findings].sort((a, b) => Number(b.blocking) - Number(a.blocking) || sevRank(a) - sevRank(b));
   const comments: RenderedReview['comments'] = [];
   const bodyFindings: string[] = [];
@@ -52,6 +55,7 @@ export function renderReview(policy: PolicyPack, meta: PullMeta, output: ReviewO
     : output.confidence === 'medium' ? `Comments only (medium confidence)${blocking.length ? `, ${blocking.length} finding${blocking.length === 1 ? '' : 's'} need a decision` : ''}`
     : blocking.length ? `Changes requested — ${blocking.length} blocking finding${blocking.length === 1 ? '' : 's'}`
     : disputed > 0 ? `Comments only — ${disputed} blocking finding${disputed === 1 ? '' : 's'} disputed by the verifier; a human decides`
+    : held > 0 ? `Comments only — ${held} finding${held === 1 ? '' : 's'} to fix before Falcon approves`
     : 'Reviewed — no blocking findings';
   const notice = verdict === 'comment' ? ' This comment-only review does not withdraw earlier approvals or change requests.' : '';
   const lines = [

@@ -38,7 +38,9 @@ network, or change anything; the host publishes the review and decides the GitHu
      later. The author should fix it soon.
    - low (P3): minor but true. info: worth knowing.
    When you hesitate between P1 and P2, ask: will someone who relies on this change get a wrong or broken result?
-   Yes means P1. Do not lower a rank because the fix is small or because the description admits the problem.
+   Yes means P1. Do not lower a rank because the fix is small or because the description admits the problem. A
+   problem that is already on the default branch keeps its full rank when this change adds a new place where it
+   happens: say that it is not new, and rank it by what it does.
    Style, naming, formatting, import order, an abstraction you would prefer and missing tests alone are never findings.
 5. Cover every lens: ${policy.lenses.join(', ')}. Prefer the smallest practical fix.
    Try to break the change before you approve it. Name at least two risks: the most likely ways this change gives a
