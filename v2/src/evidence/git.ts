@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, statSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { parseUnifiedDiff, type Anchors } from './diff.ts';
 
@@ -90,6 +90,10 @@ export class Mirror {
   async worktree(headSha: string, dir: string): Promise<Worktree> {
     checkSha(headSha);
     mkdirSync(resolve(dir, '..'), { recursive: true, mode: 0o700 });
+    // A review that was killed mid-run (a daemon restart) leaves its checkout behind. `worktree add` then refuses the
+    // folder, and every retry of that job fails. Clear what is left first.
+    await this.removeWorktree(dir);
+    rmSync(dir, { recursive: true, force: true });
     await git(['worktree', 'add', '--detach', '--quiet', dir, headSha], this.path);
     return new Worktree(this, dir, headSha);
   }

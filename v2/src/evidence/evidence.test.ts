@@ -81,6 +81,9 @@ test('mirror + worktree: fetch, merge base, diff, confined reads, grep, and host
   const wt = await mirror.worktree(headSha, join(root, 'wt', 'job1'));
   try {
     assert.equal(wt.readText('handler.py', 10_000).split('\n')[1], 'return user.name');
+    // A checkout left behind by a killed review does not block the next attempt at the same folder.
+    const again = await mirror.worktree(headSha, join(root, 'wt', 'job1'));
+    assert.equal(again.readText('handler.py', 10_000).split('\n')[1], 'return user.name');
     assert.throws(() => wt.readText('../origin/secret.txt', 10_000), /Invalid repository path|escapes/);
     assert.throws(() => wt.readText('escape', 10_000), /escapes|Not a regular file/);
     assert.deepEqual(await wt.grep('user\\.name', [], 10), ['handler.py:2:return user.name']);
