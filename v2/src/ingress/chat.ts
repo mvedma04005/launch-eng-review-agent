@@ -8,7 +8,7 @@ import type { ChatRequest, Job, PullMeta } from '../types.ts';
 /**
  * Google Chat as the front door, the way OP3 Investigator does it: the engine is a Chat *app* (its own identity),
  * events reach it through a Pub/Sub subscription it pulls from (works behind NAT, nothing inbound), it answers
- * "👀 Looking" in the thread before it touches GitHub, and every reply goes through a durable, idempotent outbox.
+ * "🦅 Looking" in the thread before it touches GitHub, and every reply goes through a durable, idempotent outbox.
  * An app-authenticated poll of the allowlisted spaces catches bare links posted without a mention.
  */
 
@@ -170,7 +170,7 @@ export function handleChatMessage(ctx: IntakeContext, msg: ChatMessage): 'record
     if (!request) continue;
     recorded++;
     const ahead = store.snapshot().byStatus['queued'] ?? 0;
-    store.queueChatReply(`ack:${request.id}`, msg.space, msg.thread, `👀 Looking at ${pr.repo}#${pr.number}${parsed.command === 're-review' ? ' (fresh review requested)' : ''}${ahead ? ` · ${ahead} ahead in the queue` : ''}`);
+    store.queueChatReply(`ack:${request.id}`, msg.space, msg.thread, `🦅 Looking at ${pr.repo}#${pr.number}${parsed.command === 're-review' ? ' (fresh review requested)' : ''}${ahead ? ` · ${ahead} ahead in the queue` : ''}`);
     ctx.log.info({ request: request.id, repo: pr.repo, number: pr.number, command: parsed.command, sender: msg.sender.name }, 'chat request recorded');
   }
   return recorded ? 'recorded' : 'duplicate';

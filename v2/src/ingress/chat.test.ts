@@ -53,7 +53,7 @@ test('intake records once, acknowledges immediately, refuses other repositories,
   assert.equal(handleChatMessage(ctx, msg({ name: `${SPACE}/messages/op3`, text: 'https://github.com/ROKT/op3/pull/1' })), 'refused');
   const replies = store.pendingChatReplies(Date.now() / 1000 + 1, 10);
   assert.equal(replies.length, 2);
-  assert.match(replies[0]!.text, /👀 Looking at ROKT\/launch-engineering#585/);
+  assert.match(replies[0]!.text, /🦅 Looking at ROKT\/launch-engineering#585/);
   assert.match(replies[1]!.text, /Only ROKT\/launch-engineering is reviewed here. Not queued: ROKT\/op3/);
   assert.equal(store.pendingChatRequests().length, 1);
 });
