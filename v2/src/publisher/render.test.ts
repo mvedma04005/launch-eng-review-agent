@@ -104,3 +104,23 @@ test('approve mode: only a nit lets the bot approve; P2 and P3 hold the approval
   const loose = parsePolicy('version: 1\nname: a\nverdict: { mode: approve, holdOn: [] }', 'a');
   assert.equal(decideVerdict(loose, [p2]).verdict, 'approve');
 });
+
+test('a comment-only review says why Falcon did not approve and what the author does next', () => {
+  const approve = parsePolicy('version: 1\nname: a\nverdict: { mode: approve }', 'a');
+  const comment = parsePolicy('version: 1\nname: c\nverdict: { mode: comment }', 'c');
+  const base = { summary: 's', confidence: 'high' as const, reviewedFiles: ['h.py'], lenses: ['correctness'], questions: [] };
+  const p3 = f({ severity: 'low', blocking: false });
+  const held = renderReview(approve, meta, { ...base, findings: [p3] }, anchors, new Map());
+  assert.equal(held.notApproved?.title, 'Not approved: 1 finding to fix (1 P3)');
+  assert.match(held.body, /\*\*Why Falcon did not approve:\*\* 1 finding \(1 P3\) is open\. A P2 or P3 finding holds Falcon's approval in this repository, and acknowledging a finding does not close it\. To merge: fix it and post the PR link again, or ask a Launch Engineering member to approve this commit\./);
+  assert.match(held.comments[0]!.body, /\*\*Holds approval · P3\*\*/);
+  const unsure = renderReview(approve, meta, { ...base, confidence: 'medium', findings: [] }, anchors, new Map());
+  assert.match(unsure.notApproved!.why, /not sure enough.*To merge: ask a Launch Engineering member to approve this commit\./);
+  // A PR the pack keeps for a person: fixing findings never gets Falcon's approval, so the next step is a person.
+  const person = renderReview(comment, meta, { ...base, findings: [p3] }, anchors, new Map());
+  assert.equal(person.notApproved?.title, "Not approved: needs a person's approval");
+  assert.doesNotMatch(person.notApproved!.why, /post the PR link again/);
+  const unsettled = renderReview(approve, meta, { ...base, findings: [f({ blocking: false })] }, anchors, new Map());
+  assert.equal(unsettled.notApproved?.title, 'Not approved: 1 serious finding not confirmed; a person decides');
+  assert.equal(renderReview(approve, meta, { ...base, findings: [] }, anchors, new Map()).notApproved, null, 'an approval needs no reason');
+});

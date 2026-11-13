@@ -163,6 +163,8 @@ export interface PendingPublication {
   blockingCount: number;
   /** A team member's approval lifted blocking findings. Absent on reviews rendered before this field existed. */
   overridden?: boolean;
+  /** The check run's title for a comment-only review: why it is not an approval. Absent on older reviews and on other verdicts. */
+  notApprovedTitle?: string;
   summary: string;
   attempts: number;
   renderedAt: string;

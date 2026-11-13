@@ -35,8 +35,10 @@ export interface GateDeps {
   dryRun: boolean;
 }
 
-function describe({ verdict, uncovered }: GateVerdict, approvers: string[], tooMany: boolean, moved: boolean): { title: string; summary: string } {
-  const who = approvers.length ? `Approved on this commit by ${approvers.join(', ')}.` : 'Nobody has approved this commit yet.';
+function describe({ verdict, uncovered }: GateVerdict, approvers: string[], outside: string[], tooMany: boolean, moved: boolean): { title: string; summary: string } {
+  // An approval GitHub shows but the gate does not count is the first thing an author asks about.
+  const notCounted = outside.length ? ` ${outside.join(' and ')} ${outside.length === 1 ? 'is' : 'are'} not in the team list of the policy file, so ${outside.length === 1 ? 'that' : 'their'} approval does not count here.` : '';
+  const who = approvers.length ? `Approved on this commit by ${approvers.join(', ')}.${notCounted}` : 'Nobody has approved this commit yet.';
   const list = uncovered.slice(0, 10).map((f) => `\`${f}\``).join(', ') + (uncovered.length > 10 ? ` and ${uncovered.length - 10} more` : '');
   if (verdict === 'pass') return { title: 'Approved by Launch Engineering or Falcon', summary: `${who} A team member or Falcon approved this commit.` };
   if (moved) return { title: 'Waiting: the PR changed while it was being checked', summary: 'The PR was pushed to or edited during the check. It is checked again on the next pass.' };
@@ -111,7 +113,8 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
       const state = read.steady ? `${read.headSha}:${result.verdict}:${read.approvers.join(',')}:${result.uncovered.length}` : `${read.headSha}:moved`;
       const key = `gate:${repo}#${p.number}`;
       if (store.cursor(key) !== state) {
-        const { title, summary } = describe(result, read.approvers, read.files === null, !read.steady);
+        const outside = read.approvers.filter((a) => a.toLowerCase() !== deps.falcon?.toLowerCase() && !team.some((t) => t.toLowerCase() === a.toLowerCase()));
+        const { title, summary } = describe(result, read.approvers, outside, read.files === null, !read.steady);
         log.info({ repo, number: p.number, head: read.headSha, verdict: result.verdict, steady: read.steady, approvers: read.approvers, dryRun: deps.dryRun }, 'merge gate decided');
         if (!deps.dryRun) {
           await github.postGate(repo, read.headSha, result.verdict === 'pass', title, summary);

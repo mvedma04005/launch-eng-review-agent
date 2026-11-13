@@ -15,6 +15,7 @@ const pull = (number: number, over: Partial<Pull> = {}): Pull => ({ number, head
 
 function fixture(pulls: Pull[], over: Partial<GateDeps> = {}, files: Record<string, string> = { '.github/CODEOWNERS': CODEOWNERS, '.falcon/policy.yaml': PACK }) {
   const posts: Array<{ sha: string; passed: boolean; title: string }> = [];
+  const summaries: string[] = [];
   const cursors = new Map<string, string>();
   const hooks: { onFiles?: (p: Pull) => void } = {};
   const queue: Array<{ number: number; headSha: string; branch: string }> = [];
@@ -30,11 +31,11 @@ function fixture(pulls: Pull[], over: Partial<GateDeps> = {}, files: Record<stri
     },
     approvers: async (_repo, number) => find(number).approvers,
     fileAtRef: async (_repo, ref, path) => (ref === 'main' ? files[path] ?? null : null),
-    postGate: async (_repo, sha, passed, title) => { posts.push({ sha, passed, title }); },
+    postGate: async (_repo, sha, passed, title, summary) => { posts.push({ sha, passed, title }); summaries.push(summary); },
     queueEntries: async (_repo, branch) => queue.filter((e) => e.branch === branch),
   };
   const deps: GateDeps = { github, store: { cursor: (k) => cursors.get(k) ?? null, setCursor: (k, v) => { cursors.set(k, v); } }, log, falcon: FALCON, repoPack: '.falcon/policy.yaml', requested: new Set(pulls.map((p) => p.number)), dryRun: false, ...over };
-  return { deps, posts, cursors, files, hooks, queue };
+  return { deps, posts, summaries, cursors, files, hooks, queue };
 }
 
 test('the gate waits, passes on a Falcon approval, and waits again when the approval goes', async () => {
@@ -204,4 +205,15 @@ test('a PR into a listed extra branch is judged like one into the default branch
   const f = fixture([pull(1, { baseRef: 'queue-trial', approvers: ['lee'] }), pull(2, { baseRef: 'stack/base', approvers: ['lee'] })], { branches: ['queue-trial'] });
   assert.equal(await sweepGate(f.deps, REPO, T0), 1);
   assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['sha1', true]]);
+});
+
+test('the gate names an approver who is not on the team list, so the author sees why that approval does not count', async () => {
+  const f = fixture([pull(1, { approvers: ['Oz', 'pat'] }), pull(2, { approvers: ['lee'] }), pull(3)]);
+  await sweepGate(f.deps, REPO, T0);
+  assert.match(f.summaries[0]!, /Approved on this commit by Oz, pat\. Oz and pat are not in the team list of the policy file, so their approval does not count here\./);
+  assert.doesNotMatch(f.summaries[1]!, /does not count/);
+  assert.doesNotMatch(f.summaries[2]!, /does not count/);
+  const g = fixture([pull(1, { approvers: ['oz', FALCON], files: ['.github/CODEOWNERS'] })]);
+  await sweepGate(g.deps, REPO, T0);
+  assert.match(g.summaries[0]!, /oz is not in the team list of the policy file, so that approval does not count here\./, 'Falcon is never named as an outsider');
 });

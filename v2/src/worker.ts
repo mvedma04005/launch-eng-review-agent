@@ -81,7 +81,7 @@ export function secondsUntilNextUtcDay(now = new Date()): number {
 export function toPending(rendered: RenderedReview, headSha: string, summary: string): PendingPublication {
   return {
     headSha, event: rendered.event, body: rendered.body, comments: rendered.comments, checkConclusion: rendered.checkConclusion,
-    blockingCount: rendered.blocking.length, overridden: rendered.overridden, summary, attempts: 0, renderedAt: new Date().toISOString(),
+    blockingCount: rendered.blocking.length, overridden: rendered.overridden, ...(rendered.notApproved ? { notApprovedTitle: rendered.notApproved.title } : {}), summary, attempts: 0, renderedAt: new Date().toISOString(),
   };
 }
 
@@ -229,7 +229,8 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
       : output.summary;
     const finalOutput: ReviewOutput = { ...output, summary, findings: kept, confidence: unreviewed.length ? 'medium' : output.confidence };
     const rendered = sanitize(renderReview(policy, meta, finalOutput, anchors, prior, override), redactor);
-    const toPublish = toPending(rendered, job.headSha, boundBytes(redactor.apply(finalOutput.summary), LIMITS.summary));
+    // The reason leads the check summary and the Chat reply, where the author looks first.
+    const toPublish = toPending(rendered, job.headSha, boundBytes(redactor.apply(`${rendered.notApproved ? `${rendered.notApproved.why}\n\n` : ''}${finalOutput.summary}`), LIMITS.summary));
     ctx.store.recordFindings(job, kept);
     ctx.store.savePending(job.id, toPublish);
     phase('render');
@@ -274,7 +275,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     try {
       const posted = await github.postReview(job.repo, job.number, job.headSha, pendingReview);
       for (const [findingId, commentId] of posted.commentIds) ctx.store.setFindingComment(findingId, commentId);
-      const title = pendingReview.blockingCount ? `${pendingReview.blockingCount} blocking finding(s)` : pendingReview.overridden ? 'Blocking findings overridden' : pendingReview.event === 'APPROVE' ? 'Approved' : 'No blocking findings';
+      const title = pendingReview.blockingCount ? `${pendingReview.blockingCount} blocking finding(s)` : pendingReview.overridden ? 'Blocking findings overridden' : pendingReview.event === 'APPROVE' ? 'Approved' : pendingReview.notApprovedTitle ?? 'No blocking findings';
       const check = checksEnabled ? await github.completeCheckRun(job.repo, job.headSha, checkId, pendingReview.checkConclusion, title, pendingReview.summary, posted.htmlUrl) : null;
       ctx.store.recordReview(job.id, { githubReviewId: posted.id, checkRunId: check, event: pendingReview.event, marker: pendingReview.body.split('\n').at(-1)! });
       ctx.store.finish(job.id, 'published', { result: { reviewUrl: posted.htmlUrl, event: pendingReview.event, inlineDropped: posted.inlineDropped } });
