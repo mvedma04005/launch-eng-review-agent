@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { AlertState, evaluateAlerts, notify } from './alerts.ts';
 import type { Config } from './config.ts';
@@ -142,10 +143,9 @@ async function runInChild(config: Config, store: Store, jobId: string, owner: st
   }
 }
 
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal.aborted) return resolve();
-    const t = setTimeout(resolve, ms);
-    signal.addEventListener('abort', () => { clearTimeout(t); resolve(); }, { once: true });
-  });
+/** Resolves after `ms`, or at once when the signal aborts. */
+export function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  // The stdlib timer removes its abort listener when it fires. A listener added by hand stayed on the shared
+  // signal for good: one per sleep, a few every second, and Node walks that list on every add.
+  return delay(ms, undefined, { signal }).catch(() => undefined);
 }
