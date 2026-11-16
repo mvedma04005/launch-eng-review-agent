@@ -15,7 +15,7 @@ export const FindingInputSchema = z.object({
 export type FindingInput = z.infer<typeof FindingInputSchema>;
 
 export const ReviewSubmissionSchema = z.object({
-  summary: z.string().min(3).max(2500),
+  summary: z.string().min(3).max(2500).describe('What the change does, then what you checked. No verdict. Simplified Technical English, as step 7 of your instructions says.'),
   /** high: callers, contracts and validation were checked for every finding. medium: a material question remains; the host publishes comments only. */
   confidence: z.enum(['high', 'medium']),
   reviewed_files: z.array(z.string()).describe('Every in-scope changed file you inspected.'),
