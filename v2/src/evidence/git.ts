@@ -82,8 +82,9 @@ export class Mirror {
     return checkSha((await git(['merge-base', checkSha(a), checkSha(b)], this.path)).trim());
   }
 
-  async diff(baseSha: string, headSha: string): Promise<Anchors> {
-    const text = await git(['-c', 'core.quotePath=false', 'diff', '--no-color', '--no-ext-diff', '-M', '--unified=3', `${checkSha(baseSha)}..${checkSha(headSha)}`], this.path);
+  /** With `context` 0 the RIGHT anchors are exactly the lines the range added or changed. */
+  async diff(baseSha: string, headSha: string, context = 3): Promise<Anchors> {
+    const text = await git(['-c', 'core.quotePath=false', 'diff', '--no-color', '--no-ext-diff', '-M', `--unified=${context}`, `${checkSha(baseSha)}..${checkSha(headSha)}`], this.path);
     return parseUnifiedDiff(text);
   }
 

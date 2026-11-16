@@ -12,7 +12,7 @@ import { buildRedactor } from './publisher/redact.ts';
 import { Store } from './queue/store.ts';
 import type { Reviewer } from './reviewer/claude.ts';
 import type { PolicyPack } from './policy/schema.ts';
-import type { PullMeta, ReviewOutput } from './types.ts';
+import type { Finding, PullMeta, ReviewOutput } from './types.ts';
 import { processJob, type WorkerContext } from './worker.ts';
 
 const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } }).trim();
@@ -604,4 +604,32 @@ test('a skip is reported to whoever asked: a moved head is never met with silenc
   assert.equal(outcome.status, 'skipped');
   assert.equal(told.length, 1);
   assert.match(told[0]!.reason ?? '', /Head moved to ffffffffffff/);
+});
+
+test('a re-review approves past a new P3 on a line the fix did not touch, and says so', async () => {
+  const f = approveFixture();
+  const store = new Store(':memory:');
+  const p3 = (line: number, evidence: string, title: string) => ({ id: title.padEnd(12, '0'), severity: 'low' as const, blocking: false, path: 'svc.py', line, side: 'RIGHT' as const, title, scenario: 's', impact: 'i', evidence, fix: 'x', fingerprint: title });
+  const round = async (headSha: string, findings: Finding[]) => {
+    const github = new FakeGitHub(meta(f.origin, headSha, f.baseSha));
+    const ctx: WorkerContext = { config: configFor(f.root), store, auth, anthropic: {} as Anthropic, reviewer: scriptedReviewer({ findings }), log, dryRun: false, githubFor: async () => github };
+    store.enqueue({ repo: 'acme/demo', number: 3, headSha, baseSha: f.baseSha, baseRef: 'main', trigger: 'manual', receivedAt: 'now' });
+    const outcome = await processJob(ctx, store.claim('t', 60, { perRepo: 1, global: 1 })!, 't');
+    assert.equal(outcome.status, 'published', outcome.reason);
+    return github.posted[0]!;
+  };
+  // Round 1: a P3 on line 2. It holds.
+  assert.equal((await round(f.headSha, [p3(2, 'user.name', 'null-user')])).event, 'COMMENT');
+  // The author fixes line 2 and nothing else.
+  git(f.origin, 'checkout', '-q', 'feature');
+  writeFileSync(join(f.origin, 'svc.py'), 'def handler(user):\n    return user and user.name\n');
+  git(f.origin, 'commit', '-qam', 'fix');
+  const fixed = git(f.origin, 'rev-parse', 'HEAD');
+  git(f.origin, 'update-ref', 'refs/pull/3/head', fixed);
+  git(f.origin, 'checkout', '-q', 'main');
+  // Round 2: the reviewer now objects to line 1, which round 1 read and passed.
+  const second = await round(fixed, [p3(1, 'def handler(user):', 'no-type')]);
+  assert.equal(second.event, 'APPROVE');
+  assert.match(second.body, /Approved — 1 late finding open/);
+  assert.match(second.comments[0]!.body, /Late finding, does not hold approval/);
 });

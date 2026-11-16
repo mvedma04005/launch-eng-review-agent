@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parsePolicy } from '../policy/load.ts';
 import { parseUnifiedDiff } from '../evidence/diff.ts';
-import { decideVerdict, renderReview } from './render.ts';
+import { decideVerdict, markLate, renderReview } from './render.ts';
 import type { Finding, PullMeta } from '../types.ts';
 
 const meta: PullMeta = { repo: 'acme/demo', number: 7, title: 'T', body: '', author: 'ann', authorType: 'User', draft: false, state: 'open', merged: false, headSha: 'f'.repeat(40), baseSha: 'e'.repeat(40), baseRef: 'main', defaultBranch: 'main', headRef: 'feat', changedFiles: 1, additions: 1, deletions: 1, labels: [], htmlUrl: 'https://github.com/acme/demo/pull/7', cloneUrl: 'https://github.com/acme/demo.git' };
@@ -140,4 +140,36 @@ test('the Chat brief lists what is open and the next step, and carries none of t
   assert.equal(unsure.brief, 'No findings.\n\nQuestions for the author:\n• Does the caller retry?\n\nTo merge: ask a Launch Engineering member to approve this commit.');
   const many = renderReview(approve, meta, { ...base, findings: Array.from({ length: 7 }, (_, i) => f({ id: `m${i}`, severity: 'medium', blocking: false, fingerprint: `m${i}` })) }, anchors, new Map());
   assert.match(many.brief, /(• P2 .*\n){5}• 2 more in the full review\n\nTo merge: fix them/);
+});
+
+test('a late finding is a P3 on a line that did not change since the last reviewed commit', () => {
+  // The fix since the last review changed line 2 of h.py and nothing else.
+  const since = parseUnifiedDiff('diff --git a/h.py b/h.py\n--- a/h.py\n+++ b/h.py\n@@ -2 +2 @@\n-old\n+new\n');
+  const p3 = (over: Partial<Finding>) => f({ severity: 'low', blocking: false, line: 9, evidence: 'x = 1', ...over });
+  const late = (finding: Finding, prior: Finding[] = []) => { markLate([finding], since, prior); return finding.late; };
+  assert.equal(late(p3({})), true, 'the reviewer passed line 9 in the earlier round');
+  assert.equal(late(p3({ line: 2 })), false, 'a finding on a line the fix changed holds');
+  assert.equal(late(p3({ path: 'other.py' })), true, 'a file the fix did not touch');
+  assert.equal(late(p3({ severity: 'medium' })), false, 'a P2 holds whenever it is found');
+  assert.equal(late(p3({ severity: 'high', blocking: true })), false);
+  assert.equal(late(p3({ side: 'LEFT' })), false, 'a deleted line is part of a change');
+  assert.equal(late(p3({ title: 'Reworded' }), [p3({ evidence: ' x  =  1 ' })]), false, 'raised on this line before and left unfixed: it still holds');
+  assert.equal(late(p3({}), [p3({ late: true })]), true, 'late in an earlier round, late now');
+});
+
+test('a late finding is shown and does not hold the approval; a finding on a changed line still does', () => {
+  const approve = parsePolicy('version: 1\nname: a\nverdict: { mode: approve }', 'a');
+  const base = { summary: 's', confidence: 'high' as const, reviewedFiles: ['h.py'], lenses: ['correctness'], questions: [] };
+  const lateP3 = f({ id: 'late', severity: 'low', blocking: false, late: true, title: 'Bare refusal text', fingerprint: 'late' });
+  const only = renderReview(approve, meta, { ...base, findings: [lateP3] }, anchors, new Map());
+  assert.equal(only.event, 'APPROVE');
+  assert.equal(only.notApproved, null);
+  assert.match(only.body, /### Falcon review: Approved — 1 late finding open/);
+  assert.match(only.body, /\*\*Late finding:\*\* found after the first review, on a line that has not changed since the last reviewed commit\./);
+  assert.match(only.comments[0]!.body, /\*\*Late finding, does not hold approval · P3\*\*/);
+  assert.match(only.brief, /^• P3 \(late\) · h\.py:1 — Bare refusal text\n\nLate: found after the first review.*Fix it here or in a follow-up\.$/);
+  const mixed = renderReview(approve, meta, { ...base, findings: [lateP3, f({ id: 'new', severity: 'low', blocking: false, fingerprint: 'new' })] }, anchors, new Map());
+  assert.equal(mixed.event, 'COMMENT');
+  assert.equal(mixed.notApproved?.title, 'Not approved: 1 finding to fix (1 P3)', 'the count is the findings that hold');
+  assert.match(mixed.brief, /To merge: fix it and post the PR link again/);
 });

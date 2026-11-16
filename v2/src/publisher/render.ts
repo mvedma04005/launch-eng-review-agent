@@ -22,6 +22,21 @@ export interface RenderedReview {
 }
 
 // P0 and P1 block (the pack's blockOn). P2 and P3 hold the approval (holdOn). Only a nit lets the bot approve.
+// A late finding is the exception: it is shown and never holds.
+const holds = (policy: PolicyPack, f: Finding) => policy.verdict.holdOn.includes(f.severity) && !f.late;
+const squash = (s: string) => s.replace(/\s+/g, ' ').trim();
+
+/**
+ * Marks the late findings of a re-review: a P3 on a line that `changedSince` (the diff from the last reviewed commit,
+ * with no context lines) did not touch. The reviewer read that line in an earlier round and passed it, so a new demand
+ * there moves the goalpost. A finding caused by a fix sits on a changed line and holds as before. So does a finding
+ * that an earlier round already raised on the same line and that held: leaving it unfixed does not make it late.
+ */
+export function markLate(findings: Finding[], changedSince: Anchors, prior: Iterable<Finding>): void {
+  const raised = new Set([...prior].filter((p) => !p.late).map((p) => `${p.path}\u0000${squash(p.evidence)}`));
+  for (const f of findings) f.late = f.severity === 'low' && !f.blocking && f.side === 'RIGHT' && !changedSince.has(f.path, 'RIGHT', f.line) && !raised.has(`${f.path}\u0000${squash(f.evidence)}`);
+}
+
 const sevLabel: Record<Finding['severity'], string> = { critical: 'P0', high: 'P1', medium: 'P2', low: 'P3', info: 'Nit' };
 
 export function decideVerdict(policy: PolicyPack, findings: Finding[], confidence: ReviewOutput['confidence'] = 'high', override: string | null = null): { verdict: Verdict; blocking: Finding[]; overridden: boolean } {
@@ -34,27 +49,28 @@ export function decideVerdict(policy: PolicyPack, findings: Finding[], confidenc
   // A blocking-severity finding the verifier disputes is a human's call: it neither blocks nor lets the PR be approved.
   if (severe.length) return { verdict: 'comment', blocking, overridden: false };
   // A finding that holds (P2 by default) does not block, but the bot does not approve over an open problem.
-  if (findings.some((f) => policy.verdict.holdOn.includes(f.severity))) return { verdict: 'comment', blocking, overridden: false };
+  if (findings.some((f) => holds(policy, f))) return { verdict: 'comment', blocking, overridden: false };
   return { verdict: policy.verdict.mode === 'approve' ? 'approve' : 'comment', blocking, overridden: false };
 }
 
 export function renderReview(policy: PolicyPack, meta: PullMeta, output: ReviewOutput, anchors: Anchors, priorOpen: Map<string, Finding>, override: string | null = null): RenderedReview {
   const { verdict, blocking, overridden } = decideVerdict(policy, output.findings, output.confidence, override);
   const disputed = output.findings.filter((f) => f.blocking).length - blocking.length;
-  const held = output.findings.filter((f) => policy.verdict.holdOn.includes(f.severity)).length;
+  const held = output.findings.filter((f) => holds(policy, f)).length;
+  const late = output.findings.filter((f) => f.late).length;
   const ordered = [...output.findings].sort((a, b) => Number(b.blocking) - Number(a.blocking) || sevRank(a) - sevRank(b));
   const comments: RenderedReview['comments'] = [];
   const bodyFindings: string[] = [];
   for (const f of ordered) {
     const still = priorOpen.has(f.fingerprint) ? ' · still open from an earlier head' : '';
     const verified = f.verified ? (f.verified.real ? '' : ` · verifier disagrees (${Math.round(f.verified.confidence * 100)}%): ${f.verified.reason}`) : '';
-    const text = `**${f.blocking ? 'Blocking' : policy.verdict.holdOn.includes(f.severity) ? 'Holds approval' : 'Non-blocking'} · ${sevLabel[f.severity]}${f.ruleId ? ` · ${f.ruleId}` : ''}** — ${f.title}${still}\n\n` +
+    const text = `**${f.blocking ? 'Blocking' : f.late ? 'Late finding, does not hold approval' : holds(policy, f) ? 'Holds approval' : 'Non-blocking'} · ${sevLabel[f.severity]}${f.ruleId ? ` · ${f.ruleId}` : ''}** — ${f.title}${still}\n\n` +
       `Scenario: ${f.scenario}\n\nImpact: ${f.impact}\n\nEvidence: \`${f.evidence}\`\n\nFix: ${f.fix}${verified}\n\n` +
       `<sub>Finding \`${f.id}\`. React 👍/👎 or reply to teach the reviewer.</sub>\n${findingTag(f.id)}`;
     if (anchors.has(f.path, f.side, f.line)) comments.push({ path: f.path, line: f.line, side: f.side, body: text, findingId: f.id });
     else bodyFindings.push(`#### ${f.path}:${f.line}\n${text}`);
   }
-  const headline = verdict === 'approve' ? 'Approved'
+  const headline = verdict === 'approve' ? `Approved${late ? ` — ${plural(late, 'late finding')} open` : ''}`
     : overridden ? `Blocking findings overridden by @${override}`
     : output.confidence === 'medium' ? `Comments only (medium confidence)${blocking.length ? `, ${blocking.length} finding${blocking.length === 1 ? '' : 's'} need a decision` : ''}`
     : blocking.length ? `Changes requested — ${blocking.length} blocking finding${blocking.length === 1 ? '' : 's'}`
@@ -67,6 +83,7 @@ export function renderReview(policy: PolicyPack, meta: PullMeta, output: ReviewO
     `### Falcon review: ${headline}`,
     ...(overridden ? ['', `Blocking findings overridden by @${override}'s approval.`] : []),
     ...(notApproved ? ['', `**Why Falcon did not approve:** ${notApproved.why}`] : []),
+    ...(late ? ['', `**Late finding:** ${LATE}`] : []),
     '',
     output.summary,
     '',
@@ -84,29 +101,31 @@ export function renderReview(policy: PolicyPack, meta: PullMeta, output: ReviewO
   const nits = ordered.length - open.length;
   const brief = [
     overridden ? `Blocking findings overridden by @${override}'s approval.` : '',
-    open.length ? [...open.slice(0, 5).map((f) => `• ${sevLabel[f.severity]} · ${f.path}:${f.line} — ${oneLine(f.title)}`), ...(open.length > 5 ? [`• ${open.length - 5} more in the full review`] : [])].join('\n')
+    open.length ? [...open.slice(0, 5).map((f) => `• ${sevLabel[f.severity]}${f.late ? ' (late)' : ''} · ${f.path}:${f.line} — ${oneLine(f.title)}`), ...(open.length > 5 ? [`• ${open.length - 5} more in the full review`] : [])].join('\n')
       : nits ? `${plural(nits, 'nit')} in the full review. None needs a fix.` : 'No findings.',
     notApproved && output.questions.length ? ['Questions for the author:', ...output.questions.slice(0, 3).map((q) => `• ${oneLine(q).slice(0, 300)}`)].join('\n') : '',
-    notApproved ? `To merge: ${notApproved.next}.` : verdict === 'request_changes' ? `To merge: fix ${open.length === 1 ? 'it' : 'them'} and post the PR link again.` : '',
+    late ? `Late: ${LATE}` : '',
+    notApproved ? `To merge: ${notApproved.next}.` : verdict === 'request_changes' ? `To merge: fix ${open.length - late === 1 ? 'it' : 'them'} and post the PR link again.` : '',
   ].filter(Boolean).join('\n\n');
   const event: RenderedReview['event'] = verdict === 'approve' ? 'APPROVE' : verdict === 'request_changes' ? 'REQUEST_CHANGES' : 'COMMENT';
   return { event, verdict, body: lines.join('\n'), comments, checkConclusion: blocking.length && output.confidence === 'high' ? 'action_required' : verdict === 'approve' ? 'success' : 'neutral', blocking, overridden, notApproved, brief };
 }
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+const LATE = 'found after the first review, on a line that has not changed since the last reviewed commit. Falcon shows a late finding and does not hold the approval for it. Fix it here or in a follow-up.';
 /** One cause, the first that applies, in the order decideVerdict tests them; then the step that gets the PR merged. */
 function whyNotApproved(policy: PolicyPack, output: ReviewOutput, blocking: number, unsettled: number): { title: string; why: string; next: string } {
-  const held = output.findings.filter((f) => policy.verdict.holdOn.includes(f.severity));
+  const held = output.findings.filter((f) => holds(policy, f));
   const person = 'ask a Launch Engineering member to approve this commit';
   // In comment mode Falcon never approves this PR, so a fix and a new request do not help: only a person does.
   const fix = (n: number) => policy.verdict.mode === 'comment' ? person : `fix ${n === 1 ? 'it' : 'them'} and post the PR link again, or ${person}`;
-  const holds = policy.verdict.holdOn.map((s) => sevLabel[s]).join(' or ');
+  const ranks = policy.verdict.holdOn.map((s) => sevLabel[s]).join(' or ');
   const [title, cause, next] =
     output.confidence === 'medium' ? ['Falcon is not sure (medium confidence)', 'Falcon is not sure enough about this change to decide (medium confidence), so a person decides.', person]
     : blocking ? [`${plural(blocking, 'blocking finding')}`, `${plural(blocking, 'blocking finding')} ${blocking === 1 ? 'is' : 'are'} open.`, fix(blocking)]
     // Blocking severity, but not a confirmed blocker: the checker disputes it, or the reviewer did not mark it blocking.
     : unsettled ? [`${plural(unsettled, 'serious finding')} not confirmed; a person decides`, `${plural(unsettled, 'finding')} of blocking severity ${unsettled === 1 ? 'is' : 'are'} open but not confirmed as a blocker, so a person decides.`, person]
-    : held.length && policy.verdict.mode !== 'comment' ? [`${plural(held.length, 'finding')} to fix (${countBy(held)})`, `${plural(held.length, 'finding')} (${countBy(held)}) ${held.length === 1 ? 'is' : 'are'} open. A ${holds} finding holds Falcon's approval in this repository, and acknowledging a finding does not close it.`, fix(held.length)]
+    : held.length && policy.verdict.mode !== 'comment' ? [`${plural(held.length, 'finding')} to fix (${countBy(held)})`, `${plural(held.length, 'finding')} (${countBy(held)}) ${held.length === 1 ? 'is' : 'are'} open. A ${ranks} finding holds Falcon's approval in this repository, and acknowledging a finding does not close it.`, fix(held.length)]
     : ["needs a person's approval", `this repository keeps this PR for a person's approval, so Falcon only comments${held.length ? `; ${plural(held.length, 'finding')} (${countBy(held)}) ${held.length === 1 ? 'is' : 'are'} also open` : ''}.`, person];
   return { title: `Not approved: ${title}`, why: `${cause[0]!.toUpperCase()}${cause.slice(1)} To merge: ${next}.`, next };
 }

@@ -186,6 +186,7 @@ Cost records distinguish measured token usage from estimates. Unreported usage r
 | Condition | Behavior |
 | --- | --- |
 | CI still running | Waits and checks again before starting analysis. A review asked for in Chat gets one "Waiting" line in its thread. |
+| A re-review finds a new P3 on a line that has not changed since the last reviewed commit | Shows it as a late finding. It does not hold the approval: the reviewer read that line in an earlier round and passed it. A P0, P1 or P2, a finding on a changed line, and a finding that an earlier round raised on the same line keep their effect. |
 | Failed/cancelled CI, draft, conflicts, empty diff, merged/closed PR | Holds or skips; thread explains the reason. |
 | Head/base changes during review | Cancels obsolete work and queues a fresh review after a stability delay; repeated changes hold for attention. |
 | Head changes during submission | Records the submitted review against its old commit and marks it stale. |

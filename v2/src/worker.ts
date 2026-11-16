@@ -15,7 +15,7 @@ import { missingPlanSections } from './policy/plan.ts';
 import type { PolicyPack } from './policy/schema.ts';
 import { OctokitGitHub, type GitHubPort } from './publisher/github.ts';
 import { boundBytes, LIMITS, redactorFromEnv, type Redactor } from './publisher/redact.ts';
-import { renderReview, type RenderedReview } from './publisher/render.ts';
+import { markLate, renderReview, type RenderedReview } from './publisher/render.ts';
 import type { Store } from './queue/store.ts';
 import { Incomplete, type Reviewer } from './reviewer/claude.ts';
 import type { Finding, Job, PendingPublication, PullMeta, ReviewOutput, Usage } from './types.ts';
@@ -217,6 +217,11 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
 
     const { kept, dropped } = applyPolicy(policy, output.findings);
     for (const d of dropped) log.info({ finding: d.finding.id, reason: d.reason }, 'finding dropped by policy');
+    // A re-review: a new P3 on a line that did not change since the last reviewed commit is late. Without that commit
+    // in the clone (a rewritten branch) nothing is late, and every finding holds as on a first review.
+    const lastHead = ctx.store.lastReviewedHead(job.repo, job.number, job.headSha);
+    const changedSince = lastHead ? await mirror.diff(lastHead, job.headSha, 0).catch((error) => { log.info({ lastHead, err: String(error) }, 'no diff from the last reviewed commit; nothing is late'); return null; }) : null;
+    if (changedSince) markLate(kept, changedSince, prior.values());
     if (policy.verdict.verifyBlocking) {
       for (const f of kept.filter((k) => k.blocking)) {
         const text = f.side === 'RIGHT' ? worktree.readText(f.path, policy.budgets.maxFileBytes) : (await baseRead(f.path)) ?? '';

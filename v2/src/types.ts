@@ -60,6 +60,11 @@ export interface Finding {
   fix: string;
   /** Host-computed; stable across heads when the same issue persists. */
   fingerprint: string;
+  /**
+   * Host-set. A P3 found after the first review, on a line that has not changed since the last reviewed commit. The
+   * reviewer read that line before and passed it, so the finding is shown and does not hold the approval.
+   */
+  late?: boolean | undefined;
   /** Set by the verifier pass. */
   verified?: { real: boolean; confidence: number; reason: string } | undefined;
 }

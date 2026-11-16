@@ -285,6 +285,12 @@ export class Store {
     return map;
   }
 
+  /** The head of the newest review posted on an earlier commit of this PR, or null on a first review. */
+  lastReviewedHead(repo: string, number: number, excludeHead: string): string | null {
+    const row = this.db.prepare('select j.head_sha from reviews r join jobs j on j.id=r.job_id where j.repo=? and j.number=? and j.head_sha<>? order by r.posted_at desc, r.id desc limit 1').get(repo, number, excludeHead) as { head_sha: string } | undefined;
+    return row?.head_sha ?? null;
+  }
+
   recordOutcome(outcome: FindingOutcome): boolean {
     const r = this.db.prepare('insert or ignore into finding_outcomes(finding_id, signal, actor, at, detail) values(?,?,?,?,?)')
       .run(outcome.findingId, outcome.signal, outcome.actor, outcome.at, outcome.detail ?? null);
