@@ -308,16 +308,16 @@ export async function pollChatSpaces(ctx: IntakeContext, chat: ChatApi): Promise
   return recorded;
 }
 
-export interface Outcome { status: 'published' | 'skipped' | 'held' | 'deferred' | 'dry_run'; reason?: string | undefined; reviewUrl?: string | undefined; event?: string | undefined; summary?: string | undefined; confidence?: string | undefined }
+export interface Outcome { status: 'published' | 'skipped' | 'held' | 'deferred' | 'dry_run'; reason?: string | undefined; reviewUrl?: string | undefined; event?: string | undefined; summary?: string | undefined; title?: string | undefined }
 
 export function chatOutcomeText(job: Pick<Job, 'repo' | 'number' | 'headSha'>, outcome: Outcome): string | null {
   const pr = `${job.repo}#${job.number}`;
   const head = job.headSha.slice(0, 8);
   switch (outcome.status) {
     case 'published': {
-      const headline = outcome.event === 'APPROVE' ? '✅ Review complete — Approved' : outcome.event === 'REQUEST_CHANGES' ? '🛑 Review complete — Changes requested' : '💬 Review complete — comments only';
-      const confidence = outcome.confidence ? ` (confidence: ${outcome.confidence})` : '';
-      return `${headline}${confidence}\n\n${outcome.summary ?? ''}${outcome.summary ? '\n\n' : ''}Full review: ${outcome.reviewUrl ?? ''}\nCommit: ${head}`;
+      // "Comments only" is GitHub's word for the review type. The author needs the outcome: approved or not, and why.
+      const headline = outcome.event === 'APPROVE' ? '✅ Review complete — Approved' : outcome.event === 'REQUEST_CHANGES' ? '🛑 Review complete — Changes requested' : `💬 Review complete — ${outcome.title ?? 'Not approved'}`;
+      return `${headline}\n\n${outcome.summary ?? ''}${outcome.summary ? '\n\n' : ''}Full review: ${outcome.reviewUrl ?? ''}\nCommit: ${head}`;
     }
     case 'held': return `⚠️ ${pr} — Review held\n\n${outcome.reason ?? 'See the engine logs.'}\nCommit: ${head}`;
     case 'skipped': return `${pr} — Not reviewed\n\n${outcome.reason ?? ''}`;

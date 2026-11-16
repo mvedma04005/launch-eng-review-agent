@@ -138,6 +138,7 @@ test('replaying a dry-run job with a retained review posts nothing', async () =>
   const { job } = store.enqueue({ repo: 'acme/demo', number: 3, headSha, baseSha, baseRef: 'main', trigger: 'poll', receivedAt: 'now' });
   await processJob(ctx, store.claim('t', 60, { perRepo: 1, global: 1 })!, 't');
   assert.ok(store.pending(store.job(job.id)!), 'the dry run keeps its rendered review');
+  assert.match(store.pending(store.job(job.id)!)!.chat!, /^This PR changes \.falcon\/policy\.yaml, so Falcon only comments: a human must review policy changes\.\n\n• P1 · svc\.py:2 — .*\n\nTo merge: ask a Launch Engineering member to approve this commit\.$/, 'the Chat text is the reason, the finding and the next step, with none of the summary');
   store.requeue(job.id, 0, 'operator replay');
   const replayed = await processJob(ctx, store.claim('t2', 60, { perRepo: 1, global: 1 })!, 't2');
   assert.equal(replayed.status, 'skipped');

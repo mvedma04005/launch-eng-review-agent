@@ -166,6 +166,8 @@ export interface PendingPublication {
   /** The check run's title for a comment-only review: why it is not an approval. Absent on older reviews and on other verdicts. */
   notApprovedTitle?: string;
   summary: string;
+  /** The Chat reply under the headline. Absent on reviews rendered before this field existed; the summary stands in. */
+  chat?: string;
   attempts: number;
   renderedAt: string;
 }

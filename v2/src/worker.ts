@@ -34,7 +34,7 @@ export interface WorkerContext {
   /** Dry run: everything except posting to GitHub. */
   dryRun: boolean;
   /** Receives every terminal outcome (published, held, skipped, dry run) so requesters can be told. */
-  notify?: (job: Job, outcome: JobOutcome & { event?: string; summary?: string; confidence?: string }) => void;
+  notify?: (job: Job, outcome: JobOutcome & { event?: string; summary?: string; title?: string }) => void;
   /** Test seams. */
   githubFor?: (repo: string) => Promise<GitHubPort>;
   redactor?: Redactor;
@@ -78,10 +78,10 @@ export function secondsUntilNextUtcDay(now = new Date()): number {
 }
 
 /** Converts a rendered review into the durable form that publication retries and operator replay work from. */
-export function toPending(rendered: RenderedReview, headSha: string, summary: string): PendingPublication {
+export function toPending(rendered: RenderedReview, headSha: string, summary: string, chat: string): PendingPublication {
   return {
     headSha, event: rendered.event, body: rendered.body, comments: rendered.comments, checkConclusion: rendered.checkConclusion,
-    blockingCount: rendered.blocking.length, overridden: rendered.overridden, ...(rendered.notApproved ? { notApprovedTitle: rendered.notApproved.title } : {}), summary, attempts: 0, renderedAt: new Date().toISOString(),
+    blockingCount: rendered.blocking.length, overridden: rendered.overridden, ...(rendered.notApproved ? { notApprovedTitle: rendered.notApproved.title } : {}), summary, chat, attempts: 0, renderedAt: new Date().toISOString(),
   };
 }
 
@@ -136,7 +136,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     if (pending) {
       checksEnabled = true;
       const outcome = await publish(pending, meta);
-      if (outcome.status === 'published') ctx.notify?.(job, { ...outcome, event: pending.event, summary: pending.summary });
+      if (outcome.status === 'published') ctx.notify?.(job, { ...outcome, event: pending.event, summary: pending.chat ?? pending.summary, ...(pending.notApprovedTitle ? { title: pending.notApprovedTitle } : {}) });
       return outcome;
     }
 
@@ -228,23 +228,26 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     // A review that does not account for every in-scope file is incomplete: medium confidence, comment-only.
     const unreviewed = inScopeFiles.filter((p) => !output.reviewedFiles.includes(p));
     if (unreviewed.length) log.info({ unreviewed }, 'review did not cover every in-scope file');
-    const summary = gateFile ? `This PR changes ${gateFile}, so Falcon only comments: a human must review policy changes.\n\n${output.summary}`
-      : humanPath ? `This PR changes ${humanPath}, so Falcon only comments: the policy pack keeps this path for a person's approval.\n\n${output.summary}`
-      : output.summary;
+    // Which file keeps this PR for a person. It leads the review summary and the Chat reply.
+    const lead = gateFile ? `This PR changes ${gateFile}, so Falcon only comments: a human must review policy changes.\n\n`
+      : humanPath ? `This PR changes ${humanPath}, so Falcon only comments: the policy pack keeps this path for a person's approval.\n\n`
+      : '';
+    const summary = `${lead}${output.summary}`;
     const finalOutput: ReviewOutput = { ...output, summary, findings: kept, confidence: unreviewed.length ? 'medium' : output.confidence };
     const rendered = sanitize(renderReview(policy, meta, finalOutput, anchors, prior, override), redactor);
-    // The reason leads the check summary and the Chat reply, where the author looks first.
-    const toPublish = toPending(rendered, job.headSha, boundBytes(redactor.apply(`${rendered.notApproved ? `${rendered.notApproved.why}\n\n` : ''}${finalOutput.summary}`), LIMITS.summary));
+    // The reason leads the check summary, where the author looks first. Chat gets the short form: findings and the next step.
+    const toPublish = toPending(rendered, job.headSha, boundBytes(redactor.apply(`${rendered.notApproved ? `${rendered.notApproved.why}\n\n` : ''}${finalOutput.summary}`), LIMITS.summary),
+      boundBytes(redactor.apply(`${lead}${rendered.brief}`), LIMITS.summary));
     ctx.store.recordFindings(job, kept);
     ctx.store.savePending(job.id, toPublish);
     phase('render');
     if (ctx.dryRun) {
       ctx.store.finish(job.id, 'skipped', { error: 'dry run: review rendered, nothing posted' });
-      ctx.notify?.(job, { status: 'dry_run', summary: toPublish.summary });
+      ctx.notify?.(job, { status: 'dry_run' });
       return { status: 'dry_run', rendered, output: finalOutput, usage };
     }
     const outcome = await publish(toPublish, meta);
-    if (outcome.status === 'published') ctx.notify?.(job, { ...outcome, event: toPublish.event, summary: toPublish.summary, confidence: finalOutput.confidence });
+    if (outcome.status === 'published') ctx.notify?.(job, { ...outcome, event: toPublish.event, summary: toPublish.chat ?? toPublish.summary, ...(toPublish.notApprovedTitle ? { title: toPublish.notApprovedTitle } : {}) });
     return { ...outcome, rendered, output: finalOutput, usage };
   } catch (error) {
     if (error instanceof Incomplete) return done('held', error.message, true);

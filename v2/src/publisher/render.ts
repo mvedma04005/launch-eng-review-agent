@@ -16,7 +16,9 @@ export interface RenderedReview {
   /** A team member's approval lifted blocking findings. */
   overridden: boolean;
   /** Why a comment-only review is not an approval, and what the author does next. Null on an approval, a change request or an override. */
-  notApproved: { title: string; why: string } | null;
+  notApproved: { title: string; why: string; next: string } | null;
+  /** The Chat reply under the headline: what is open and the next step. The reviewer's own prose stays in the full review. */
+  brief: string;
 }
 
 // P0 and P1 block (the pack's blockOn). P2 and P3 hold the approval (holdOn). Only a nit lets the bot approve.
@@ -76,13 +78,24 @@ export function renderReview(policy: PolicyPack, meta: PullMeta, output: ReviewO
     `<sub>Reviewed head \`${meta.headSha.slice(0, 12)}\` against policy \`${policy.name}\` with ${output.confidence} confidence. Lenses: ${output.lenses.join(', ')}. Tests were not executed; CI is reported separately.${notice} Reply \`/falcon wrong <finding-id>\` or \`/falcon why <finding-id>\` on any finding.</sub>`,
     marker(meta.repo, meta.number, meta.headSha),
   ];
+  // Built from the findings, not from the reviewer's summary: a summary that says "nothing blocks" under a reason that
+  // says "fix it" reads as two verdicts.
+  const open = ordered.filter((f) => f.severity !== 'info');
+  const nits = ordered.length - open.length;
+  const brief = [
+    overridden ? `Blocking findings overridden by @${override}'s approval.` : '',
+    open.length ? [...open.slice(0, 5).map((f) => `• ${sevLabel[f.severity]} · ${f.path}:${f.line} — ${oneLine(f.title)}`), ...(open.length > 5 ? [`• ${open.length - 5} more in the full review`] : [])].join('\n')
+      : nits ? `${plural(nits, 'nit')} in the full review. None needs a fix.` : 'No findings.',
+    notApproved && output.questions.length ? ['Questions for the author:', ...output.questions.slice(0, 3).map((q) => `• ${oneLine(q).slice(0, 300)}`)].join('\n') : '',
+    notApproved ? `To merge: ${notApproved.next}.` : verdict === 'request_changes' ? `To merge: fix ${open.length === 1 ? 'it' : 'them'} and post the PR link again.` : '',
+  ].filter(Boolean).join('\n\n');
   const event: RenderedReview['event'] = verdict === 'approve' ? 'APPROVE' : verdict === 'request_changes' ? 'REQUEST_CHANGES' : 'COMMENT';
-  return { event, verdict, body: lines.join('\n'), comments, checkConclusion: blocking.length && output.confidence === 'high' ? 'action_required' : verdict === 'approve' ? 'success' : 'neutral', blocking, overridden, notApproved };
+  return { event, verdict, body: lines.join('\n'), comments, checkConclusion: blocking.length && output.confidence === 'high' ? 'action_required' : verdict === 'approve' ? 'success' : 'neutral', blocking, overridden, notApproved, brief };
 }
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
 /** One cause, the first that applies, in the order decideVerdict tests them; then the step that gets the PR merged. */
-function whyNotApproved(policy: PolicyPack, output: ReviewOutput, blocking: number, unsettled: number): { title: string; why: string } {
+function whyNotApproved(policy: PolicyPack, output: ReviewOutput, blocking: number, unsettled: number): { title: string; why: string; next: string } {
   const held = output.findings.filter((f) => policy.verdict.holdOn.includes(f.severity));
   const person = 'ask a Launch Engineering member to approve this commit';
   // In comment mode Falcon never approves this PR, so a fix and a new request do not help: only a person does.
@@ -95,7 +108,7 @@ function whyNotApproved(policy: PolicyPack, output: ReviewOutput, blocking: numb
     : unsettled ? [`${plural(unsettled, 'serious finding')} not confirmed; a person decides`, `${plural(unsettled, 'finding')} of blocking severity ${unsettled === 1 ? 'is' : 'are'} open but not confirmed as a blocker, so a person decides.`, person]
     : held.length && policy.verdict.mode !== 'comment' ? [`${plural(held.length, 'finding')} to fix (${countBy(held)})`, `${plural(held.length, 'finding')} (${countBy(held)}) ${held.length === 1 ? 'is' : 'are'} open. A ${holds} finding holds Falcon's approval in this repository, and acknowledging a finding does not close it.`, fix(held.length)]
     : ["needs a person's approval", `this repository keeps this PR for a person's approval, so Falcon only comments${held.length ? `; ${plural(held.length, 'finding')} (${countBy(held)}) ${held.length === 1 ? 'is' : 'are'} also open` : ''}.`, person];
-  return { title: `Not approved: ${title}`, why: `${cause[0]!.toUpperCase()}${cause.slice(1)} To merge: ${next}.` };
+  return { title: `Not approved: ${title}`, why: `${cause[0]!.toUpperCase()}${cause.slice(1)} To merge: ${next}.`, next };
 }
 
 const oneLine = (s: string) => s.replace(/\s+/g, ' ').trim();

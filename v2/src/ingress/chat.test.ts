@@ -84,10 +84,10 @@ test('pending requests become prioritized jobs once GitHub answers; merged PRs a
 
   // The outcome reaches every requesting thread once.
   store.finish(job.id, 'published', { result: { reviewUrl: 'https://github.com/ROKT/launch-engineering/pull/585#pullrequestreview-1' } });
-  deliverOutcome(store, store.job(job.id)!, { status: 'published', event: 'APPROVE', summary: 'Looks good.', confidence: 'high', reviewUrl: 'https://github.com/ROKT/launch-engineering/pull/585#pullrequestreview-1' });
+  deliverOutcome(store, store.job(job.id)!, { status: 'published', event: 'APPROVE', summary: 'Looks good.', reviewUrl: 'https://github.com/ROKT/launch-engineering/pull/585#pullrequestreview-1' });
   const replies = store.pendingChatReplies(Date.now() / 1000 + 1, 20).filter((r) => /Review complete/.test(r.text));
   assert.equal(replies.length, 2);
-  assert.match(replies[0]!.text, /✅ Review complete — Approved \(confidence: high\)/);
+  assert.match(replies[0]!.text, /✅ Review complete — Approved\n\nLooks good\./);
   assert.deepEqual(new Set(replies.map((r) => r.thread)), new Set([`${SPACE}/threads/t1`, `${SPACE}/threads/t2`]));
 
   // Same head again after publication: the existing review is linked, no new job.
@@ -144,8 +144,9 @@ test('a reply to a deleted request is never posted top-level: Chat is told to fa
 
 test('outcome text follows the OP3 shape and holds carry the reason', () => {
   const job = { repo: 'ROKT/launch-engineering', number: 585, headSha: 'abcdef1234567890'.padEnd(40, '0') };
-  assert.match(chatOutcomeText(job, { status: 'published', event: 'REQUEST_CHANGES', summary: 'Two defects.', confidence: 'high', reviewUrl: 'u' })!, /🛑 Review complete — Changes requested \(confidence: high\)\n\nTwo defects\.\n\nFull review: u\nCommit: abcdef12/);
-  assert.match(chatOutcomeText(job, { status: 'published', event: 'COMMENT', confidence: 'medium' })!, /💬 Review complete — comments only/);
+  assert.match(chatOutcomeText(job, { status: 'published', event: 'REQUEST_CHANGES', summary: 'Two defects.', reviewUrl: 'u' })!, /🛑 Review complete — Changes requested\n\nTwo defects\.\n\nFull review: u\nCommit: abcdef12/);
+  assert.match(chatOutcomeText(job, { status: 'published', event: 'COMMENT', title: 'Not approved: 1 finding to fix (1 P3)', summary: '• P3 · a.ts:5 — Stale state' })!, /💬 Review complete — Not approved: 1 finding to fix \(1 P3\)\n\n• P3 · a\.ts:5 — Stale state\n\nFull review/, 'the headline is the outcome and its cause, not the GitHub review type');
+  assert.match(chatOutcomeText(job, { status: 'published', event: 'COMMENT' })!, /💬 Review complete — Not approved\n/, 'a review stored before the title existed');
   assert.match(chatOutcomeText(job, { status: 'held', reason: 'CI failed at this head.' })!, /⚠️ ROKT\/launch-engineering#585 — Review held\n\nCI failed/);
   assert.equal(chatOutcomeText(job, { status: 'deferred' }), null, 'a deferral with no reason is not announced; the acknowledgement already said we are looking');
   assert.match(chatOutcomeText(job, { status: 'deferred', reason: 'CI is still running.' })!, /⏳ ROKT\/launch-engineering#585 — Waiting\n\nCI is still running\./);
@@ -164,7 +165,7 @@ test('a CI wait is said once per request and the result still reaches the thread
   assert.equal(replies(/Waiting/).length, 1);
   assert.equal(store.chatRequestsForJob(job.id).length, 1, 'the request is still queued for the result');
 
-  deliverOutcome(store, job, { status: 'published', event: 'APPROVE', summary: 's', confidence: 'high', reviewUrl: 'https://example/review-1' });
+  deliverOutcome(store, job, { status: 'published', event: 'APPROVE', summary: 's', reviewUrl: 'https://example/review-1' });
   assert.equal(replies(/Review complete/).length, 1);
   assert.equal(replies(/Waiting/)[0]!.thread, replies(/Review complete/)[0]!.thread);
 });
@@ -177,7 +178,7 @@ test('re-review runs a published commit again, drops the stored result, and coun
   await resolvePendingChatRequests(ctx, async () => meta(), 1000);
   const job = store.claim('w', 60, { perRepo: 1, global: 1 })!;
   store.finish(job.id, 'published', { result: { reviewUrl: 'https://example/review-1' } });
-  deliverOutcome(store, store.job(job.id)!, { status: 'published', event: 'COMMENT', summary: 's', confidence: 'high', reviewUrl: 'https://example/review-1' });
+  deliverOutcome(store, store.job(job.id)!, { status: 'published', event: 'COMMENT', summary: 's', reviewUrl: 'https://example/review-1' });
 
   // A plain link is answered with the existing review and how to ask for a fresh one.
   handleChatMessage(ctx, msg({ name: `${SPACE}/messages/p1`, text: link }));

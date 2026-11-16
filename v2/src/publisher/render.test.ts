@@ -124,3 +124,20 @@ test('a comment-only review says why Falcon did not approve and what the author 
   assert.equal(unsettled.notApproved?.title, 'Not approved: 1 serious finding not confirmed; a person decides');
   assert.equal(renderReview(approve, meta, { ...base, findings: [] }, anchors, new Map()).notApproved, null, 'an approval needs no reason');
 });
+
+test('the Chat brief lists what is open and the next step, and carries none of the reviewer prose', () => {
+  const approve = parsePolicy('version: 1\nname: a\nverdict: { mode: approve }', 'a');
+  const base = { summary: 'I found one small problem and nothing that blocks the merge.', confidence: 'high' as const, reviewedFiles: ['h.py'], lenses: ['correctness'], questions: [] };
+  const p3 = f({ id: 'p3', severity: 'low', blocking: false, title: 'Form keeps the last person', path: 'web/Ask.tsx', line: 57, fingerprint: 'p3' });
+  const nit = f({ id: 'nit', severity: 'info', blocking: false, fingerprint: 'nit' });
+  const held = renderReview(approve, meta, { ...base, findings: [nit, p3] }, anchors, new Map());
+  assert.equal(held.brief, '• P3 · web/Ask.tsx:57 — Form keeps the last person\n\nTo merge: fix it and post the PR link again, or ask a Launch Engineering member to approve this commit.');
+  assert.equal(renderReview(approve, meta, { ...base, findings: [] }, anchors, new Map()).brief, 'No findings.');
+  assert.equal(renderReview(approve, meta, { ...base, findings: [nit] }, anchors, new Map()).brief, '1 nit in the full review. None needs a fix.');
+  const blocked = renderReview(approve, meta, { ...base, findings: [p3, f({})] }, anchors, new Map());
+  assert.match(blocked.brief, /^• P1 · .*\n• P3 · web\/Ask\.tsx:57 — Form keeps the last person\n\nTo merge: fix them and post the PR link again\.$/, 'blocking first, then the rest');
+  const unsure = renderReview(approve, meta, { ...base, confidence: 'medium', findings: [], questions: ['Does  the caller\nretry?'] }, anchors, new Map());
+  assert.equal(unsure.brief, 'No findings.\n\nQuestions for the author:\n• Does the caller retry?\n\nTo merge: ask a Launch Engineering member to approve this commit.');
+  const many = renderReview(approve, meta, { ...base, findings: Array.from({ length: 7 }, (_, i) => f({ id: `m${i}`, severity: 'medium', blocking: false, fingerprint: `m${i}` })) }, anchors, new Map());
+  assert.match(many.brief, /(• P2 .*\n){5}• 2 more in the full review\n\nTo merge: fix them/);
+});
