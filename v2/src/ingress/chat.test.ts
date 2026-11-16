@@ -147,7 +147,26 @@ test('outcome text follows the OP3 shape and holds carry the reason', () => {
   assert.match(chatOutcomeText(job, { status: 'published', event: 'REQUEST_CHANGES', summary: 'Two defects.', confidence: 'high', reviewUrl: 'u' })!, /🛑 Review complete — Changes requested \(confidence: high\)\n\nTwo defects\.\n\nFull review: u\nCommit: abcdef12/);
   assert.match(chatOutcomeText(job, { status: 'published', event: 'COMMENT', confidence: 'medium' })!, /💬 Review complete — comments only/);
   assert.match(chatOutcomeText(job, { status: 'held', reason: 'CI failed at this head.' })!, /⚠️ ROKT\/launch-engineering#585 — Review held\n\nCI failed/);
-  assert.equal(chatOutcomeText(job, { status: 'deferred' }), null, 'deferrals are not announced; the acknowledgement already said we are looking');
+  assert.equal(chatOutcomeText(job, { status: 'deferred' }), null, 'a deferral with no reason is not announced; the acknowledgement already said we are looking');
+  assert.match(chatOutcomeText(job, { status: 'deferred', reason: 'CI is still running.' })!, /⏳ ROKT\/launch-engineering#585 — Waiting\n\nCI is still running\./);
+});
+
+test('a CI wait is said once per request and the result still reaches the thread', async () => {
+  const store = new Store(':memory:');
+  const ctx = { config, store, log };
+  handleChatMessage(ctx, msg());
+  await resolvePendingChatRequests(ctx, async () => meta(), 1000);
+  const job = store.claim('w', 60, { perRepo: 1, global: 1 })!;
+  const replies = (pattern: RegExp) => store.pendingChatReplies(Date.now() / 1000 + 1, 20).filter((r) => pattern.test(r.text));
+
+  // Four retries while CI runs: one line, and the request stays open.
+  for (let i = 0; i < 4; i++) deliverOutcome(store, job, { status: 'deferred', reason: 'CI is still running at this commit.' });
+  assert.equal(replies(/Waiting/).length, 1);
+  assert.equal(store.chatRequestsForJob(job.id).length, 1, 'the request is still queued for the result');
+
+  deliverOutcome(store, job, { status: 'published', event: 'APPROVE', summary: 's', confidence: 'high', reviewUrl: 'https://example/review-1' });
+  assert.equal(replies(/Review complete/).length, 1);
+  assert.equal(replies(/Waiting/)[0]!.thread, replies(/Review complete/)[0]!.thread);
 });
 
 test('re-review runs a published commit again, drops the stored result, and counts as a round', async () => {

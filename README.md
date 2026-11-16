@@ -185,7 +185,7 @@ Cost records distinguish measured token usage from estimates. Unreported usage r
 
 | Condition | Behavior |
 | --- | --- |
-| CI still running | Waits and checks again before starting analysis. |
+| CI still running | Waits and checks again before starting analysis. A review asked for in Chat gets one "Waiting" line in its thread. |
 | Failed/cancelled CI, draft, conflicts, empty diff, merged/closed PR | Holds or skips; thread explains the reason. |
 | Head/base changes during review | Cancels obsolete work and queues a fresh review after a stability delay; repeated changes hold for attention. |
 | Head changes during submission | Records the submitted review against its old commit and marks it stale. |

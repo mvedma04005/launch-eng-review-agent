@@ -177,9 +177,13 @@ test('worker holds on failed CI, defers on pending CI, and skips drafts without 
     const github = new FakeGitHub(meta(origin, headSha, baseSha, { draft }), ci);
     const s = new Store(':memory:');
     const { job } = s.enqueue({ repo: 'acme/demo', number: 3, headSha, baseSha, baseRef: 'main', trigger: 'poll', receivedAt: 'now' });
-    const outcome = await processJob({ config, store: s, auth, anthropic: {} as Anthropic, reviewer, log, dryRun: false, githubFor: async () => github }, s.claim('t', 60, { perRepo: 1, global: 1 })!, 't');
+    const told: Array<{ status: string; reason?: string | undefined }> = [];
+    const outcome = await processJob({ config, store: s, auth, anthropic: {} as Anthropic, reviewer, log, dryRun: false, githubFor: async () => github, notify: (_job, o) => { told.push(o); } }, s.claim('t', 60, { perRepo: 1, global: 1 })!, 't');
     assert.equal(outcome.status, expected, `ci=${ci} draft=${draft}`);
-    if (expected === 'deferred') assert.equal(s.job(job.id)?.status, 'queued');
+    if (expected === 'deferred') {
+      assert.equal(s.job(job.id)?.status, 'queued');
+      assert.match(told.find((o) => o.status === 'deferred')?.reason ?? '', /CI is still running/, 'whoever asked is told about the CI wait');
+    }
   }
   // A job for any other repository is refused before GitHub is even asked.
   const s = new Store(':memory:');

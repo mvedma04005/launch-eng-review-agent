@@ -141,7 +141,11 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     }
 
     const ci = await github.ci(job.repo, job.headSha, ctx.config.github.stalledCheckMinutes * 60_000);
-    if (ci === 'pending') return defer(90, 'CI still running', 'ci_pending');
+    if (ci === 'pending') {
+      // Said once per request (the outbox key repeats on every retry): a silent CI wait reads as a hang.
+      ctx.notify?.(job, { status: 'deferred', reason: 'CI is still running at this commit. The review starts when CI finishes.' });
+      return defer(90, 'CI still running', 'ci_pending');
+    }
     if (ci === 'failure') return await done('held', `CI failed at this head. ${auto ? 'Fix CI and the next push is reviewed automatically.' : 'Fix CI, then post the PR link in the review space again.'}`);
 
     const capReason = dailyCapReason(ctx.store, ctx.config, job.repo);

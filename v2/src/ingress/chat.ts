@@ -322,17 +322,22 @@ export function chatOutcomeText(job: Pick<Job, 'repo' | 'number' | 'headSha'>, o
     case 'held': return `⚠️ ${pr} — Review held\n\n${outcome.reason ?? 'See the engine logs.'}\nCommit: ${head}`;
     case 'skipped': return `${pr} — Not reviewed\n\n${outcome.reason ?? ''}`;
     case 'dry_run': return `${pr} — Dry run complete; nothing was posted.`;
+    // A wait is announced only when the worker gives a reason worth a message (CI). Other deferrals stay quiet.
+    case 'deferred': return outcome.reason ? `⏳ ${pr} — Waiting\n\n${outcome.reason}` : null;
     default: return null;
   }
 }
 
-/** Called by the worker on every terminal outcome. Each requesting thread gets one reply; the outbox makes retries safe. */
+/**
+ * Called by the worker on every terminal outcome, and on a wait it wants announced. Each requesting thread gets one
+ * reply per status; the outbox makes retries safe. A wait leaves the request open, so the result still reaches it.
+ */
 export function deliverOutcome(store: Store, job: Job, outcome: Outcome): void {
   const text = chatOutcomeText(job, outcome);
   if (!text) return;
   for (const req of store.chatRequestsForJob(job.id)) {
     store.queueChatReply(`result:${req.id}:${outcome.status}`, req.space, req.thread, text);
-    store.setChatRequest(req.id, { status: 'delivered' });
+    if (outcome.status !== 'deferred') store.setChatRequest(req.id, { status: 'delivered' });
   }
 }
 
