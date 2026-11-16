@@ -24,17 +24,19 @@ export interface RenderedReview {
 // P0 and P1 block (the pack's blockOn). P2 and P3 hold the approval (holdOn). Only a nit lets the bot approve.
 // A late finding is the exception: it is shown and never holds.
 const holds = (policy: PolicyPack, f: Finding) => policy.verdict.holdOn.includes(f.severity) && !f.late;
-const squash = (s: string) => s.replace(/\s+/g, ' ').trim();
 
 /**
  * Marks the late findings of a re-review: a P3 on a line that `changedSince` (the diff from the last reviewed commit,
  * with no context lines) did not touch. The reviewer read that line in an earlier round and passed it, so a new demand
- * there moves the goalpost. A finding caused by a fix sits on a changed line and holds as before. So does a finding
- * that an earlier round already raised on the same line and that held: leaving it unfixed does not make it late.
+ * there moves the goalpost. A finding caused by a fix sits on a changed line and holds as before.
+ *
+ * Nothing is late while a finding that held in the last review (`lastRound`) still sits on a line the author did not
+ * touch: that review is not answered yet. The check is on the line and not on the finding's text, because the reviewer
+ * rewords the same problem and often cites another line for it the next time.
  */
-export function markLate(findings: Finding[], changedSince: Anchors, prior: Iterable<Finding>): void {
-  const raised = new Set([...prior].filter((p) => !p.late).map((p) => `${p.path}\u0000${squash(p.evidence)}`));
-  for (const f of findings) f.late = f.severity === 'low' && !f.blocking && f.side === 'RIGHT' && !changedSince.has(f.path, 'RIGHT', f.line) && !raised.has(`${f.path}\u0000${squash(f.evidence)}`);
+export function markLate(findings: Finding[], changedSince: Anchors, lastRound: Iterable<Finding>): void {
+  const unanswered = [...lastRound].some((p) => !p.late && p.severity !== 'info' && p.side === 'RIGHT' && !changedSince.has(p.path, 'LEFT', p.line));
+  for (const f of findings) f.late = !unanswered && f.severity === 'low' && !f.blocking && f.side === 'RIGHT' && !changedSince.has(f.path, 'RIGHT', f.line);
 }
 
 const sevLabel: Record<Finding['severity'], string> = { critical: 'P0', high: 'P1', medium: 'P2', low: 'P3', info: 'Nit' };

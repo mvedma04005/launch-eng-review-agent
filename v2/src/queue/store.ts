@@ -291,6 +291,11 @@ export class Store {
     return row?.head_sha ?? null;
   }
 
+  /** The findings Falcon recorded for one commit of a PR. */
+  findingsAt(repo: string, number: number, headSha: string): Finding[] {
+    return (this.db.prepare('select body_json from findings where repo=? and number=? and head_sha=?').all(repo, number, headSha) as Array<{ body_json: string }>).map((r) => JSON.parse(r.body_json) as Finding);
+  }
+
   recordOutcome(outcome: FindingOutcome): boolean {
     const r = this.db.prepare('insert or ignore into finding_outcomes(finding_id, signal, actor, at, detail) values(?,?,?,?,?)')
       .run(outcome.findingId, outcome.signal, outcome.actor, outcome.at, outcome.detail ?? null);

@@ -153,8 +153,13 @@ test('a late finding is a P3 on a line that did not change since the last review
   assert.equal(late(p3({ severity: 'medium' })), false, 'a P2 holds whenever it is found');
   assert.equal(late(p3({ severity: 'high', blocking: true })), false);
   assert.equal(late(p3({ side: 'LEFT' })), false, 'a deleted line is part of a change');
-  assert.equal(late(p3({ title: 'Reworded' }), [p3({ evidence: ' x  =  1 ' })]), false, 'raised on this line before and left unfixed: it still holds');
-  assert.equal(late(p3({}), [p3({ late: true })]), true, 'late in an earlier round, late now');
+  // The last review held on line 2 and the fix changed it: that review is answered.
+  assert.equal(late(p3({}), [p3({ line: 2 })]), true);
+  // The last review held on line 5 and nobody touched it. The reviewer now cites line 9 for it, in other words.
+  assert.equal(late(p3({ title: 'Reworded' }), [p3({ line: 5 })]), false, 'an unanswered review makes nothing late');
+  assert.equal(late(p3({}), [p3({ line: 5, severity: 'medium' })]), false);
+  assert.equal(late(p3({}), [p3({ line: 5, late: true })]), true, 'a late finding of the last review asks for no answer');
+  assert.equal(late(p3({}), [p3({ line: 5, severity: 'info' })]), true, 'nor does a nit');
 });
 
 test('a late finding is shown and does not hold the approval; a finding on a changed line still does', () => {

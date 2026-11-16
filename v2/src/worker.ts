@@ -217,11 +217,12 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
 
     const { kept, dropped } = applyPolicy(policy, output.findings);
     for (const d of dropped) log.info({ finding: d.finding.id, reason: d.reason }, 'finding dropped by policy');
-    // A re-review: a new P3 on a line that did not change since the last reviewed commit is late. Without that commit
-    // in the clone (a rewritten branch) nothing is late, and every finding holds as on a first review.
+    // A re-review: a new P3 on a line that did not change since the last reviewed commit is late, once the author has
+    // touched every line the last review held on. Without that commit in the clone (a rewritten branch) nothing is
+    // late, and every finding holds as on a first review.
     const lastHead = ctx.store.lastReviewedHead(job.repo, job.number, job.headSha);
     const changedSince = lastHead ? await mirror.diff(lastHead, job.headSha, 0).catch((error) => { log.info({ lastHead, err: String(error) }, 'no diff from the last reviewed commit; nothing is late'); return null; }) : null;
-    if (changedSince) markLate(kept, changedSince, prior.values());
+    if (changedSince) markLate(kept, changedSince, ctx.store.findingsAt(job.repo, job.number, lastHead!));
     if (policy.verdict.verifyBlocking) {
       for (const f of kept.filter((k) => k.blocking)) {
         const text = f.side === 'RIGHT' ? worktree.readText(f.path, policy.budgets.maxFileBytes) : (await baseRead(f.path)) ?? '';
