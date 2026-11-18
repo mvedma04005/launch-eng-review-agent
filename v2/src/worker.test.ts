@@ -9,7 +9,7 @@ import { ConfigSchema } from './config.ts';
 import { log } from './log.ts';
 import type { CheckConclusion, GitHubPort, Publishable } from './publisher/github.ts';
 import { buildRedactor } from './publisher/redact.ts';
-import { Store } from './queue/store.ts';
+import { CARRY_ONLY, Store } from './queue/store.ts';
 import type { Reviewer } from './reviewer/claude.ts';
 import type { PolicyPack } from './policy/schema.ts';
 import type { Finding, PullMeta, ReviewOutput } from './types.ts';
@@ -649,7 +649,7 @@ function moveMainAndRebase(origin: string, path: string, text: string, extra?: s
   return { base, head };
 }
 
-async function rebaseRounds(first: Partial<ReviewOutput> & { severities?: Array<'critical' | 'high' | 'medium'> }, move: (origin: string) => { base: string; head: string }) {
+async function rebaseRounds(first: Partial<ReviewOutput> & { severities?: Array<'critical' | 'high' | 'medium'> }, move: (origin: string) => { base: string; head: string }, carryOnly = false) {
   const f = approveFixture();
   const store = new Store(':memory:');
   const calls = { n: 0 };
@@ -658,17 +658,20 @@ async function rebaseRounds(first: Partial<ReviewOutput> & { severities?: Array<
   const round = async (headSha: string, baseSha: string) => {
     const github = new FakeGitHub(meta(f.origin, headSha, baseSha));
     const ctx: WorkerContext = { config: configFor(f.root), store, auth, anthropic: {} as Anthropic, reviewer, log, dryRun: false, githubFor: async () => github };
-    store.enqueue({ repo: 'acme/demo', number: 3, headSha, baseSha, baseRef: 'main', trigger: 'manual', receivedAt: 'now' });
+    const { job: queued } = store.enqueue({ repo: 'acme/demo', number: 3, headSha, baseSha, baseRef: 'main', trigger: 'comment', receivedAt: 'now' });
+    if (carryOnly && headSha !== f.headSha) {
+      const req = store.addChatRequest({ messageName: `m-${headSha}`, space: 's', thread: 't', sender: 'u', senderEmail: null, repo: 'acme/demo', number: 3, command: 'review' })!;
+      store.setChatRequest(req.id, { status: 'queued', jobId: queued.id, note: CARRY_ONLY });
+    }
     const job = store.claim('t', 60, { perRepo: 1, global: 1 })!;
     const outcome = await processJob(ctx, job, 't');
-    assert.equal(outcome.status, 'published', outcome.reason);
-    return { github, job };
+    return { github, job, outcome };
   };
-  await round(f.headSha, f.baseSha);
+  assert.equal((await round(f.headSha, f.baseSha)).outcome.status, 'published');
   const moved = move(f.origin);
   const second = await round(moved.head, moved.base);
   const carried = (store.db.prepare("select count(*) as n from events where job_id=? and kind='carried_forward'").get(second.job.id) as { n: number }).n;
-  return { calls: calls.n, posted: second.github.posted[0]!, checks: second.github.checks, carried, firstHead: f.headSha };
+  return { calls: calls.n, posted: second.github.posted[0]!, checks: second.github.checks, carried, firstHead: f.headSha, outcome: second.outcome };
 }
 
 test('a rebase that keeps an approved change is approved again with no model run', async () => {
@@ -696,4 +699,15 @@ test('a rebase is reviewed again when the last review was not an approval', asyn
   const r = await rebaseRounds({ severities: ['medium'] }, (o) => moveMainAndRebase(o, 'other.py', 'x = 1\n'));
   assert.equal(r.calls, 2);
   assert.equal(r.carried, 0);
+});
+
+test('past the round limit, a rebase of the same change is approved and any other commit is refused with no model run', async () => {
+  const same = await rebaseRounds({}, (o) => moveMainAndRebase(o, 'other.py', 'x = 1\n'), true);
+  assert.equal(same.posted?.event, 'APPROVE');
+  assert.equal(same.calls, 1);
+  const changed = await rebaseRounds({}, (o) => moveMainAndRebase(o, 'other.py', 'x = 1\n', 'def handler(user):\n    return user.email\n'), true);
+  assert.equal(changed.calls, 1, 'no model run for a changed diff past the limit');
+  assert.equal(changed.outcome.status, 'skipped');
+  assert.match(changed.outcome.reason ?? '', /used its \d+ manual review rounds/);
+  assert.equal(changed.posted, undefined, 'nothing posted on GitHub');
 });

@@ -16,7 +16,7 @@ import type { PolicyPack } from './policy/schema.ts';
 import { OctokitGitHub, type GitHubPort } from './publisher/github.ts';
 import { boundBytes, LIMITS, redactorFromEnv, type Redactor } from './publisher/redact.ts';
 import { marker, markLate, renderReview, type RenderedReview } from './publisher/render.ts';
-import type { Store } from './queue/store.ts';
+import { CARRY_ONLY, type Store } from './queue/store.ts';
 import { Incomplete, type Reviewer } from './reviewer/claude.ts';
 import type { Finding, Job, PendingPublication, PullMeta, ReviewOutput, Usage } from './types.ts';
 
@@ -200,6 +200,11 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
         || (policy.context.instructionFiles.includes(basename(p)) && prPaths.some((f) => dirname(p) === '.' || f.startsWith(`${dirname(p)}/`)));
       const same = await sameChange(mirror, last, mergeBase, job.headSha, governs).catch((error) => { log.info({ last: last.headSha, err: String(error) }, 'could not compare with the last approval; reviewing in full'); return false; });
       if (same) return await carryApproval(last, meta);
+    }
+    // Every request for this job came past the round limit: no review, only the carry above.
+    const requests = ctx.store.chatRequestsForJob(job.id);
+    if (requests.length && requests.every((r) => r.note === CARRY_ONLY)) {
+      return await done('skipped', `This PR has used its ${ctx.config.chat.maxRoundsPerPr} manual review rounds, and this commit is not the same change Falcon last approved. Ask a team member to review it.`);
     }
     const instructionDocs = await collectInstructionDocs(trustedRead, inScopeFiles, policy);
     const requiredDocs: Array<{ path: string; text: string }> = [];

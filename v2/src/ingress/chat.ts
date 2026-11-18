@@ -4,7 +4,7 @@ import { IdentityPoolClient, JWT } from 'google-auth-library';
 import { isAllowedRepo, type Config } from '../config.ts';
 import type { Logger } from '../log.ts';
 import { metrics } from '../metrics.ts';
-import { FRESH_REVIEW, type Store } from '../queue/store.ts';
+import { CARRY_ONLY, FRESH_REVIEW, type Store } from '../queue/store.ts';
 import type { ChatRequest, Job, PullMeta } from '../types.ts';
 
 /**
@@ -246,15 +246,11 @@ export async function resolvePendingChatRequests(ctx: IntakeContext, pull: (repo
         resolved++;
         continue;
       }
-      if (!created && ['held', 'failed', 'cancelled', 'skipped'].includes(job.status)) {
-        if (store.chatRoundsForPr(req.repo, req.number) >= config.chat.maxRoundsPerPr) { refuse(`this PR has used its ${config.chat.maxRoundsPerPr} manual review rounds.${config.github.pollSeconds > 0 ? ' Push a new commit for an automatic review.' : ' Ask a team member to review it.'}`); continue; }
-        store.requeue(job.id, 0, `chat ${req.command} by ${req.sender}`);
-      } else if (created && store.chatRoundsForPr(req.repo, req.number) >= config.chat.maxRoundsPerPr) {
-        store.finish(job.id, 'cancelled', { error: 'manual rounds exhausted' });
-        refuse(`this PR has used its ${config.chat.maxRoundsPerPr} manual review rounds.${config.github.pollSeconds > 0 ? ' Push a new commit for an automatic review.' : ' Ask a team member to review it.'}`);
-        continue;
-      }
-      store.setChatRequest(req.id, { status: 'queued', jobId: job.id });
+      // Past the round limit the request still queues, but the worker may only carry an approval across a rebase of
+      // the same change. Any other commit is refused there, with no model run.
+      const carryOnly = store.chatRoundsForPr(req.repo, req.number) >= config.chat.maxRoundsPerPr;
+      if (!created && ['held', 'failed', 'cancelled', 'skipped'].includes(job.status)) store.requeue(job.id, 0, `chat ${req.command} by ${req.sender}${carryOnly ? ' (approval carry only)' : ''}`);
+      store.setChatRequest(req.id, { status: 'queued', jobId: job.id, ...(carryOnly ? { note: CARRY_ONLY } : {}) });
       metrics.feedback.inc({ repo: req.repo, signal: created ? 'chat_queued' : 'chat_attached' });
       resolved++;
     } catch (error) {

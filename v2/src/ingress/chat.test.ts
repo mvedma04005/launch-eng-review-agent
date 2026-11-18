@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ConfigSchema, isAllowedRepo } from '../config.ts';
 import { log } from '../log.ts';
-import { Store } from '../queue/store.ts';
+import { CARRY_ONLY, Store } from '../queue/store.ts';
 import type { PullMeta } from '../types.ts';
 import { generateKeyPairSync, verify } from 'node:crypto';
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
@@ -233,4 +233,27 @@ test('keyless key: created once, owner-only, and only the public half is returne
 
   const [h, p, sig] = signedNote({ audience: '//a', service_account: 's', issuer: 'https://i', subject: 'x', key_id: key.kid, signing_key_file: file }).split('.') as [string, string, string];
   assert.ok(verify('RSA-SHA256', Buffer.from(`${h}.${p}`), { key, format: 'jwk' }, Buffer.from(sig, 'base64url')), 'the printed public key verifies a note from the file');
+});
+
+test('at the round limit a request still queues, but only to approve a rebase of the same change; a carried approval is not a round', async () => {
+  const store = new Store(':memory:');
+  const ctx = { config, store, log };
+  const ask = async (n: number, head: string) => {
+    handleChatMessage(ctx, msg({ name: `${SPACE}/messages/r${n}` }));
+    await resolvePendingChatRequests(ctx, async () => meta({ headSha: head.repeat(40) }), n * 10_000);
+    return store.claim('w', 60, { perRepo: 1, global: 1 })!;
+  };
+  store.finish((await ask(1, 'a')).id, 'published', { result: {} });
+  const second = await ask(2, 'c');
+  store.finish(second.id, 'published', { result: {} });
+  assert.equal(store.chatRoundsForPr('ROKT/launch-engineering', 585), 2);
+
+  const third = await ask(3, 'e');
+  assert.ok(third, 'the request past the limit is queued, not cancelled');
+  assert.equal(store.chatRequestsForJob(third.id)[0]?.note, CARRY_ONLY);
+  assert.ok(!store.pendingChatReplies(Date.now() / 1000 + 1, 30).some((r) => /used its 2 manual review rounds/.test(r.text)), 'nothing is refused yet');
+  assert.equal(store.chatRoundsForPr('ROKT/launch-engineering', 585), 2, 'a request past the limit is not a round');
+
+  store.event(second.id, 'carried_forward', { from: 'x' });
+  assert.equal(store.chatRoundsForPr('ROKT/launch-engineering', 585), 1, 'a carried approval is not a round');
 });

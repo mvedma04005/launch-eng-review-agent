@@ -58,6 +58,8 @@ const now = () => new Date().toISOString();
 /** Deterministic id from a key (UUID v5 over a fixed namespace), so idempotent inserts need no lookups. */
 /** The note on a Chat request that was granted a fresh review of a commit Falcon had already reviewed. */
 export const FRESH_REVIEW = 'fresh review';
+/** A request that came past the round limit: it may only carry an approval across a rebase, never start a review. */
+export const CARRY_ONLY = 'carry only';
 
 export function uuid5(key: string): string {
   const hash = createHash('sha1').update('falcon-outbox:' + key).digest();
@@ -225,8 +227,10 @@ export class Store {
 
   /** Rounds a PR has used: one per commit asked for, plus one per fresh review of a commit already reviewed. */
   chatRoundsForPr(repo: string, number: number): number {
+    // An approval carried across a rebase, and a request that may only carry one, cost no model run, so no round.
     const row = this.db.prepare(`select count(distinct coalesce(job_id, id)) as jobs, sum(case when note=? then 1 else 0 end) as fresh
-      from chat_requests where repo=? and number=? and status in ('queued','delivered')`).get(FRESH_REVIEW, repo, number) as { jobs: number; fresh: number | null };
+      from chat_requests c where repo=? and number=? and status in ('queued','delivered') and coalesce(note, '')<>?
+        and not exists (select 1 from events e where e.job_id=c.job_id and e.kind='carried_forward')`).get(FRESH_REVIEW, repo, number, CARRY_ONLY) as { jobs: number; fresh: number | null };
     return row.jobs + (row.fresh ?? 0);
   }
 
