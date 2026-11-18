@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
@@ -80,6 +80,35 @@ export class Mirror {
 
   async mergeBase(a: string, b: string): Promise<string> {
     return checkSha((await git(['merge-base', checkSha(a), checkSha(b)], this.path)).trim());
+  }
+
+  /** Makes one commit present by SHA, for a head that a rebase or force-push took off every ref. Throws when GitHub does not have it. */
+  async fetchCommit(sha: string): Promise<void> {
+    checkSha(sha);
+    if (await git(['cat-file', '-e', `${sha}^{commit}`], this.path).then(() => true, () => false)) return;
+    await git(['fetch', '--quiet', '--no-tags', 'origin', sha], this.path, await this.authEnv());
+    await git(['cat-file', '-e', `${sha}^{commit}`], this.path);
+  }
+
+  /** The change's fingerprint (`git patch-id --stable`): equal for the same change on another base, null for no change. */
+  async patchId(baseSha: string, headSha: string): Promise<string | null> {
+    const diff = await git(['diff', '--no-color', '--no-ext-diff', '--full-index', `${checkSha(baseSha)}..${checkSha(headSha)}`], this.path);
+    if (!diff) return null;
+    const out = await new Promise<string>((ok, fail) => {
+      const p = spawn('git', ['patch-id', '--stable'], { cwd: this.path });
+      let text = '';
+      p.stdout.on('data', (d) => { text += d; });
+      p.on('error', fail);
+      p.on('close', (code) => (code === 0 ? ok(text) : fail(new Error(`git patch-id exited ${code}`))));
+      p.stdin.end(diff);
+    });
+    return out.split(' ')[0] || null;
+  }
+
+  /** Every path a range touched; a rename lists both names, so a file moved away still counts. */
+  async changedFiles(fromSha: string, toSha: string): Promise<string[]> {
+    const out = await git(['-c', 'core.quotePath=false', 'diff', '--name-only', '--no-renames', '-z', `${checkSha(fromSha)}..${checkSha(toSha)}`], this.path);
+    return out.split('\0').filter(Boolean);
   }
 
   /** With `context` 0 the RIGHT anchors are exactly the lines the range added or changed. */

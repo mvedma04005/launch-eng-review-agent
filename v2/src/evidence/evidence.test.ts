@@ -116,3 +116,47 @@ test('a diff header that cannot be read fails the review instead of hiding the f
   const quoted = 'diff --git "a/infra/x\\ty.tf" "b/infra/x\\ty.tf"\nnew file mode 100644\n--- /dev/null\n+++ "b/infra/x\\ty.tf"\n@@ -0,0 +1 @@\n+x\n';
   assert.throws(() => parseUnifiedDiff(quoted), /Cannot read a changed file's name/);
 });
+
+test('a rebase that keeps the change keeps its fingerprint, and the old head is fetched by SHA', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'falcon-rebase-'));
+  const origin = join(root, 'origin');
+  mkdirSync(origin);
+  git(origin, 'init', '-q', '-b', 'main');
+  git(origin, 'config', 'uploadpack.allowAnySHA1InWant', 'true');
+  writeFileSync(join(origin, 'app.py'), 'a = 1\nb = 2\n');
+  writeFileSync(join(origin, 'other.py'), 'x = 1\n');
+  git(origin, 'add', '.'); git(origin, 'commit', '-q', '-m', 'base');
+  const base1 = git(origin, 'rev-parse', 'HEAD');
+  git(origin, 'checkout', '-q', '-b', 'feature');
+  writeFileSync(join(origin, 'app.py'), 'a = 1\nb = 3\n');
+  git(origin, 'commit', '-q', '-am', 'change');
+  const head1 = git(origin, 'rev-parse', 'HEAD');
+  // main moves on a file the PR does not touch, then the PR is rebased onto it: the old head is no longer on any ref.
+  git(origin, 'checkout', '-q', 'main');
+  writeFileSync(join(origin, 'other.py'), 'x = 2\n');
+  git(origin, 'commit', '-q', '-am', 'main moves');
+  const base2 = git(origin, 'rev-parse', 'HEAD');
+  git(origin, 'checkout', '-q', 'feature');
+  git(origin, 'rebase', '-q', 'main');
+  const head2 = git(origin, 'rev-parse', 'HEAD');
+  writeFileSync(join(origin, 'app.py'), 'a = 1\nb = 4\n');
+  git(origin, 'commit', '-q', '-am', 'more');
+  const head3 = git(origin, 'rev-parse', 'HEAD');
+  git(origin, 'update-ref', 'refs/pull/7/head', head2);
+  git(origin, 'checkout', '-q', 'main');
+
+  // file:// so the clone fetches like a remote does; a plain path copies every object, the old head included.
+  const mirror = new Mirror(join(root, 'state'), 'acme/demo', `file://${origin}`);
+  await mirror.fetchPull(7, head2, 'main', base2);
+  assert.throws(() => git(mirror.path, 'cat-file', '-e', `${head1}^{commit}`), 'the old head is not in a fresh mirror');
+  await mirror.fetchCommit(head1);
+  await mirror.fetchCommit(head3);
+  await assert.rejects(mirror.fetchCommit('0'.repeat(40)), 'a commit GitHub does not have fails, so the caller reviews in full');
+
+  const before = await mirror.patchId(base1, head1);
+  assert.ok(before, 'a change has a fingerprint');
+  assert.equal(await mirror.patchId(base2, head2), before, 'the rebased change has the same fingerprint');
+  assert.notEqual(await mirror.patchId(base2, head3), before, 'a changed diff has a different fingerprint');
+  assert.equal(await mirror.patchId(base2, base2), null, 'an empty diff has no fingerprint');
+  assert.deepEqual(await mirror.changedFiles(base1, base2), ['other.py'], 'what main changed between the two bases');
+});
