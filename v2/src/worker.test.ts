@@ -633,3 +633,67 @@ test('a re-review approves past a new P3 on a line the fix did not touch, and sa
   assert.match(second.body, /Approved — 1 late finding open/);
   assert.match(second.comments[0]!.body, /Late finding, does not hold approval/);
 });
+
+/** main moves (`path` gets `text`), then the PR is rebased onto it. Returns the new main and the new PR head. */
+function moveMainAndRebase(origin: string, path: string, text: string, extra?: string) {
+  mkdirSync(join(origin, path, '..'), { recursive: true });
+  writeFileSync(join(origin, path), text);
+  git(origin, 'add', '.'); git(origin, 'commit', '-q', '-m', `main: ${path}`);
+  const base = git(origin, 'rev-parse', 'HEAD');
+  git(origin, 'checkout', '-q', 'feature');
+  git(origin, 'rebase', '-q', 'main');
+  if (extra) { writeFileSync(join(origin, 'svc.py'), extra); git(origin, 'commit', '-qam', 'more'); }
+  const head = git(origin, 'rev-parse', 'HEAD');
+  git(origin, 'update-ref', 'refs/pull/3/head', head);
+  git(origin, 'checkout', '-q', 'main');
+  return { base, head };
+}
+
+async function rebaseRounds(first: Partial<ReviewOutput> & { severities?: Array<'critical' | 'high' | 'medium'> }, move: (origin: string) => { base: string; head: string }) {
+  const f = approveFixture();
+  const store = new Store(':memory:');
+  const calls = { n: 0 };
+  const inner = scriptedReviewer(first);
+  const reviewer: Reviewer = { ...inner, async review(opts) { calls.n++; return inner.review(opts); } };
+  const round = async (headSha: string, baseSha: string) => {
+    const github = new FakeGitHub(meta(f.origin, headSha, baseSha));
+    const ctx: WorkerContext = { config: configFor(f.root), store, auth, anthropic: {} as Anthropic, reviewer, log, dryRun: false, githubFor: async () => github };
+    store.enqueue({ repo: 'acme/demo', number: 3, headSha, baseSha, baseRef: 'main', trigger: 'manual', receivedAt: 'now' });
+    const job = store.claim('t', 60, { perRepo: 1, global: 1 })!;
+    const outcome = await processJob(ctx, job, 't');
+    assert.equal(outcome.status, 'published', outcome.reason);
+    return { github, job };
+  };
+  await round(f.headSha, f.baseSha);
+  const moved = move(f.origin);
+  const second = await round(moved.head, moved.base);
+  const carried = (store.db.prepare("select count(*) as n from events where job_id=? and kind='carried_forward'").get(second.job.id) as { n: number }).n;
+  return { calls: calls.n, posted: second.github.posted[0]!, checks: second.github.checks, carried, firstHead: f.headSha };
+}
+
+test('a rebase that keeps an approved change is approved again with no model run', async () => {
+  const r = await rebaseRounds({}, (o) => moveMainAndRebase(o, 'other.py', 'x = 1\n'));
+  assert.equal(r.calls, 1, 'only the first commit went to the model');
+  assert.equal(r.posted.event, 'APPROVE');
+  assert.match(r.posted.body, new RegExp(`same change as ${r.firstHead.slice(0, 12)}`));
+  assert.deepEqual(r.checks.map((c) => `${c.status}:${c.conclusion ?? ''}:${c.title ?? ''}`), ['completed:success:Approved']);
+  assert.equal(r.carried, 1, 'the carried approval is recorded, so it does not count as a round');
+});
+
+test('a rebase is reviewed again when main changed one of the PR files, the rules, or the diff changed', async () => {
+  const prFile = await rebaseRounds({}, (o) => moveMainAndRebase(o, 'svc.py', '# main header\ndef handler(user):\n    return user\n'));
+  assert.equal(prFile.calls, 2, 'main touched svc.py, which the PR changes');
+  const rules = await rebaseRounds({}, (o) => moveMainAndRebase(o, '.falcon/policy.yaml', 'version: 1\nname: repo\nverdict: { mode: approve }\nteam: { members: [lee, kim] }\n'));
+  assert.equal(rules.calls, 2, 'the policy on main changed');
+  const instructions = await rebaseRounds({}, (o) => moveMainAndRebase(o, 'CLAUDE.md', '# New rule\n'));
+  assert.equal(instructions.calls, 2, 'an instruction file above the PR files changed');
+  const diff = await rebaseRounds({}, (o) => moveMainAndRebase(o, 'other.py', 'x = 1\n', 'def handler(user):\n    return user.email\n'));
+  assert.equal(diff.calls, 2, 'the PR change itself is different');
+  for (const r of [prFile, rules, instructions, diff]) assert.equal(r.carried, 0);
+});
+
+test('a rebase is reviewed again when the last review was not an approval', async () => {
+  const r = await rebaseRounds({ severities: ['medium'] }, (o) => moveMainAndRebase(o, 'other.py', 'x = 1\n'));
+  assert.equal(r.calls, 2);
+  assert.equal(r.carried, 0);
+});

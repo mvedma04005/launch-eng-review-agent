@@ -286,6 +286,15 @@ export class Store {
   }
 
   /** The head of the newest review posted on an earlier commit of this PR, or null on a first review. */
+  /** Falcon's last posted review of a PR at another commit, with the commit and base it read. */
+  lastReview(repo: string, number: number, excludeHead: string): { jobId: string; headSha: string; baseSha: string; event: string; reviewUrl: string | null } | null {
+    const row = this.db.prepare('select j.id, j.head_sha, j.base_sha, r.event, j.result_json from reviews r join jobs j on j.id=r.job_id where j.repo=? and j.number=? and j.head_sha<>? order by r.posted_at desc, r.id desc limit 1')
+      .get(repo, number, excludeHead) as { id: string; head_sha: string; base_sha: string; event: string; result_json: string | null } | undefined;
+    if (!row) return null;
+    const result = row.result_json ? (JSON.parse(row.result_json) as { reviewUrl?: string }) : {};
+    return { jobId: row.id, headSha: row.head_sha, baseSha: row.base_sha, event: row.event, reviewUrl: result.reviewUrl ?? null };
+  }
+
   lastReviewedHead(repo: string, number: number, excludeHead: string): string | null {
     const row = this.db.prepare('select j.head_sha from reviews r join jobs j on j.id=r.job_id where j.repo=? and j.number=? and j.head_sha<>? order by r.posted_at desc, r.id desc limit 1').get(repo, number, excludeHead) as { head_sha: string } | undefined;
     return row?.head_sha ?? null;

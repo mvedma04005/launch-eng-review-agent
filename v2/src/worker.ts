@@ -1,6 +1,6 @@
 import type Anthropic from '@anthropic-ai/sdk';
 import { execFile } from 'node:child_process';
-import { isAbsolute, join } from 'node:path';
+import { basename, dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { isAllowedRepo, type Config } from './config.ts';
@@ -15,7 +15,7 @@ import { missingPlanSections } from './policy/plan.ts';
 import type { PolicyPack } from './policy/schema.ts';
 import { OctokitGitHub, type GitHubPort } from './publisher/github.ts';
 import { boundBytes, LIMITS, redactorFromEnv, type Redactor } from './publisher/redact.ts';
-import { markLate, renderReview, type RenderedReview } from './publisher/render.ts';
+import { marker, markLate, renderReview, type RenderedReview } from './publisher/render.ts';
 import type { Store } from './queue/store.ts';
 import { Incomplete, type Reviewer } from './reviewer/claude.ts';
 import type { Finding, Job, PendingPublication, PullMeta, ReviewOutput, Usage } from './types.ts';
@@ -191,6 +191,16 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     const changedLines = anchors.files.filter((f) => inScopeFiles.includes(f.path)).reduce((n, f) => n + f.additions + f.deletions, 0);
     if (changedLines > policy.budgets.maxChangedLines && override) return await done('skipped', `${changedLines} changed lines is over the limit of ${policy.budgets.maxChangedLines}; overridden by @${override}, not reviewed.`, 'pass');
     if (changedLines > policy.budgets.maxChangedLines) return await done('skipped', `${changedLines} changed lines exceeds the policy budget of ${policy.budgets.maxChangedLines}. Split the PR into smaller, focused PRs so the review can assess the changes and their interactions reliably. ${RERUN}`, 'block');
+    // A rebase that kept the change: Falcon's last verdict on this PR approved the same diff, and the base moved without
+    // touching the PR's files or the rules. Approve again with no model run. Anything unclear reviews in full.
+    const last = fresh || gateFile || humanPath || policy.verdict.mode !== 'approve' ? null : ctx.store.lastReview(job.repo, job.number, job.headSha);
+    if (last?.event === 'APPROVE') {
+      const prPaths = anchors.files.flatMap((f) => [f.path, f.oldPath]).filter((p): p is string => !!p);
+      const governs = (p: string) => prPaths.includes(p) || p === ctx.config.policy.repoPath || isGateFile(p) || policy.context.required.includes(p)
+        || (policy.context.instructionFiles.includes(basename(p)) && prPaths.some((f) => dirname(p) === '.' || f.startsWith(`${dirname(p)}/`)));
+      const same = await sameChange(mirror, last, mergeBase, job.headSha, governs).catch((error) => { log.info({ last: last.headSha, err: String(error) }, 'could not compare with the last approval; reviewing in full'); return false; });
+      if (same) return await carryApproval(last, meta);
+    }
     const instructionDocs = await collectInstructionDocs(trustedRead, inScopeFiles, policy);
     const requiredDocs: Array<{ path: string; text: string }> = [];
     for (const p of policy.context.required) {
@@ -273,6 +283,22 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     log.info({ phases, totalMs: Date.now() - startedAt, attempts: job.attempts }, 'job phases');
   }
 
+  /** Approves this commit on the strength of the approval of the same change at an earlier commit. Counts as no round. */
+  async function carryApproval(last: { jobId: string; headSha: string; reviewUrl: string | null }, meta: PullMeta): Promise<JobOutcome> {
+    const short = last.headSha.slice(0, 12);
+    const why = `This commit makes the same change as ${short}, which Falcon approved${last.reviewUrl ? ` (${last.reviewUrl})` : ''}. The branch moved onto a newer ${meta.baseRef}, and that did not change this PR's files or the review rules. Falcon did not review it again.`;
+    const pendingReview: PendingPublication = {
+      headSha: job.headSha, event: 'APPROVE', comments: [], checkConclusion: 'success', blockingCount: 0, overridden: false,
+      body: `### Falcon review: Approved, same change as ${short}\n\n${why}\n${marker(job.repo, job.number, job.headSha)}`,
+      summary: why, chat: `Same change as ${last.headSha.slice(0, 8)}, which Falcon approved. Approved again without a new review.`, attempts: 0, renderedAt: new Date().toISOString(),
+    };
+    ctx.store.event(job.id, 'carried_forward', { from: last.jobId, head: last.headSha });
+    ctx.store.savePending(job.id, pendingReview);
+    const outcome = await publish(pendingReview, meta);
+    if (outcome.status === 'published') ctx.notify?.(job, { ...outcome, event: 'APPROVE', summary: pendingReview.chat! });
+    return outcome;
+  }
+
   /** Publishes a finished review. Failures keep the review and retry; after the cap, the job parks for `falcon replay`. */
   async function publish(pendingReview: PendingPublication, meta: PullMeta): Promise<JobOutcome> {
     // Dry run posts nothing, on every path. Without this, replaying a dry-run job that holds a retained review
@@ -338,6 +364,19 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     log.info({ seconds, reason }, 'job deferred');
     return { status: 'deferred', reason };
   }
+}
+
+/**
+ * True when `headSha` makes the same change as the last reviewed commit (equal `git patch-id`), and nothing the base
+ * gained in between is a path `governs` names: a file of the PR, the policy, or an instruction file above it.
+ */
+export async function sameChange(mirror: Mirror, last: { headSha: string; baseSha: string }, mergeBase: string, headSha: string, governs: (path: string) => boolean): Promise<boolean> {
+  await mirror.fetchCommit(last.headSha);
+  await mirror.fetchCommit(last.baseSha);
+  const oldBase = await mirror.mergeBase(last.baseSha, last.headSha);
+  const [before, after] = await Promise.all([mirror.patchId(oldBase, last.headSha), mirror.patchId(mergeBase, headSha)]);
+  if (!before || before !== after) return false;
+  return !(await mirror.changedFiles(oldBase, mergeBase)).some(governs);
 }
 
 function recordUsage(ctx: WorkerContext, job: Job, usage: Usage): void {
