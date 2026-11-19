@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { AlertState, evaluateAlerts, notify } from './alerts.ts';
 import type { Config } from './config.ts';
 import { buildContext } from './context.ts';
+import { Mirror } from './evidence/git.ts';
 import { sweepGate } from './gate.ts';
 import { registerStoreGauges, startStatusServer } from './http.ts';
 import { CHAT_SCOPES, GoogleChatApi, PUBSUB_SCOPES, PubSubPuller, flushChatOutbox, handleChatMessage, parseChatEvent, pollChatSpaces, resolvePendingChatRequests, serviceAccountTokens } from './ingress/chat.ts';
@@ -14,7 +15,7 @@ import { log } from './log.ts';
 import { metrics } from './metrics.ts';
 import { OctokitGitHub } from './publisher/github.ts';
 import { Store } from './queue/store.ts';
-import { processJob } from './worker.ts';
+import { processJob, sameChange } from './worker.ts';
 
 const CLI = fileURLToPath(new URL('./cli.ts', import.meta.url));
 
@@ -51,7 +52,16 @@ export async function serve(config: Config, signal: AbortSignal): Promise<void> 
     every(config.gate.pollSeconds * 1000, 'gate_sweep', async () => {
       for (const repo of config.github.repos) {
         const github = new OctokitGitHub(await ctx.auth.octokitFor(repo), await ctx.auth.botLogin());
-        await sweepGate({ github, store, log, falcon: await ctx.auth.botLogin(), repoPack: config.policy.repoPath, requested: config.gate.everyPull ? null : store.chatRequestedPulls(repo), branches: config.gate.branches, dryRun: config.dryRun }, repo);
+        const mirror = new Mirror(config.stateDir, repo, `https://github.com/${repo}.git`, () => ctx.auth.gitTokenFor(repo));
+        // The same comparison the worker uses for Falcon's own approvals: both commits measured from where they left main.
+        const same = async (number: number, oldSha: string, headSha: string, governs: (path: string) => boolean) => {
+          await mirror.ensure();
+          await mirror.fetchCommit(headSha);
+          const { baseRef } = await github.pullState(repo, number);
+          const mergeBase = await mirror.mergeBase(await mirror.fetchBranchTip(number, baseRef), headSha);
+          return sameChange(mirror, { headSha: oldSha, baseSha: mergeBase }, mergeBase, headSha, governs);
+        };
+        await sweepGate({ github, store, log, falcon: await ctx.auth.botLogin(), repoPack: config.policy.repoPath, requested: config.gate.everyPull ? null : store.chatRequestedPulls(repo), branches: config.gate.branches, dryRun: config.dryRun, sameChange: same }, repo);
       }
     });
   }

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { Logger } from './log.ts';
-import { gateVerdict, type GateVerdict } from './policy/gate.ts';
+import { gateVerdict, governedBy, type GateVerdict } from './policy/gate.ts';
 import { parsePolicy } from './policy/load.ts';
 
 /** Every open PR is judged again this often, in case a change did not move its update time. */
@@ -14,6 +14,8 @@ export interface GatePort {
   /** Every path the PR changes, or null when GitHub's list may be cut short. */
   changedPaths(repo: string, number: number): Promise<string[] | null>;
   approvers(repo: string, number: number, headSha: string): Promise<string[]>;
+  /** People whose latest verdict is an approval of a commit older than `headSha`, with that commit. */
+  olderApprovals(repo: string, number: number, headSha: string): Promise<Array<{ login: string; sha: string }>>;
   fileAtRef(repo: string, ref: string, path: string): Promise<string | null>;
   postGate(repo: string, headSha: string, passed: boolean, title: string, summary: string): Promise<void>;
   /** The merge queue of a branch: each queued PR with the commit GitHub tests it on. Empty when the branch has no queue. */
@@ -33,6 +35,11 @@ export interface GateDeps {
   /** Base branches judged besides the default branch. */
   branches?: string[];
   dryRun: boolean;
+  /**
+   * Whether `headSha` carries the same change as `oldSha` and the base did not move anything `governs` names. Absent:
+   * only approvals on the current commit count. Throws when it cannot tell.
+   */
+  sameChange?: (number: number, oldSha: string, headSha: string, governs: (path: string) => boolean) => Promise<boolean>;
 }
 
 function describe({ verdict, uncovered }: GateVerdict, approvers: string[], outside: string[], tooMany: boolean, moved: boolean): { title: string; summary: string } {
@@ -65,6 +72,34 @@ async function readPull(github: GatePort, repo: string, number: number, author: 
 }
 
 /**
+ * Team members, other than the author, whose latest verdict approves an older commit that carries the same change as
+ * `headSha`. Each answer is saved per pair of commits. A comparison that fails counts as not the same and is not saved.
+ */
+async function carriedApprovals(deps: GateDeps, repo: string, number: number, headSha: string, author: string, team: string[], governs: (path: string) => boolean): Promise<string[]> {
+  const lower = (s: string) => s.toLowerCase();
+  const members = new Set(team.map(lower));
+  const carried: string[] = [];
+  for (const { login, sha } of await deps.github.olderApprovals(repo, number, headSha)) {
+    const l = lower(login);
+    if (l === lower(author) || l === deps.falcon?.toLowerCase() || l.endsWith('[bot]') || !members.has(l)) continue;
+    // ponytail: one cursor per pair of commits, never removed; prune by age if the table ever matters.
+    const key = `gate-carry:${repo}:${sha}:${headSha}`;
+    let same = deps.store.cursor(key);
+    if (same === null) {
+      try {
+        same = String(await deps.sameChange!(number, sha, headSha, governs));
+        deps.store.setCursor(key, same);
+      } catch (error) {
+        deps.log.info({ repo, number, old: sha, head: headSha, err: String(error) }, 'merge gate: could not compare with an older approval');
+        continue;
+      }
+    }
+    if (same === 'true') carried.push(login);
+  }
+  return carried;
+}
+
+/**
  * One pass over the open PRs into the default branch (only those requested in Chat, unless `requested` is null). It judges the ones that changed since the last pass, and
  * all of them when the rules changed or half an hour has gone by, and posts the check when the decision differs
  * from the last one posted. Returns the number of checks posted.
@@ -81,9 +116,10 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   const pack = await github.fileAtRef(repo, branch, deps.repoPack);
   let team: string[] = [];
   let humanPaths: string[] = [];
+  let context = { required: [] as string[], instructionFiles: [] as string[] };
   try {
     // ponytail: the repository pack only; a comment-only list in the engine's central pack is not read here.
-    if (pack !== null) { const parsed = parsePolicy(pack, deps.repoPack); team = parsed.team.members; humanPaths = parsed.verdict.commentOnly; }
+    if (pack !== null) { const parsed = parsePolicy(pack, deps.repoPack); team = parsed.team.members; humanPaths = parsed.verdict.commentOnly; context = parsed.context; }
   } catch (error) {
     log.warn({ err: error, repo }, 'merge gate: the policy pack is invalid, so no team member counts');
   }
@@ -108,7 +144,16 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
       const read = await readPull(github, repo, p.number, p.author);
       if (!read.open || (read.baseRef !== branch && !extra.includes(read.baseRef))) continue; // Closed or retargeted since it was listed.
       // A PR that will not hold still gets a wait, never a skip: an old pass must not survive because the PR keeps moving.
-      const result: GateVerdict = !read.steady || read.files === null ? { verdict: 'wait', uncovered: [] } : gateVerdict({ files: read.files, team, humanPaths, approvers: read.approvers, falcon: deps.falcon });
+      let result: GateVerdict = !read.steady || read.files === null ? { verdict: 'wait', uncovered: [] } : gateVerdict({ files: read.files, team, humanPaths, approvers: read.approvers, falcon: deps.falcon });
+      // A team member's approval of an older commit counts when that commit carries the same change. Checked only
+      // when the gate would wait, because the comparison runs git.
+      if (result.verdict === 'wait' && read.steady && read.files !== null && deps.sameChange) {
+        const carried = await carriedApprovals(deps, repo, p.number, read.headSha, p.author, team, governedBy(read.files, deps.repoPack, context));
+        if (carried.length) {
+          read.approvers = [...read.approvers, ...carried].sort();
+          result = gateVerdict({ files: read.files, team, humanPaths, approvers: read.approvers, falcon: deps.falcon });
+        }
+      }
       // `moved` never equals a judged state, so the next pass posts the real verdict.
       const state = read.steady ? `${read.headSha}:${result.verdict}:${read.approvers.join(',')}:${result.uncovered.length}` : `${read.headSha}:moved`;
       const key = `gate:${repo}#${p.number}`;

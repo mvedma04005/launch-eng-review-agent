@@ -78,6 +78,14 @@ export class OctokitGitHub implements GitHubPort {
     return [...latest].filter(([, state]) => state === 'APPROVED').map(([login]) => login);
   }
 
+  /** People whose latest verdict, on any commit, is an approval of an older commit than `headSha`. A dismissed approval is not one. */
+  async olderApprovals(repo: string, number: number, headSha: string) {
+    const rows = await this.octokit.paginate(this.octokit.pulls.listReviews, { ...split(repo), pull_number: number, per_page: 100 });
+    const latest = new Map<string, { state: string; sha: string }>();
+    for (const r of rows) if (r.user && r.commit_id && r.state !== 'COMMENTED') latest.set(r.user.login, { state: r.state, sha: r.commit_id });
+    return [...latest].filter(([, v]) => v.state === 'APPROVED' && v.sha !== headSha).map(([login, v]) => ({ login, sha: v.sha }));
+  }
+
   async postReview(repo: string, number: number, headSha: string, review: Publishable) {
     const r = split(repo);
     const base = { ...r, pull_number: number, commit_id: headSha, event: review.event, body: review.body };

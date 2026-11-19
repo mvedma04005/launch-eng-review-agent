@@ -10,7 +10,7 @@ const PACK = 'version: 1\nname: repo\nteam: { members: [lee] }\n';
 const T0 = Date.parse('2026-11-10T12:00:00Z');
 const MINUTE = 60_000;
 
-interface Pull { number: number; headSha: string; baseRef: string; updatedAt: string; author: string; files: string[] | null; approvers: string[]; open?: boolean }
+interface Pull { number: number; headSha: string; baseRef: string; updatedAt: string; author: string; files: string[] | null; approvers: string[]; older?: Array<{ login: string; sha: string }>; open?: boolean }
 const pull = (number: number, over: Partial<Pull> = {}): Pull => ({ number, headSha: `sha${number}`, baseRef: 'main', updatedAt: `2026-11-10T10:00:0${number}Z`, author: 'sam', files: ['Orbit/a.py'], approvers: [], ...over });
 
 function fixture(pulls: Pull[], over: Partial<GateDeps> = {}, files: Record<string, string> = { '.github/CODEOWNERS': CODEOWNERS, '.falcon/policy.yaml': PACK }) {
@@ -30,6 +30,7 @@ function fixture(pulls: Pull[], over: Partial<GateDeps> = {}, files: Record<stri
       return p.files;
     },
     approvers: async (_repo, number) => find(number).approvers,
+    olderApprovals: async (_repo, number) => find(number).older ?? [],
     fileAtRef: async (_repo, ref, path) => (ref === 'main' ? files[path] ?? null : null),
     postGate: async (_repo, sha, passed, title, summary) => { posts.push({ sha, passed, title }); summaries.push(summary); },
     queueEntries: async (_repo, branch) => queue.filter((e) => e.branch === branch),
@@ -216,4 +217,47 @@ test('the gate names an approver who is not on the team list, so the author sees
   const g = fixture([pull(1, { approvers: ['oz', FALCON], files: ['.github/CODEOWNERS'] })]);
   await sweepGate(g.deps, REPO, T0);
   assert.match(g.summaries[0]!, /oz is not in the team list of the policy file, so that approval does not count here\./, 'Falcon is never named as an outsider');
+});
+
+test('an approval on an older commit counts when the change is the same, and the check runs once per pair of commits', async () => {
+  const calls: string[] = [];
+  let same = true;
+  const p = pull(1, { headSha: 'new1', older: [{ login: 'lee', sha: 'old1' }] });
+  const f = fixture([p], { sameChange: async (number, oldSha, headSha, governs) => {
+    calls.push(`${number}:${oldSha}:${headSha}`);
+    assert.ok(governs('Orbit/a.py') && governs('.falcon/policy.yaml') && governs('.github/CODEOWNERS') && !governs('ad-sentinel/x.py'));
+    return same;
+  } });
+  assert.equal(await sweepGate(f.deps, REPO, T0), 1);
+  assert.deepEqual(f.posts.at(-1), { sha: 'new1', passed: true, title: 'Approved by Launch Engineering or Falcon' });
+  await sweepGate(f.deps, REPO, T0 + 31 * MINUTE); // A full recheck reads the saved result.
+  assert.deepEqual(calls, ['1:old1:new1']);
+
+  same = false;
+  p.headSha = 'new2';
+  p.updatedAt = '2026-11-10T10:07:00Z';
+  await sweepGate(f.deps, REPO, T0 + 32 * MINUTE);
+  assert.deepEqual(f.posts.at(-1), { sha: 'new2', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' });
+});
+
+test('the gate compares only when it would wait, and only for team members other than the author', async () => {
+  const calls: string[] = [];
+  const sameChange = async (_n: number, oldSha: string) => { calls.push(oldSha); return true; };
+  const f = fixture([
+    pull(1, { approvers: ['lee'], older: [{ login: 'lee', sha: 'a' }] }),
+    pull(2, { older: [{ login: 'oz', sha: 'b' }, { login: FALCON, sha: 'c' }, { login: 'sam', sha: 'd' }] }),
+  ], { sameChange });
+  await sweepGate(f.deps, REPO, T0);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['sha1', true], ['sha2', false]]);
+});
+
+test('a failed comparison waits and is tried again on the next pass', async () => {
+  let fail = true;
+  const f = fixture([pull(1, { older: [{ login: 'lee', sha: 'old1' }] })], { sameChange: async () => { if (fail) throw new Error('git down'); return true; } });
+  await sweepGate(f.deps, REPO, T0);
+  assert.equal(f.posts.at(-1)?.passed, false);
+  fail = false;
+  await sweepGate(f.deps, REPO, T0 + 31 * MINUTE);
+  assert.equal(f.posts.at(-1)?.passed, true);
 });

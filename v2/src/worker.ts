@@ -8,7 +8,7 @@ import { Mirror } from './evidence/git.ts';
 import type { GitHubAuth } from './ingress/github.ts';
 import type { Logger } from './log.ts';
 import { metrics } from './metrics.ts';
-import { isGateFile } from './policy/gate.ts';
+import { governedBy, isGateFile } from './policy/gate.ts';
 import { minimatch } from './policy/glob.ts';
 import { applyPolicy, inScope, isTeamMember, loadPolicyFile, mergePolicies, overrideBy, parsePolicy } from './policy/load.ts';
 import { missingPlanSections } from './policy/plan.ts';
@@ -196,8 +196,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     const last = fresh || gateFile || humanPath || policy.verdict.mode !== 'approve' ? null : ctx.store.lastReview(job.repo, job.number, job.headSha);
     if (last?.event === 'APPROVE') {
       const prPaths = anchors.files.flatMap((f) => [f.path, f.oldPath]).filter((p): p is string => !!p);
-      const governs = (p: string) => prPaths.includes(p) || p === ctx.config.policy.repoPath || isGateFile(p) || policy.context.required.includes(p)
-        || (policy.context.instructionFiles.includes(basename(p)) && prPaths.some((f) => dirname(p) === '.' || f.startsWith(`${dirname(p)}/`)));
+      const governs = governedBy(prPaths, ctx.config.policy.repoPath, policy.context);
       const same = await sameChange(mirror, last, mergeBase, job.headSha, governs).catch((error) => { log.info({ last: last.headSha, err: String(error) }, 'could not compare with the last approval; reviewing in full'); return false; });
       if (same) return await carryApproval(last, meta);
     }
