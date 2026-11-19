@@ -261,3 +261,20 @@ test('a failed comparison waits and is tried again on the next pass', async () =
   await sweepGate(f.deps, REPO, T0 + 31 * MINUTE);
   assert.equal(f.posts.at(-1)?.passed, true);
 });
+
+test('the check names an approval carried from an older commit, and one that no longer counts', async () => {
+  let same = true;
+  const p = pull(1, { headSha: 'b'.repeat(40), older: [{ login: 'lee', sha: 'a'.repeat(40) }] });
+  const f = fixture([p], { sameChange: async () => same });
+  await sweepGate(f.deps, REPO, T0);
+  assert.equal(f.posts.at(-1)?.passed, true);
+  assert.match(f.summaries.at(-1)!, /Approved by lee on aaaaaaaaaaaa, an earlier commit with the same change\./);
+  assert.doesNotMatch(f.summaries.at(-1)!, /Nobody has approved/);
+
+  same = false;
+  p.headSha = 'c'.repeat(40);
+  p.updatedAt = '2026-11-10T10:07:00Z';
+  await sweepGate(f.deps, REPO, T0 + MINUTE);
+  assert.equal(f.posts.at(-1)?.passed, false);
+  assert.match(f.summaries.at(-1)!, /lee approved aaaaaaaaaaaa, but the change is different on this commit, so that approval does not count here\. Approve this commit again\./);
+});

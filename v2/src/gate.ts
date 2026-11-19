@@ -42,15 +42,21 @@ export interface GateDeps {
   sameChange?: (number: number, oldSha: string, headSha: string, governs: (path: string) => boolean) => Promise<boolean>;
 }
 
-function describe({ verdict, uncovered }: GateVerdict, approvers: string[], outside: string[], tooMany: boolean, moved: boolean): { title: string; summary: string } {
+type Older = Array<{ login: string; sha: string }>;
+
+function describe({ verdict, uncovered }: GateVerdict, approvers: string[], outside: string[], tooMany: boolean, moved: boolean, carried: Older = [], stale: Older = []): { title: string; summary: string } {
   // An approval GitHub shows but the gate does not count is the first thing an author asks about.
   const notCounted = outside.length ? ` ${outside.join(' and ')} ${outside.length === 1 ? 'is' : 'are'} not in the team list of the policy file, so ${outside.length === 1 ? 'that' : 'their'} approval does not count here.` : '';
-  const who = approvers.length ? `Approved on this commit by ${approvers.join(', ')}.${notCounted}` : 'Nobody has approved this commit yet.';
+  const short = (sha: string) => sha.slice(0, 12);
+  // An approval of an earlier commit is named with that commit, so nobody reads it as an approval of this one.
+  const earlier = carried.map((c) => ` Approved by ${c.login} on ${short(c.sha)}, an earlier commit with the same change.`).join('')
+    + stale.map((c) => ` ${c.login} approved ${short(c.sha)}, but the change is different on this commit, so that approval does not count here. Approve this commit again.`).join('');
+  const who = (approvers.length ? `Approved on this commit by ${approvers.join(', ')}.${notCounted}` : carried.length ? '' : 'Nobody has approved this commit yet.') + earlier;
   const list = uncovered.slice(0, 10).map((f) => `\`${f}\``).join(', ') + (uncovered.length > 10 ? ` and ${uncovered.length - 10} more` : '');
-  if (verdict === 'pass') return { title: 'Approved by Launch Engineering or Falcon', summary: `${who} A team member or Falcon approved this commit.` };
+  if (verdict === 'pass') return { title: 'Approved by Launch Engineering or Falcon', summary: `${who.trim()} A team member or Falcon approved ${carried.length && !approvers.length ? 'this change' : 'this commit'}.` };
   if (moved) return { title: 'Waiting: the PR changed while it was being checked', summary: 'The PR was pushed to or edited during the check. It is checked again on the next pass.' };
   if (tooMany) return { title: 'Waiting: too many files to check', summary: 'This PR changes more files than GitHub lists, so the list of files may be incomplete. Split the PR.' };
-  return { title: 'Waiting for Launch Engineering or Falcon to approve', summary: `${who} Still needs an approval from a team member, or from Falcon where Falcon may approve, for: ${list || 'this change'}.` };
+  return { title: 'Waiting for Launch Engineering or Falcon to approve', summary: `${who.trim()} Still needs an approval from a team member, or from Falcon where Falcon may approve, for: ${list || 'this change'}.` };
 }
 
 /**
@@ -75,10 +81,11 @@ async function readPull(github: GatePort, repo: string, number: number, author: 
  * Team members, other than the author, whose latest verdict approves an older commit that carries the same change as
  * `headSha`. Each answer is saved per pair of commits. A comparison that fails counts as not the same and is not saved.
  */
-async function carriedApprovals(deps: GateDeps, repo: string, number: number, headSha: string, author: string, team: string[], governs: (path: string) => boolean): Promise<string[]> {
+async function carriedApprovals(deps: GateDeps, repo: string, number: number, headSha: string, author: string, team: string[], governs: (path: string) => boolean): Promise<{ carried: Older; stale: Older }> {
   const lower = (s: string) => s.toLowerCase();
   const members = new Set(team.map(lower));
-  const carried: string[] = [];
+  const carried: Older = [];
+  const stale: Older = [];
   for (const { login, sha } of await deps.github.olderApprovals(repo, number, headSha)) {
     const l = lower(login);
     if (l === lower(author) || l === deps.falcon?.toLowerCase() || l.endsWith('[bot]') || !members.has(l)) continue;
@@ -94,9 +101,9 @@ async function carriedApprovals(deps: GateDeps, repo: string, number: number, he
         continue;
       }
     }
-    if (same === 'true') carried.push(login);
+    (same === 'true' ? carried : stale).push({ login, sha });
   }
-  return carried;
+  return { carried, stale };
 }
 
 /**
@@ -147,19 +154,18 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
       let result: GateVerdict = !read.steady || read.files === null ? { verdict: 'wait', uncovered: [] } : gateVerdict({ files: read.files, team, humanPaths, approvers: read.approvers, falcon: deps.falcon });
       // A team member's approval of an older commit counts when that commit carries the same change. Checked only
       // when the gate would wait, because the comparison runs git.
+      let older: { carried: Older; stale: Older } = { carried: [], stale: [] };
       if (result.verdict === 'wait' && read.steady && read.files !== null && deps.sameChange) {
-        const carried = await carriedApprovals(deps, repo, p.number, read.headSha, p.author, team, governedBy(read.files, deps.repoPack, context));
-        if (carried.length) {
-          read.approvers = [...read.approvers, ...carried].sort();
-          result = gateVerdict({ files: read.files, team, humanPaths, approvers: read.approvers, falcon: deps.falcon });
-        }
+        older = await carriedApprovals(deps, repo, p.number, read.headSha, p.author, team, governedBy(read.files, deps.repoPack, context));
+        if (older.carried.length) result = gateVerdict({ files: read.files, team, humanPaths, approvers: [...read.approvers, ...older.carried.map((c) => c.login)], falcon: deps.falcon });
       }
       // `moved` never equals a judged state, so the next pass posts the real verdict.
-      const state = read.steady ? `${read.headSha}:${result.verdict}:${read.approvers.join(',')}:${result.uncovered.length}` : `${read.headSha}:moved`;
+      const olderState = [...older.carried, ...older.stale.map((c) => ({ ...c, login: `-${c.login}` }))].map((c) => c.login).join(',');
+      const state = read.steady ? `${read.headSha}:${result.verdict}:${read.approvers.join(',')}:${result.uncovered.length}${olderState ? `:${olderState}` : ''}` : `${read.headSha}:moved`;
       const key = `gate:${repo}#${p.number}`;
       if (store.cursor(key) !== state) {
         const outside = read.approvers.filter((a) => a.toLowerCase() !== deps.falcon?.toLowerCase() && !team.some((t) => t.toLowerCase() === a.toLowerCase()));
-        const { title, summary } = describe(result, read.approvers, outside, read.files === null, !read.steady);
+        const { title, summary } = describe(result, read.approvers, outside, read.files === null, !read.steady, older.carried, older.stale);
         log.info({ repo, number: p.number, head: read.headSha, verdict: result.verdict, steady: read.steady, approvers: read.approvers, dryRun: deps.dryRun }, 'merge gate decided');
         if (!deps.dryRun) {
           await github.postGate(repo, read.headSha, result.verdict === 'pass', title, summary);
