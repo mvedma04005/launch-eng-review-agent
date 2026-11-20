@@ -155,9 +155,11 @@ test('a finished review survives publication failures and is republished without
   const calls = { n: 0 };
   const config = configFor(root);
   const ctx: WorkerContext = { config, store, auth, anthropic: {} as Anthropic, reviewer: fakeReviewer([{ path: 'svc.py', line: 2, evidence: 'user.name', severity: 'high' }], calls), log, dryRun: false, githubFor: async () => github };
-  const { job } = store.enqueue({ repo: 'acme/demo', number: 3, headSha, baseSha, baseRef: 'main', trigger: 'poll', receivedAt: 'now' });
+  // Queued on a base that moved before the review read it: the review reads `baseSha`, and that is the base it saves.
+  const { job } = store.enqueue({ repo: 'acme/demo', number: 3, headSha, baseSha: 'f'.repeat(40), baseRef: 'main', trigger: 'poll', receivedAt: 'now' });
   const first = await processJob(ctx, store.claim('t', 60, { perRepo: 1, global: 1 })!, 't');
   assert.equal(first.status, 'deferred');
+  github.meta = { ...github.meta, baseSha: 'e'.repeat(40) }; // The base moves again before the retry publishes.
   assert.match(first.reason!, /publication retry 1/);
   assert.equal(store.job(job.id)?.status, 'queued');
   assert.ok(store.pending(store.job(job.id)!), 'the rendered review is retained');
@@ -168,6 +170,7 @@ test('a finished review survives publication failures and is republished without
   assert.equal(calls.n, 1, 'the model ran once');
   assert.equal(github.posted.length, 1);
   assert.equal(store.job(job.id)?.status, 'published');
+  assert.equal(store.lastReview('acme/demo', 3, '')?.baseSha, baseSha, 'the base the review read, not the queue-time base or the base at the retry');
 });
 
 test('worker holds on failed CI, defers on pending CI, and skips drafts without touching git', async () => {

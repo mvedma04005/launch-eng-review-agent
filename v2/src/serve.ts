@@ -55,10 +55,11 @@ export async function serve(config: Config, signal: AbortSignal): Promise<void> 
         const mirror = new Mirror(config.stateDir, repo, `https://github.com/${repo}.git`, () => ctx.auth.gitTokenFor(repo));
         // The same comparison the worker uses for Falcon's own approvals: the head from where it left its base now, the
         // old commit from the base it was approved on (from today's base when that is unknown).
-        const same = async (number: number, oldSha: string, headSha: string, governs: (path: string) => boolean, oldBase?: string) => {
+        const same = async (number: number, oldSha: string, headSha: string, governs: (path: string) => boolean, oldBase?: string, judgedRef?: string) => {
           await mirror.ensure();
           await mirror.fetchCommit(headSha);
-          const { baseRef } = await github.pullState(repo, number);
+          // The base branch the gate judged, so the answer matches the key it is saved under.
+          const baseRef = judgedRef ?? (await github.pullState(repo, number)).baseRef;
           const mergeBase = await mirror.mergeBase(await mirror.fetchBranchTip(number, baseRef), headSha);
           return sameChange(mirror, { headSha: oldSha, baseSha: oldBase ?? mergeBase }, mergeBase, headSha, governs);
         };

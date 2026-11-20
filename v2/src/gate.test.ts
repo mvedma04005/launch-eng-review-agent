@@ -282,6 +282,15 @@ test("Falcon's approval of an older commit counts while it is Falcon's latest re
   assert.deepEqual(calls, ['old1:new1:stackbase']);
 });
 
+test("Falcon's older approval does not carry when Falcon's recorded review is of another commit", async () => {
+  const calls: string[] = [];
+  const f = fixture([pull(1, { headSha: 'new1', older: [{ login: FALCON, sha: 'old1' }] })], { sameChange: async (_n, oldSha) => { calls.push(oldSha); return true; } });
+  f.deps.store.lastReview = () => ({ headSha: 'other', baseSha: 'b', event: 'APPROVE' });
+  await sweepGate(f.deps, REPO, T0);
+  assert.deepEqual(calls, []);
+  assert.equal(f.posts.at(-1)?.passed, false);
+});
+
 test('a carried approval is compared again when the PR moves to another base', async () => {
   const calls: string[] = [];
   const p = pull(1, { headSha: 'new1', older: [{ login: 'lee', sha: 'old1' }] });

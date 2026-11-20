@@ -78,9 +78,9 @@ export function secondsUntilNextUtcDay(now = new Date()): number {
 }
 
 /** Converts a rendered review into the durable form that publication retries and operator replay work from. */
-export function toPending(rendered: RenderedReview, headSha: string, summary: string, chat: string): PendingPublication {
+export function toPending(rendered: RenderedReview, headSha: string, summary: string, chat: string, baseSha?: string): PendingPublication {
   return {
-    headSha, event: rendered.event, body: rendered.body, comments: rendered.comments, checkConclusion: rendered.checkConclusion,
+    headSha, ...(baseSha ? { baseSha } : {}), event: rendered.event, body: rendered.body, comments: rendered.comments, checkConclusion: rendered.checkConclusion,
     blockingCount: rendered.blocking.length, overridden: rendered.overridden, ...(rendered.notApproved ? { notApprovedTitle: rendered.notApproved.title } : {}), summary, chat, attempts: 0, renderedAt: new Date().toISOString(),
   };
 }
@@ -257,7 +257,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     const rendered = sanitize(renderReview(policy, meta, finalOutput, anchors, prior, override), redactor);
     // The reason leads the check summary, where the author looks first. Chat gets the short form: findings and the next step.
     const toPublish = toPending(rendered, job.headSha, boundBytes(redactor.apply(`${rendered.notApproved ? `${rendered.notApproved.why}\n\n` : ''}${finalOutput.summary}`), LIMITS.summary),
-      boundBytes(redactor.apply(`${lead}${rendered.brief}`), LIMITS.summary));
+      boundBytes(redactor.apply(`${lead}${rendered.brief}`), LIMITS.summary), meta.baseSha);
     ctx.store.recordFindings(job, kept);
     ctx.store.savePending(job.id, toPublish);
     phase('render');
@@ -292,7 +292,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
     const short = last.headSha.slice(0, 12);
     const why = `This commit makes the same change as ${short}, which Falcon approved${last.reviewUrl ? ` (${last.reviewUrl})` : ''}. The branch moved onto a newer ${meta.baseRef}, and that did not change this PR's files or the review rules. Falcon did not review it again.`;
     const pendingReview: PendingPublication = {
-      headSha: job.headSha, event: 'APPROVE', comments: [], checkConclusion: 'success', blockingCount: 0, overridden: false,
+      headSha: job.headSha, baseSha: meta.baseSha, event: 'APPROVE', comments: [], checkConclusion: 'success', blockingCount: 0, overridden: false,
       body: `### Falcon review: Approved, same change as ${short}\n\n${why}\n${marker(job.repo, job.number, job.headSha)}`,
       summary: why, chat: `Same change as ${last.headSha.slice(0, 8)}, which Falcon approved. Approved again without a new review.`, attempts: 0, renderedAt: new Date().toISOString(),
     };
@@ -320,7 +320,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
       for (const [findingId, commentId] of posted.commentIds) ctx.store.setFindingComment(findingId, commentId);
       const title = pendingReview.blockingCount ? `${pendingReview.blockingCount} blocking finding(s)` : pendingReview.overridden ? 'Blocking findings overridden' : pendingReview.event === 'APPROVE' ? 'Approved' : pendingReview.notApprovedTitle ?? 'No blocking findings';
       const check = checksEnabled ? await github.completeCheckRun(job.repo, job.headSha, checkId, pendingReview.checkConclusion, title, pendingReview.summary, posted.htmlUrl) : null;
-      ctx.store.recordReview(job.id, { githubReviewId: posted.id, checkRunId: check, event: pendingReview.event, marker: pendingReview.body.split('\n').at(-1)!, baseSha: meta.baseSha });
+      ctx.store.recordReview(job.id, { githubReviewId: posted.id, checkRunId: check, event: pendingReview.event, marker: pendingReview.body.split('\n').at(-1)!, baseSha: pendingReview.baseSha });
       ctx.store.finish(job.id, 'published', { result: { reviewUrl: posted.htmlUrl, event: pendingReview.event, inlineDropped: posted.inlineDropped } });
       metrics.jobsFinished.inc({ repo: job.repo, outcome: 'published' });
       metrics.reviewsPublished.inc({ repo: job.repo, event: pendingReview.event });

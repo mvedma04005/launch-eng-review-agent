@@ -161,6 +161,8 @@ export interface ReviewStep {
 /** A finished review waiting to be published; retried without another model run. */
 export interface PendingPublication {
   headSha: string;
+  /** The base the review read. Saved with the published review, so a retry after the base moved keeps it. Absent on reviews rendered before this field existed. */
+  baseSha?: string;
   event: 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT';
   body: string;
   comments: Array<{ path: string; line: number; side: Side; body: string; findingId: string }>;

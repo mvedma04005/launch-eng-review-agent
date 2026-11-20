@@ -45,7 +45,7 @@ export interface GateDeps {
    * is the base `oldSha` was approved on, when known. Absent: only approvals on the current commit count. Throws when it
    * cannot tell.
    */
-  sameChange?: (number: number, oldSha: string, headSha: string, governs: (path: string) => boolean, oldBase?: string) => Promise<boolean>;
+  sameChange?: (number: number, oldSha: string, headSha: string, governs: (path: string) => boolean, oldBase?: string, baseRef?: string) => Promise<boolean>;
 }
 
 type Older = Array<{ login: string; sha: string }>;
@@ -107,7 +107,7 @@ async function carriedApprovals(deps: GateDeps, repo: string, number: number, he
     let same = deps.store.cursor(key);
     if (same === null) {
       try {
-        same = String(await deps.sameChange!(number, sha, headSha, governs, base));
+        same = String(await deps.sameChange!(number, sha, headSha, governs, base, baseRef));
         deps.store.setCursor(key, same);
       } catch (error) {
         deps.log.info({ repo, number, old: sha, head: headSha, err: String(error) }, 'merge gate: could not compare with an older approval');

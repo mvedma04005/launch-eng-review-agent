@@ -321,7 +321,7 @@ export class Store {
   }
 
   /** `baseSha`: the base the review read, which can differ from the base at queue time; `lastReview` returns it. */
-  recordReview(jobId: string, review: { githubReviewId: number | null; checkRunId: number | null; event: string; marker: string; baseSha?: string }): void {
+  recordReview(jobId: string, review: { githubReviewId: number | null; checkRunId: number | null; event: string; marker: string; baseSha?: string | undefined }): void {
     this.db.prepare('insert into reviews(job_id, github_review_id, check_run_id, event, marker, posted_at) values(?,?,?,?,?,?)')
       .run(jobId, review.githubReviewId, review.checkRunId, review.event, review.marker, now());
     if (review.baseSha) this.db.prepare('update jobs set base_sha=? where id=?').run(review.baseSha, jobId);
