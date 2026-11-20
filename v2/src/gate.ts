@@ -24,7 +24,12 @@ export interface GatePort {
 
 export interface GateDeps {
   github: GatePort;
-  store: { cursor(key: string): string | null; setCursor(key: string, value: string): void };
+  store: {
+    cursor(key: string): string | null;
+    setCursor(key: string, value: string): void;
+    /** Falcon's latest review of a PR on any commit except `excludeHead`, with the base it saved. Absent: Falcon's own approvals never carry. */
+    lastReview?(repo: string, number: number, excludeHead: string): { headSha: string; baseSha: string; event: string } | null;
+  };
   log: Logger;
   /** Falcon's own login, or null when it is unknown. */
   falcon: string | null;
@@ -36,10 +41,11 @@ export interface GateDeps {
   branches?: string[];
   dryRun: boolean;
   /**
-   * Whether `headSha` carries the same change as `oldSha` and the base did not move anything `governs` names. Absent:
-   * only approvals on the current commit count. Throws when it cannot tell.
+   * Whether `headSha` carries the same change as `oldSha` and the base did not move anything `governs` names. `oldBase`
+   * is the base `oldSha` was approved on, when known. Absent: only approvals on the current commit count. Throws when it
+   * cannot tell.
    */
-  sameChange?: (number: number, oldSha: string, headSha: string, governs: (path: string) => boolean) => Promise<boolean>;
+  sameChange?: (number: number, oldSha: string, headSha: string, governs: (path: string) => boolean, oldBase?: string) => Promise<boolean>;
 }
 
 type Older = Array<{ login: string; sha: string }>;
@@ -78,23 +84,29 @@ async function readPull(github: GatePort, repo: string, number: number, author: 
 }
 
 /**
- * Team members, other than the author, whose latest verdict approves an older commit that carries the same change as
- * `headSha`. Each answer is saved per pair of commits. A comparison that fails counts as not the same and is not saved.
+ * Team members, other than the author, and Falcon, whose latest verdict approves an older commit that carries the same
+ * change as `headSha`. Each answer is saved per pair of commits. A comparison that fails counts as not the same and is
+ * not saved.
  */
 async function carriedApprovals(deps: GateDeps, repo: string, number: number, headSha: string, author: string, team: string[], governs: (path: string) => boolean): Promise<{ carried: Older; stale: Older }> {
   const lower = (s: string) => s.toLowerCase();
   const members = new Set(team.map(lower));
   const carried: Older = [];
   const stale: Older = [];
+  // Falcon's approval carries only while it is Falcon's latest review on any commit: a later comment-only review of
+  // the new head ends it. It is measured from the base Falcon saved, which is the branch below for a stacked PR.
+  const last = deps.store.lastReview?.(repo, number, '') ?? null;
   for (const { login, sha } of await deps.github.olderApprovals(repo, number, headSha)) {
     const l = lower(login);
-    if (l === lower(author) || l === deps.falcon?.toLowerCase() || l.endsWith('[bot]') || !members.has(l)) continue;
-    // ponytail: one cursor per pair of commits, never removed; prune by age if the table ever matters.
-    const key = `gate-carry:${repo}:${sha}:${headSha}`;
+    const falcon = l === deps.falcon?.toLowerCase();
+    if (falcon ? !(last?.event === 'APPROVE' && last.headSha === sha) : l === lower(author) || l.endsWith('[bot]') || !members.has(l)) continue;
+    const base = falcon ? last!.baseSha : undefined;
+    // ponytail: one cursor per pair of commits and base, never removed; prune by age if the table ever matters.
+    const key = `gate-carry:${repo}:${sha}:${headSha}${base ? `:${base}` : ''}`;
     let same = deps.store.cursor(key);
     if (same === null) {
       try {
-        same = String(await deps.sameChange!(number, sha, headSha, governs));
+        same = String(await deps.sameChange!(number, sha, headSha, governs, base));
         deps.store.setCursor(key, same);
       } catch (error) {
         deps.log.info({ repo, number, old: sha, head: headSha, err: String(error) }, 'merge gate: could not compare with an older approval');

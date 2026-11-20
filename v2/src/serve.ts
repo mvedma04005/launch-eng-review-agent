@@ -53,13 +53,14 @@ export async function serve(config: Config, signal: AbortSignal): Promise<void> 
       for (const repo of config.github.repos) {
         const github = new OctokitGitHub(await ctx.auth.octokitFor(repo), await ctx.auth.botLogin());
         const mirror = new Mirror(config.stateDir, repo, `https://github.com/${repo}.git`, () => ctx.auth.gitTokenFor(repo));
-        // The same comparison the worker uses for Falcon's own approvals: both commits measured from where they left main.
-        const same = async (number: number, oldSha: string, headSha: string, governs: (path: string) => boolean) => {
+        // The same comparison the worker uses for Falcon's own approvals: the head from where it left its base now, the
+        // old commit from the base it was approved on (from today's base when that is unknown).
+        const same = async (number: number, oldSha: string, headSha: string, governs: (path: string) => boolean, oldBase?: string) => {
           await mirror.ensure();
           await mirror.fetchCommit(headSha);
           const { baseRef } = await github.pullState(repo, number);
           const mergeBase = await mirror.mergeBase(await mirror.fetchBranchTip(number, baseRef), headSha);
-          return sameChange(mirror, { headSha: oldSha, baseSha: mergeBase }, mergeBase, headSha, governs);
+          return sameChange(mirror, { headSha: oldSha, baseSha: oldBase ?? mergeBase }, mergeBase, headSha, governs);
         };
         await sweepGate({ github, store, log, falcon: await ctx.auth.botLogin(), repoPack: config.policy.repoPath, requested: config.gate.everyPull ? null : store.chatRequestedPulls(repo), branches: config.gate.branches, dryRun: config.dryRun, sameChange: same }, repo);
       }

@@ -262,6 +262,26 @@ test('a failed comparison waits and is tried again on the next pass', async () =
   assert.equal(f.posts.at(-1)?.passed, true);
 });
 
+test("Falcon's approval of an older commit counts while it is Falcon's latest review, measured from the base Falcon saved", async () => {
+  const calls: string[] = [];
+  let last = { headSha: 'old1', baseSha: 'stackbase', event: 'APPROVE' };
+  const p = pull(1, { headSha: 'new1', older: [{ login: FALCON, sha: 'old1' }] });
+  const f = fixture([p], { sameChange: async (_n, oldSha, headSha, _governs, oldBase) => { calls.push(`${oldSha}:${headSha}:${oldBase}`); return true; } });
+  f.deps.store.lastReview = () => last;
+  await sweepGate(f.deps, REPO, T0);
+  assert.deepEqual(calls, ['old1:new1:stackbase']);
+  assert.deepEqual(f.posts.at(-1), { sha: 'new1', passed: true, title: 'Approved by Launch Engineering or Falcon' });
+  assert.match(f.summaries.at(-1)!, /Approved by falcon-review\[bot\] on old1, an earlier commit with the same change\./);
+
+  // Falcon reviewed the new head and did not approve it: its older approval no longer carries.
+  last = { headSha: 'new2', baseSha: 'main1', event: 'COMMENT' };
+  p.headSha = 'new2';
+  p.updatedAt = '2026-11-10T10:07:00Z';
+  await sweepGate(f.deps, REPO, T0 + MINUTE);
+  assert.equal(f.posts.at(-1)?.passed, false);
+  assert.deepEqual(calls, ['old1:new1:stackbase']);
+});
+
 test('the check names an approval carried from an older commit, and one that no longer counts', async () => {
   let same = true;
   const p = pull(1, { headSha: 'b'.repeat(40), older: [{ login: 'lee', sha: 'a'.repeat(40) }] });
