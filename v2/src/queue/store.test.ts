@@ -90,3 +90,10 @@ test('pending publications and tool-call steps round-trip', () => {
   assert.equal(store.failedSince('1970-01-01T00:00:00Z'), 1);
   assert.equal(store.lastProgressAt(), null, 'failed is not progress');
 });
+
+test('a published review keeps the base it was reviewed against, not the base at queue time', () => {
+  const store = new Store(':memory:');
+  const { job } = store.enqueue(req());
+  store.recordReview(job.id, { githubReviewId: 1, checkRunId: null, event: 'APPROVE', marker: 'm', baseSha: 'd'.repeat(40) });
+  assert.equal(store.lastReview('ROKT/x', 1, '')?.baseSha, 'd'.repeat(40));
+});

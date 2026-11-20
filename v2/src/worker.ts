@@ -320,7 +320,7 @@ export async function processJob(ctx: WorkerContext, job: Job, owner: string): P
       for (const [findingId, commentId] of posted.commentIds) ctx.store.setFindingComment(findingId, commentId);
       const title = pendingReview.blockingCount ? `${pendingReview.blockingCount} blocking finding(s)` : pendingReview.overridden ? 'Blocking findings overridden' : pendingReview.event === 'APPROVE' ? 'Approved' : pendingReview.notApprovedTitle ?? 'No blocking findings';
       const check = checksEnabled ? await github.completeCheckRun(job.repo, job.headSha, checkId, pendingReview.checkConclusion, title, pendingReview.summary, posted.htmlUrl) : null;
-      ctx.store.recordReview(job.id, { githubReviewId: posted.id, checkRunId: check, event: pendingReview.event, marker: pendingReview.body.split('\n').at(-1)! });
+      ctx.store.recordReview(job.id, { githubReviewId: posted.id, checkRunId: check, event: pendingReview.event, marker: pendingReview.body.split('\n').at(-1)!, baseSha: meta.baseSha });
       ctx.store.finish(job.id, 'published', { result: { reviewUrl: posted.htmlUrl, event: pendingReview.event, inlineDropped: posted.inlineDropped } });
       metrics.jobsFinished.inc({ repo: job.repo, outcome: 'published' });
       metrics.reviewsPublished.inc({ repo: job.repo, event: pendingReview.event });

@@ -85,24 +85,25 @@ async function readPull(github: GatePort, repo: string, number: number, author: 
 
 /**
  * Team members, other than the author, and Falcon, whose latest verdict approves an older commit that carries the same
- * change as `headSha`. Each answer is saved per pair of commits. A comparison that fails counts as not the same and is
- * not saved.
+ * change as `headSha`. Each answer is saved per pair of commits and base branch, so a retarget compares again. A
+ * comparison that fails counts as not the same and is not saved.
  */
-async function carriedApprovals(deps: GateDeps, repo: string, number: number, headSha: string, author: string, team: string[], governs: (path: string) => boolean): Promise<{ carried: Older; stale: Older }> {
+async function carriedApprovals(deps: GateDeps, repo: string, number: number, headSha: string, baseRef: string, author: string, team: string[], governs: (path: string) => boolean): Promise<{ carried: Older; stale: Older }> {
   const lower = (s: string) => s.toLowerCase();
   const members = new Set(team.map(lower));
   const carried: Older = [];
   const stale: Older = [];
-  // Falcon's approval carries only while it is Falcon's latest review on any commit: a later comment-only review of
-  // the new head ends it. It is measured from the base Falcon saved, which is the branch below for a stacked PR.
+  // GitHub lists Falcon only while its latest review on any commit is that approval: a later comment-only review ends
+  // it. The store gives the base Falcon reviewed against, which is the branch below for a stacked PR; with no record
+  // of that exact review, nothing carries.
   const last = deps.store.lastReview?.(repo, number, '') ?? null;
   for (const { login, sha } of await deps.github.olderApprovals(repo, number, headSha)) {
     const l = lower(login);
     const falcon = l === deps.falcon?.toLowerCase();
     if (falcon ? !(last?.event === 'APPROVE' && last.headSha === sha) : l === lower(author) || l.endsWith('[bot]') || !members.has(l)) continue;
     const base = falcon ? last!.baseSha : undefined;
-    // ponytail: one cursor per pair of commits and base, never removed; prune by age if the table ever matters.
-    const key = `gate-carry:${repo}:${sha}:${headSha}${base ? `:${base}` : ''}`;
+    // ponytail: one cursor per pair of commits, base branch and saved base, never removed; prune by age if the table ever matters.
+    const key = `gate-carry:${repo}:${sha}:${headSha}:${baseRef}${base ? `:${base}` : ''}`;
     let same = deps.store.cursor(key);
     if (same === null) {
       try {
@@ -168,7 +169,7 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
       // when the gate would wait, because the comparison runs git.
       let older: { carried: Older; stale: Older } = { carried: [], stale: [] };
       if (result.verdict === 'wait' && read.steady && read.files !== null && deps.sameChange) {
-        older = await carriedApprovals(deps, repo, p.number, read.headSha, p.author, team, governedBy(read.files, deps.repoPack, context));
+        older = await carriedApprovals(deps, repo, p.number, read.headSha, read.baseRef, p.author, team, governedBy(read.files, deps.repoPack, context));
         if (older.carried.length) result = gateVerdict({ files: read.files, team, humanPaths, approvers: [...read.approvers, ...older.carried.map((c) => c.login)], falcon: deps.falcon });
       }
       // `moved` never equals a judged state, so the next pass posts the real verdict.

@@ -63,3 +63,12 @@ test('ci: a check pending for longer than the limit is stalled and holds nothing
   assert.equal(await github([green], [{ name: 'build', status: 'in_progress', conclusion: null, started_at: ago(3 * HOUR) }]).ci('acme/demo', HEAD, HOUR), 'success', 'a check run stuck in progress is stalled too');
   assert.equal(await github([green], [{ name: 'build', status: 'in_progress', conclusion: null, started_at: ago(60_000) }]).ci('acme/demo', HEAD, HOUR), 'pending');
 });
+
+test("olderApprovals: a person's later comment keeps their approval; Falcon's later comment ends Falcon's", async () => {
+  const OLD = 'o'.repeat(40);
+  const rows = [review('lee', 'APPROVED', OLD), review('lee', 'COMMENTED'), review('falcon[bot]', 'APPROVED', OLD), review('falcon[bot]', 'COMMENTED'), review('oz', 'APPROVED', OLD)];
+  const octokit = { paginate: async () => rows, pulls: { listReviews: {} } } as unknown as Octokit;
+  assert.deepEqual((await new OctokitGitHub(octokit, 'falcon[bot]').olderApprovals('acme/demo', 3, HEAD)).map((x) => x.login), ['lee', 'oz']);
+  rows.splice(3, 1);
+  assert.deepEqual((await new OctokitGitHub(octokit, 'falcon[bot]').olderApprovals('acme/demo', 3, HEAD)).map((x) => x.login), ['lee', 'falcon[bot]', 'oz']);
+});

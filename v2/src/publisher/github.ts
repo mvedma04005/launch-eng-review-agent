@@ -82,7 +82,9 @@ export class OctokitGitHub implements GitHubPort {
   async olderApprovals(repo: string, number: number, headSha: string) {
     const rows = await this.octokit.paginate(this.octokit.pulls.listReviews, { ...split(repo), pull_number: number, per_page: 100 });
     const latest = new Map<string, { state: string; sha: string }>();
-    for (const r of rows) if (r.user && r.commit_id && r.state !== 'COMMENTED') latest.set(r.user.login, { state: r.state, sha: r.commit_id });
+    // A person's comment never changes their verdict. Falcon's comment-only review is its verdict on that commit, so a
+    // later one ends Falcon's older approval.
+    for (const r of rows) if (r.user && r.commit_id && (r.state !== 'COMMENTED' || r.user.login === this.botLogin)) latest.set(r.user.login, { state: r.state, sha: r.commit_id });
     return [...latest].filter(([, v]) => v.state === 'APPROVED' && v.sha !== headSha).map(([login, v]) => ({ login, sha: v.sha }));
   }
 

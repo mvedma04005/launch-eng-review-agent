@@ -282,6 +282,16 @@ test("Falcon's approval of an older commit counts while it is Falcon's latest re
   assert.deepEqual(calls, ['old1:new1:stackbase']);
 });
 
+test('a carried approval is compared again when the PR moves to another base', async () => {
+  const calls: string[] = [];
+  const p = pull(1, { headSha: 'new1', older: [{ login: 'lee', sha: 'old1' }] });
+  const f = fixture([p], { branches: ['release'], sameChange: async (_n, oldSha, headSha) => { calls.push(`${oldSha}:${headSha}`); return true; } });
+  await sweepGate(f.deps, REPO, T0);
+  Object.assign(p, { baseRef: 'release', updatedAt: '2026-11-10T10:07:00Z' });
+  await sweepGate(f.deps, REPO, T0 + MINUTE);
+  assert.deepEqual(calls, ['old1:new1', 'old1:new1']);
+});
+
 test('the check names an approval carried from an older commit, and one that no longer counts', async () => {
   let same = true;
   const p = pull(1, { headSha: 'b'.repeat(40), older: [{ login: 'lee', sha: 'a'.repeat(40) }] });
