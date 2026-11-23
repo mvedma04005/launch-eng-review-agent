@@ -200,3 +200,6 @@ export interface ChatRequest {
   updatedAt: string;
   note: string | null;
 }
+
+/** What the gate saw of a PR at one moment: its head, its base branch and tip, and their merge base. */
+export interface GateObservation { repo: string; number: number; atMs: number; headSha: string; baseRef: string; baseSha: string; mergeBase: string }

@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { ChatRequest, Finding, FindingOutcome, Job, JobStatus, Lesson, PendingPublication, ReviewRequest, ReviewStep, Usage } from '../types.ts';
+import type { ChatRequest, Finding, FindingOutcome, GateObservation, Job, JobStatus, Lesson, PendingPublication, ReviewRequest, ReviewStep, Usage } from '../types.ts';
 
 const SCHEMA = `
 pragma journal_mode = WAL;
@@ -37,6 +37,8 @@ create table if not exists lessons(
   id text primary key, repo text not null, path_prefix text not null default '', text text not null, source_finding_id text,
   confidence real not null, uses integer not null default 0, created_at text not null, last_used_at text, retired_at text);
 create index if not exists lessons_repo on lessons(repo, retired_at);
+create table if not exists gate_observations(repo text not null, number integer not null, at_ms integer not null, head_sha text not null, base_ref text not null, base_sha text not null, merge_base text not null);
+create index if not exists gate_observations_pr on gate_observations(repo, number, at_ms);
 create table if not exists cursors(key text primary key, value text not null);
 create table if not exists chat_requests(
   id text primary key, message_name text not null unique, space text not null, thread text not null, sender text not null,
@@ -291,12 +293,33 @@ export class Store {
 
   /** The head of the newest review posted on an earlier commit of this PR, or null on a first review. */
   /** Falcon's last posted review of a PR at another commit, with the commit and base it read. */
-  lastReview(repo: string, number: number, excludeHead: string): { jobId: string; headSha: string; baseSha: string; event: string; reviewUrl: string | null } | null {
-    const row = this.db.prepare('select j.id, j.head_sha, j.base_sha, r.event, j.result_json from reviews r join jobs j on j.id=r.job_id where j.repo=? and j.number=? and j.head_sha<>? order by r.posted_at desc, r.id desc limit 1')
-      .get(repo, number, excludeHead) as { id: string; head_sha: string; base_sha: string; event: string; result_json: string | null } | undefined;
+  lastReview(repo: string, number: number, excludeHead: string): { jobId: string; headSha: string; baseSha: string; baseRef: string; event: string; reviewUrl: string | null } | null {
+    const row = this.db.prepare('select j.id, j.head_sha, j.base_sha, j.base_ref, r.event, j.result_json from reviews r join jobs j on j.id=r.job_id where j.repo=? and j.number=? and j.head_sha<>? order by r.posted_at desc, r.id desc limit 1')
+      .get(repo, number, excludeHead) as { id: string; head_sha: string; base_sha: string; base_ref: string; event: string; result_json: string | null } | undefined;
     if (!row) return null;
     const result = row.result_json ? (JSON.parse(row.result_json) as { reviewUrl?: string }) : {};
-    return { jobId: row.id, headSha: row.head_sha, baseSha: row.base_sha, event: row.event, reviewUrl: result.reviewUrl ?? null };
+    return { jobId: row.id, headSha: row.head_sha, baseSha: row.base_sha, baseRef: row.base_ref, event: row.event, reviewUrl: result.reviewUrl ?? null };
+  }
+
+  /** Record what the gate saw of a PR's head and base at one moment. */
+  observeGate(o: GateObservation): void {
+    this.db.prepare('insert into gate_observations(repo,number,at_ms,head_sha,base_ref,base_sha,merge_base) values(?,?,?,?,?,?,?)')
+      .run(o.repo, o.number, o.atMs, o.headSha, o.baseRef, o.baseSha, o.mergeBase);
+  }
+
+  /** The newest observation at or before `atMs` and the oldest at or after it, for one PR. */
+  gateObservationsAround(repo: string, number: number, atMs: number): { before: GateObservation | null; after: GateObservation | null } {
+    const pick = (cmp: string, order: string): GateObservation | null => {
+      const r = this.db.prepare(`select * from gate_observations where repo=? and number=? and at_ms ${cmp} ? order by at_ms ${order} limit 1`)
+        .get(repo, number, atMs) as { repo: string; number: number; at_ms: number; head_sha: string; base_ref: string; base_sha: string; merge_base: string } | undefined;
+      return r ? { repo: r.repo, number: r.number, atMs: r.at_ms, headSha: r.head_sha, baseRef: r.base_ref, baseSha: r.base_sha, mergeBase: r.merge_base } : null;
+    };
+    return { before: pick('<=', 'desc'), after: pick('>=', 'asc') };
+  }
+
+  /** Delete observations older than `beforeMs`; returns how many went. */
+  pruneGateObservations(beforeMs: number): number {
+    return Number(this.db.prepare('delete from gate_observations where at_ms<?').run(beforeMs).changes);
   }
 
   lastReviewedHead(repo: string, number: number, excludeHead: string): string | null {

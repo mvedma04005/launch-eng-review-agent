@@ -97,3 +97,38 @@ test('a published review keeps the base it was reviewed against, not the base at
   store.recordReview(job.id, { githubReviewId: 1, checkRunId: null, event: 'APPROVE', marker: 'm', baseSha: 'd'.repeat(40) });
   assert.equal(store.lastReview('ROKT/x', 1, '')?.baseSha, 'd'.repeat(40));
 });
+
+const obs = (number: number, atMs: number) => ({ repo: 'acme/demo', number, atMs, headSha: 'h'.repeat(40), baseRef: 'main', baseSha: 'b'.repeat(40), mergeBase: 'm'.repeat(40) });
+
+test('gate observations: the nearest record on each side of a time', () => {
+  const store = new Store(':memory:');
+  const T = 1_000_000;
+  for (const t of [T, T + 60000, T + 120000]) store.observeGate(obs(1, t));
+  store.observeGate(obs(2, T + 90000));
+  const around = (n: number, at: number) => store.gateObservationsAround('acme/demo', n, at);
+  const mid = around(1, T + 90000);
+  assert.equal(mid.before?.atMs, T + 60000);
+  assert.equal(mid.after?.atMs, T + 120000);
+  const exact = around(1, T + 60000);
+  assert.equal(exact.before?.atMs, T + 60000);
+  assert.equal(exact.after?.atMs, T + 60000);
+  assert.deepEqual(exact.before, obs(1, T + 60000));
+  assert.deepEqual(exact.after, obs(1, T + 60000));
+  assert.equal(around(1, T - 1).before, null);
+  assert.equal(around(1, T + 200000).after, null);
+});
+
+test('gate observations: pruning deletes only rows older than the cut', () => {
+  const store = new Store(':memory:');
+  const T = 1_000_000;
+  for (const t of [T, T + 1, T + 2]) store.observeGate(obs(1, t));
+  assert.equal(store.pruneGateObservations(T + 2), 2);
+  assert.equal(store.gateObservationsAround('acme/demo', 1, T + 2).before?.atMs, T + 2);
+});
+
+test('lastReview returns the base branch of the reviewed job', () => {
+  const store = new Store(':memory:');
+  const { job } = store.enqueue(req({ repo: 'acme/demo', baseRef: 'feat-a' }));
+  store.recordReview(job.id, { githubReviewId: 1, checkRunId: null, event: 'APPROVE', marker: 'm' });
+  assert.equal(store.lastReview('acme/demo', 1, '')?.baseRef, 'feat-a');
+});
