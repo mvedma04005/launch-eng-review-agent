@@ -84,7 +84,7 @@ export class OctokitGitHub implements GitHubPort {
     const latest = new Map<string, { state: string; sha: string }>();
     // A person's comment never changes their verdict. Falcon's comment-only review is its verdict on that commit, so a
     // later one ends Falcon's older approval.
-    for (const r of rows) if (r.user && r.commit_id && (r.state !== 'COMMENTED' || r.user.login === this.botLogin)) latest.set(r.user.login, { state: r.state, sha: r.commit_id });
+    for (const r of rows) if (r.user && r.commit_id && r.state !== 'PENDING' && (r.state !== 'COMMENTED' || r.user.login === this.botLogin)) latest.set(r.user.login, { state: r.state, sha: r.commit_id });
     return [...latest].filter(([, v]) => v.state === 'APPROVED' && v.sha !== headSha).map(([login, v]) => ({ login, sha: v.sha }));
   }
 
@@ -140,16 +140,65 @@ export class OctokitGitHub implements GitHubPort {
     }
   }
 
-  /** Every open PR. */
+  /** Every open PR, with its head branch and its place in a stack. */
   async openPulls(repo: string) {
     const rows = await this.octokit.paginate(this.octokit.pulls.list, { ...split(repo), state: 'open', per_page: 100 });
-    return rows.map((p) => ({ number: p.number, headSha: p.head.sha, baseRef: p.base.ref, defaultBranch: p.base.repo.default_branch, updatedAt: p.updated_at, author: p.user?.login ?? '' }));
+    return rows.map((p) => {
+      // Octokit's types do not declare `stack`, so it is read through a narrow cast.
+      const s = (p as { stack?: { base: { ref: string }; number: number; position: number } | null }).stack;
+      return { number: p.number, headSha: p.head.sha, headRef: p.head.ref, baseRef: p.base.ref, defaultBranch: p.base.repo.default_branch, updatedAt: p.updated_at, author: p.user?.login ?? '', stack: s ? { number: s.number, baseRef: s.base.ref, position: s.position } : null };
+    });
   }
 
   /** One PR's head, base and update time, read fresh. */
   async pullState(repo: string, number: number) {
     const { data } = await this.octokit.pulls.get({ ...split(repo), pull_number: number });
-    return { headSha: data.head.sha, baseRef: data.base.ref, updatedAt: data.updated_at, open: data.state === 'open' };
+    return { headSha: data.head.sha, baseRef: data.base.ref, baseSha: data.base.sha, updatedAt: data.updated_at, open: data.state === 'open' };
+  }
+
+  /**
+   * Each reviewer's latest verdict on any commit, with its time. A person's comment never changes their verdict; the
+   * bot's comment-only review is its verdict on that commit, so it replaces the bot's older approval.
+   */
+  async latestVerdicts(repo: string, number: number) {
+    const rows = await this.octokit.paginate(this.octokit.pulls.listReviews, { ...split(repo), pull_number: number, per_page: 100 });
+    const latest = new Map<string, { login: string; state: string; sha: string; submittedAt: string }>();
+    for (const r of rows) if (r.user && r.commit_id && r.state !== 'PENDING' && (r.state !== 'COMMENTED' || r.user.login === this.botLogin)) latest.set(r.user.login, { login: r.user.login, state: r.state, sha: r.commit_id, submittedAt: r.submitted_at ?? '' });
+    return [...latest.values()];
+  }
+
+  /** The newest commit both `baseSha` and `headSha` descend from. */
+  async mergeBase(repo: string, baseSha: string, headSha: string): Promise<string> {
+    const { data } = await this.octokit.repos.compareCommitsWithBasehead({ ...split(repo), basehead: `${baseSha}...${headSha}`, per_page: 1 });
+    return data.merge_base_commit.sha;
+  }
+
+  /** The base branch the PR had at `atMs`, from its base-change events. */
+  async baseRefAt(repo: string, number: number, atMs: number): Promise<string> {
+    const { owner, repo: name } = split(repo);
+    const data = await this.octokit.graphql<{ repository: { pullRequest: { baseRefName: string; timelineItems: { nodes: Array<{ createdAt: string; previousRefName?: string; currentRefName?: string; oldBase?: string; newBase?: string }> } } } }>(
+      `query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { baseRefName timelineItems(first: 100, itemTypes: [BASE_REF_CHANGED_EVENT, AUTOMATIC_BASE_CHANGE_SUCCEEDED_EVENT]) { nodes { __typename ... on BaseRefChangedEvent { createdAt previousRefName currentRefName } ... on AutomaticBaseChangeSucceededEvent { createdAt oldBase newBase } } } } } }`,
+      { owner, name, number });
+    const pr = data.repository.pullRequest;
+    // ponytail: reads the first 100 events. At that cap the history may be cut short, so the answer is '' (no branch
+    // matches it, so no approval binds). Page the timeline if a PR is ever retargeted that often.
+    if (pr.timelineItems.nodes.length >= 100) return '';
+    const events = pr.timelineItems.nodes.map((e) => ({ at: Date.parse(e.createdAt), from: e.previousRefName ?? e.oldBase ?? '', to: e.currentRefName ?? e.newBase ?? '' })).sort((a, b) => a.at - b.at);
+    const before = events.filter((e) => e.at <= atMs).at(-1);
+    if (before) return before.to;
+    return events[0]?.from || pr.baseRefName;
+  }
+
+  /** The PRs in this PR's stack, bottom first. Empty when the PR is in no stack. */
+  async stackMembers(repo: string, number: number) {
+    const { owner, repo: name } = split(repo);
+    const data = await this.octokit.graphql<{ repository: { pullRequest: { stack: { entries: { nodes: Array<{ position: number; pullRequest: { number: number; state: string; baseRefName: string; headRefName: string; headRefOid: string } }> } } | null } } }>(
+      `query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { stack { entries(first: 50) { nodes { position pullRequest { number state baseRefName headRefName headRefOid } } } } } } }`,
+      { owner, name, number });
+    const stack = data.repository.pullRequest.stack;
+    if (!stack) return [];
+    // ponytail: the first 50 entries. A cut-off list leaves members out, and the queue chain then fails closed.
+    return stack.entries.nodes.map((n) => ({ number: n.pullRequest.number, position: n.position, open: n.pullRequest.state === 'OPEN', baseRef: n.pullRequest.baseRefName, headRef: n.pullRequest.headRefName, headSha: n.pullRequest.headRefOid })).sort((a, b) => a.position - b.position);
   }
 
   /** Every path the PR changes, old names of renamed files included. Null at GitHub's cap of 3000 files, where the list may be cut short. */

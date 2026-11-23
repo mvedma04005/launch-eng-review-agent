@@ -72,3 +72,57 @@ test("olderApprovals: a person's later comment keeps their approval; Falcon's la
   rows.splice(3, 1);
   assert.deepEqual((await new OctokitGitHub(octokit, 'falcon[bot]').olderApprovals('acme/demo', 3, HEAD)).map((x) => x.login), ['lee', 'falcon[bot]', 'oz']);
 });
+
+test('latestVerdicts: a person\'s comment keeps their verdict, the bot\'s comment ends its approval', async () => {
+  const bot = 'falcon-review[bot]';
+  const row = (login: string, state: string, at: string) => ({ user: { login }, state, commit_id: HEAD, submitted_at: `2026-11-10T${at}:00Z` });
+  const rows = [row('lee', 'APPROVED', '10:00'), row('lee', 'COMMENTED', '10:01'), row(bot, 'APPROVED', '10:02'), row(bot, 'COMMENTED', '10:03'), { user: null, state: 'APPROVED', commit_id: HEAD, submitted_at: 'x' }, { user: { login: 'sam' }, state: 'APPROVED', commit_id: null, submitted_at: 'x' }, row('pat', 'APPROVED', '10:04'), row('pat', 'PENDING', '10:05'), row('kim', 'APPROVED', '10:06'), row('kim', 'DISMISSED', '10:07')];
+  const octokit = { paginate: async () => rows, pulls: { listReviews: {} } } as unknown as Octokit;
+  assert.deepEqual(await new OctokitGitHub(octokit, bot).latestVerdicts('acme/demo', 3), [
+    { login: 'lee', state: 'APPROVED', sha: HEAD, submittedAt: '2026-11-10T10:00:00Z' },
+    { login: bot, state: 'COMMENTED', sha: HEAD, submittedAt: '2026-11-10T10:03:00Z' },
+    { login: 'pat', state: 'APPROVED', sha: HEAD, submittedAt: '2026-11-10T10:04:00Z' },
+    { login: 'kim', state: 'DISMISSED', sha: HEAD, submittedAt: '2026-11-10T10:07:00Z' },
+  ]);
+});
+
+test('mergeBase: reads the compare API\'s merge base', async () => {
+  const base = 'b'.repeat(40);
+  const seen: Array<Record<string, unknown>> = [];
+  const octokit = { repos: { compareCommitsWithBasehead: async (a: Record<string, unknown>) => { seen.push(a); return { data: { merge_base_commit: { sha: 'm'.repeat(40) } } }; } } } as unknown as Octokit;
+  assert.equal(await new OctokitGitHub(octokit, null).mergeBase('acme/demo', base, HEAD), 'm'.repeat(40));
+  assert.equal(seen[0]!['basehead'], `${base}...${HEAD}`);
+});
+
+test('baseRefAt: the base in force at a time', async () => {
+  const graphql = (nodes: unknown[]) => async () => ({ repository: { pullRequest: { baseRefName: 'feat-b', timelineItems: { nodes } } } });
+  const events = [
+    { __typename: 'BaseRefChangedEvent', createdAt: '2026-11-10T12:00:00Z', previousRefName: 'feat-a', currentRefName: 'main' },
+    { __typename: 'AutomaticBaseChangeSucceededEvent', createdAt: '2026-11-10T13:00:00Z', oldBase: 'main', newBase: 'feat-b' },
+  ];
+  const at = (h: string, nodes = events) => new OctokitGitHub({ graphql: graphql(nodes) } as unknown as Octokit, null).baseRefAt('acme/demo', 3, Date.parse(`2026-11-10T${h}:00Z`));
+  assert.equal(await at('11:00'), 'feat-a');
+  assert.equal(await at('12:30'), 'main');
+  assert.equal(await at('13:00'), 'feat-b');
+  assert.equal(await at('11:00', []), 'feat-b');
+  const many = Array.from({ length: 100 }, (_, i) => ({ __typename: 'BaseRefChangedEvent', createdAt: '2026-11-10T12:00:00Z', previousRefName: `p${i}`, currentRefName: `c${i}` }));
+  assert.equal(await at('12:30', many), '', 'a read at the cap may be cut short, so no base is claimed');
+});
+
+test('stackMembers: maps the stack entries and marks the open ones', async () => {
+  const entry = (position: number, state: string, n: number) => ({ position, pullRequest: { number: n, state, baseRefName: `b${n}`, headRefName: `h${n}`, headRefOid: `sha${n}` } });
+  const reply = (stack: unknown) => async () => ({ repository: { pullRequest: { stack } } });
+  const members = await new OctokitGitHub({ graphql: reply({ entries: { nodes: [entry(1, 'MERGED', 5), entry(2, 'OPEN', 6)].reverse() } }) } as unknown as Octokit, null).stackMembers('acme/demo', 6);
+  assert.deepEqual(members, [
+    { number: 5, position: 1, open: false, baseRef: 'b5', headRef: 'h5', headSha: 'sha5' },
+    { number: 6, position: 2, open: true, baseRef: 'b6', headRef: 'h6', headSha: 'sha6' },
+  ]);
+  assert.deepEqual(await new OctokitGitHub({ graphql: reply(null) } as unknown as Octokit, null).stackMembers('acme/demo', 6), []);
+});
+
+test('openPulls: carries the stack and the head branch', async () => {
+  const pr = (number: number, stack?: unknown) => ({ number, head: { sha: `s${number}`, ref: `feat-${number}` }, base: { ref: 'main', repo: { default_branch: 'main' } }, updated_at: 't', user: { login: 'sam' }, ...(stack ? { stack } : {}) });
+  const octokit = { paginate: async () => [pr(7, { base: { ref: 'main', sha: 's' }, number: 7, position: 2 }), pr(8)], pulls: { list: {} } } as unknown as Octokit;
+  const rows = await new OctokitGitHub(octokit, null).openPulls('acme/demo');
+  assert.deepEqual(rows.map((r) => [r.headRef, r.stack]), [['feat-7', { number: 7, baseRef: 'main', position: 2 }], ['feat-8', null]]);
+});

@@ -21,8 +21,8 @@ function fixture(pulls: Pull[], over: Partial<GateDeps> = {}, files: Record<stri
   const queue: Array<{ number: number; headSha: string; branch: string }> = [];
   const find = (number: number) => pulls.find((x) => x.number === number)!;
   const github: GatePort = {
-    openPulls: async () => pulls.map((p) => ({ ...p, defaultBranch: 'main' })),
-    pullState: async (_repo, number) => ({ ...find(number), open: find(number).open ?? true }),
+    openPulls: async () => pulls.map((p) => ({ ...p, headRef: `br${p.number}`, defaultBranch: 'main', stack: null })),
+    pullState: async (_repo, number) => ({ ...find(number), baseSha: 'tip-main', open: find(number).open ?? true }),
     changedPaths: async (_repo, number) => {
       const p = find(number);
       if (p.files?.[0] === 'boom') throw new Error('GitHub is down');
@@ -31,6 +31,13 @@ function fixture(pulls: Pull[], over: Partial<GateDeps> = {}, files: Record<stri
     },
     approvers: async (_repo, number) => find(number).approvers,
     olderApprovals: async (_repo, number) => find(number).older ?? [],
+    latestVerdicts: async (_repo, number) => {
+      const p = find(number);
+      return [...p.approvers.map((login) => ({ login, sha: p.headSha })), ...(p.older ?? [])].map(({ login, sha }) => ({ login, state: 'APPROVED', sha, submittedAt: p.updatedAt }));
+    },
+    mergeBase: async (_repo, baseSha) => `mb-${baseSha}`,
+    baseRefAt: async (_repo, number) => find(number).baseRef,
+    stackMembers: async () => [],
     fileAtRef: async (_repo, ref, path) => (ref === 'main' ? files[path] ?? null : null),
     postGate: async (_repo, sha, passed, title, summary) => { posts.push({ sha, passed, title }); summaries.push(summary); },
     queueEntries: async (_repo, branch) => queue.filter((e) => e.branch === branch),

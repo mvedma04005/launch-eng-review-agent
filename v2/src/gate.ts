@@ -6,16 +6,26 @@ import { parsePolicy } from './policy/load.ts';
 /** Every open PR is judged again this often, in case a change did not move its update time. */
 const FULL_RECHECK_MS = 30 * 60_000;
 
+export type StackRef = { number: number; baseRef: string; position: number };
+
 /** The GitHub surface the merge gate needs; a fake implements this in tests. */
 export interface GatePort {
-  openPulls(repo: string): Promise<Array<{ number: number; headSha: string; baseRef: string; defaultBranch: string; updatedAt: string; author: string }>>;
+  openPulls(repo: string): Promise<Array<{ number: number; headSha: string; headRef: string; baseRef: string; defaultBranch: string; updatedAt: string; author: string; stack: StackRef | null }>>;
   /** One PR's head, base and update time, read fresh. */
-  pullState(repo: string, number: number): Promise<{ headSha: string; baseRef: string; updatedAt: string; open: boolean }>;
+  pullState(repo: string, number: number): Promise<{ headSha: string; baseRef: string; baseSha: string; updatedAt: string; open: boolean }>;
   /** Every path the PR changes, or null when GitHub's list may be cut short. */
   changedPaths(repo: string, number: number): Promise<string[] | null>;
   approvers(repo: string, number: number, headSha: string): Promise<string[]>;
   /** People whose latest verdict is an approval of a commit older than `headSha`, with that commit. */
   olderApprovals(repo: string, number: number, headSha: string): Promise<Array<{ login: string; sha: string }>>;
+  /** Each reviewer's latest verdict on any commit, with its time. A person's comment keeps their verdict; the bot's comment replaces its own. */
+  latestVerdicts(repo: string, number: number): Promise<Array<{ login: string; state: string; sha: string; submittedAt: string }>>;
+  /** The newest commit both `baseSha` and `headSha` descend from. */
+  mergeBase(repo: string, baseSha: string, headSha: string): Promise<string>;
+  /** The base branch the PR had at `atMs`. */
+  baseRefAt(repo: string, number: number, atMs: number): Promise<string>;
+  /** The PRs in this PR's stack, bottom first; empty when it is in none. */
+  stackMembers(repo: string, number: number): Promise<Array<{ number: number; position: number; open: boolean; baseRef: string; headRef: string; headSha: string }>>;
   fileAtRef(repo: string, ref: string, path: string): Promise<string | null>;
   postGate(repo: string, headSha: string, passed: boolean, title: string, summary: string): Promise<void>;
   /** The merge queue of a branch: each queued PR with the commit GitHub tests it on. Empty when the branch has no queue. */
