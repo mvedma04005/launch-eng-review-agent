@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import type { Octokit } from '@octokit/rest';
 import { ConfigSchema } from './config.ts';
 import { sweepGate, type GateDeps, type GatePort, type StackRef } from './gate.ts';
-import { decodeState } from './gate-binding.ts';
+import { decodeState, encodeState } from './gate-binding.ts';
 import { log } from './log.ts';
 import { OctokitGitHub } from './publisher/github.ts';
 import { Store } from './queue/store.ts';
@@ -798,4 +798,96 @@ test('a stacked PR into a listed extra branch is judged as before under shadow, 
   assert.doesNotMatch(f.summaries.at(-1)!, /stack/);
   assert.equal(await sweepGate(f.deps, REPO, T0 + MINUTE), 0);
   assert.equal(decodeState(f.cursors.get(`gate:${REPO}#2`) ?? null)?.verdict, 'pass');
+});
+
+// Queue commits for a stack: PR 1 into main, PR 2 on br1, PR 3 on br2. One real sweep sets every cursor of the pass;
+// then the decisions are overwritten by hand, and the later sweeps are incremental, so they leave them alone.
+const settle = async (f: ReturnType<typeof fixture>, pulls: Pull[], states: Record<number, Partial<Parameters<typeof encodeState>[0]>> = {}) => {
+  await sweepGate(f.deps, REPO, T0);
+  // The incremental cursor sits after every update time (the newest PR itself is judged again at `>=`).
+  f.cursors.set(`gate:${REPO}`, '2026-11-10T11:00:00Z');
+  f.posts.length = 0;
+  f.summaries.length = 0;
+  for (const p of pulls) {
+    const s = states[p.number];
+    f.cursors.set(`gate:${REPO}#${p.number}`, encodeState({ headSha: p.headSha, baseRef: p.baseRef, mergeBase: 'mb', verdict: 'pass', detail: '', ...s }));
+  }
+};
+
+async function queueStack(over: { states?: Record<number, Partial<Parameters<typeof encodeState>[0]>>; closed?: number[]; throws?: boolean } = {}) {
+  const pulls = [1, 2, 3].map((n) => pull(n, { baseRef: n === 1 ? 'main' : `br${n - 1}`, stack: inStack(n) }));
+  const f = fixture(pulls, { stacks: 'on' });
+  f.deps.github.stackMembers = async () => {
+    if (over.throws) throw new Error('GitHub is down');
+    return pulls.map((p, i) => ({ number: p.number, position: i + 1, open: !over.closed?.includes(p.number), baseRef: p.baseRef, headRef: `br${p.number}`, headSha: p.headSha }));
+  };
+  await settle(f, pulls, over.states);
+  f.queue.push({ number: 3, headSha: 'q3', branch: 'main' });
+  return f;
+}
+
+test('I1: a queue commit for the top of a stack waits while a PR below has no current pass', async () => {
+  const f = await queueStack({ states: { 2: { verdict: 'wait' } } });
+  await sweepGate(f.deps, REPO, T0 + MINUTE);
+  assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['q3', false]]);
+  assert.equal(f.summaries[0], 'Merge queue commit for #3. A PR below it in the stack has no current pass: #2.');
+});
+
+test('a queue commit for the top of a stack passes when the whole chain passes and closes on main', async () => {
+  const f = await queueStack();
+  await sweepGate(f.deps, REPO, T0 + MINUTE);
+  assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['q3', true]]);
+});
+
+test('a queue commit waits when a member below was pushed after its pass', async () => {
+  const f = await queueStack({ states: { 1: { headSha: 'older' } } });
+  await sweepGate(f.deps, REPO, T0 + MINUTE);
+  assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['q3', false]]);
+  assert.ok(f.summaries[0]!.endsWith('#1.'), f.summaries[0]);
+});
+
+test('a queue commit waits when a member below was closed without merging', async () => {
+  // PR 2 is gone from the open members, so PR 3 no longer starts on a chain that closes on main.
+  const f = await queueStack({ closed: [2] });
+  await sweepGate(f.deps, REPO, T0 + MINUTE);
+  assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['q3', false]]);
+});
+
+test('a PR alone: its queue commit passes only with a saved pass for the queue branch', async () => {
+  const pulls = [pull(1), pull(2)];
+  const f = fixture(pulls);
+  await settle(f, pulls, { 2: { baseRef: 'release' } });
+  f.queue.push({ number: 1, headSha: 'q1', branch: 'main' }, { number: 2, headSha: 'q2', branch: 'main' }, { number: 9, headSha: 'q9', branch: 'main' });
+  await sweepGate(f.deps, REPO, T0 + MINUTE);
+  assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['q1', true], ['q2', false], ['q9', false]], 'a PR missing from the listing waits');
+});
+
+test('a queue commit waits, and a pass it had stops, when the stack cannot be read; the rest of the queue is still posted', async () => {
+  const pulls = [pull(1, { stack: inStack(1) }), pull(2)];
+  const f = fixture(pulls, { stacks: 'on' });
+  let asked = 0;
+  let down = false;
+  f.deps.github.stackMembers = async () => { asked++; if (down) throw new Error('GitHub is down'); return [{ number: 1, position: 1, open: true, baseRef: 'main', headRef: 'br1', headSha: 'sha1' }]; };
+  await settle(f, pulls);
+  f.queue.push({ number: 1, headSha: 'q1', branch: 'main' }, { number: 2, headSha: 'q2', branch: 'main' });
+  await sweepGate(f.deps, REPO, T0 + MINUTE);
+  assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['q1', true], ['q2', true]]);
+  f.posts.length = 0;
+  f.summaries.length = 0;
+  down = true;
+  f.cursors.delete(`gateq:${REPO}:q2`);
+  asked = 0;
+  await sweepGate(f.deps, REPO, T0 + 2 * MINUTE);
+  assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['q1', false], ['q2', true]], 'the commit that had passed now waits');
+  assert.equal(f.summaries[0], "Merge queue commit for #1. It carries the decision on the pull request's own commit.");
+  assert.equal(f.cursors.get(`gateq:${REPO}:q1`), 'false');
+  assert.equal(asked, 1, 'a PR with no stack never asks for one');
+});
+
+test('a dry run posts no queue commit and saves no queue cursor', async () => {
+  const f = await queueStack();
+  f.deps.dryRun = true;
+  await sweepGate(f.deps, REPO, T0 + MINUTE);
+  assert.deepEqual(f.posts, []);
+  assert.equal(f.cursors.has(`gateq:${REPO}:q3`), false);
 });

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { approvalOutcome, bindFromObservations, bindFromTimeline, decodeState, encodeState, type Binding } from './gate-binding.ts';
+import { approvalOutcome, bindFromObservations, bindFromTimeline, decodeState, encodeState, queueChain, type Binding, type ChainMember } from './gate-binding.ts';
 import type { Logger } from './log.ts';
 import { gateVerdict, governedBy, type GateVerdict } from './policy/gate.ts';
 import { parsePolicy } from './policy/load.ts';
@@ -333,15 +333,29 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   for (const base of new Set(open.filter((p) => judgedBase(p.baseRef, p.defaultBranch)).map((p) => p.baseRef))) {
     try {
       for (const entry of await github.queueEntries(repo, base)) {
-        const saved = decodeState(store.cursor(`gate:${repo}#${entry.number}`));
-        // A pass judged on another base branch says nothing about this queue's branch.
-        const passed = saved?.verdict === 'pass' && saved.baseRef === base;
+        // R4: the commit carries the whole chain below the entry, so it passes only when every open member passes now.
+        // An entry whose PR is not listed, or whose chain cannot be read, waits: this check is required.
+        const row = open.find((p) => p.number === entry.number);
+        let chain: ReturnType<typeof queueChain> = { passed: false, blocker: entry.number };
+        if (row) {
+          try {
+            const members: ChainMember[] = row.stack
+              ? (await github.stackMembers(repo, entry.number)).filter((m) => m.open).map(({ number, position, baseRef, headRef, headSha }) => ({ number, position, baseRef, headRef, headSha }))
+              : [{ number: row.number, position: 1, baseRef: row.baseRef, headRef: row.headRef, headSha: row.headSha }];
+            const states = new Map(members.map((m) => [m.number, decodeState(store.cursor(`gate:${repo}#${m.number}`))] as const));
+            chain = queueChain(entry.number, members, states, base);
+          } catch (error) {
+            // Fail closed: the commit gets a wait, so a pass posted earlier on it does not stay.
+            log.warn({ err: error, repo, number: entry.number }, 'merge gate could not read the stack for a queue commit; it waits');
+          }
+        }
+        const passed = chain.passed;
         // ponytail: one cursor per queue commit, never removed; prune by age if the table ever matters.
         const key = `gateq:${repo}:${entry.headSha}`;
         if (store.cursor(key) === String(passed)) continue;
         log.info({ repo, number: entry.number, head: entry.headSha, passed, dryRun: deps.dryRun }, 'merge gate decided for a queue commit');
         if (deps.dryRun) continue;
-        await github.postGate(repo, entry.headSha, passed, passed ? 'Approved by Launch Engineering or Falcon' : 'Waiting for Launch Engineering or Falcon to approve', `Merge queue commit for #${entry.number}. It carries the decision on the pull request's own commit.`);
+        await github.postGate(repo, entry.headSha, passed, passed ? 'Approved by Launch Engineering or Falcon' : 'Waiting for Launch Engineering or Falcon to approve', chain.passed || chain.blocker === entry.number ? `Merge queue commit for #${entry.number}. It carries the decision on the pull request's own commit.` : `Merge queue commit for #${entry.number}. A PR below it in the stack has no current pass: #${chain.blocker}.`);
         store.setCursor(key, String(passed));
         posted++;
       }
