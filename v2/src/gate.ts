@@ -54,6 +54,11 @@ export interface GateDeps {
   requested: Set<number> | null;
   /** Base branches judged besides the default branch. */
   branches?: string[];
+  /**
+   * PRs in a GitHub stack on the default branch: `on` judges and posts, `shadow` judges and only logs, `off` (default)
+   * skips them. `shadow` and `off` post one thing for them: a wait that withdraws a pass left from `on`.
+   */
+  stacks?: 'off' | 'shadow' | 'on' | undefined;
   dryRun: boolean;
   /**
    * Whether `headSha` carries the same change as `oldSha` and the base did not move anything `governs` names. `oldBase`
@@ -85,6 +90,12 @@ function describe({ verdict, uncovered }: GateVerdict, approvers: string[], outs
   return { title: 'Waiting for Launch Engineering or Falcon to approve', summary: `${who.trim()} Still needs an approval from a team member, or from Falcon where Falcon may approve, for: ${list || 'this change'}.` };
 }
 
+/** R5: a stacked PR's check says it was judged on its own change against its direct base, not against the default branch. */
+function forStack({ title, summary }: { title: string; summary: string }, passed: boolean, base: string): { title: string; summary: string } {
+  if (passed) return { title: `Approved for its own change on ${base}`, summary: `${summary} This PR is in a stack. The gate judged its own change against \`${base}\`. The stack merges only when every PR below it also passes.` };
+  return { title, summary: `${summary} The gate judges this PR on its own change against \`${base}\`.` };
+}
+
 /**
  * Reads one PR, its files and its reviewers' verdicts, then the PR again. GitHub lists the files of "the PR now", so they
  * belong to the commit only if nothing about the PR moved in between. Tries twice; `steady` says whether it held. A
@@ -110,14 +121,14 @@ async function readPull(github: GatePort, repo: string, number: number) {
  * then compared. `unbound`: a person's approval that nothing places on a change. The comparison runs git, so it runs
  * only when the direct approvals are not `enough`; then the others are neither compared nor named, as before.
  */
-async function countApprovals(deps: GateDeps, repo: string, pr: { number: number; author: string; defaultBranch: string }, read: Awaited<ReturnType<typeof readPull>>, team: string[], rules: string, governs: (path: string) => boolean, enough: (approvers: string[]) => boolean): Promise<Counted> {
+async function countApprovals(deps: GateDeps, repo: string, pr: { number: number; author: string; defaultBranch: string }, read: Awaited<ReturnType<typeof readPull>>, team: string[], rules: string, governs: (path: string) => boolean, enough: (approvers: string[]) => boolean, readOnly: boolean): Promise<Counted> {
   const lower = (s: string) => s.toLowerCase();
-  // GitHub's answers about the past never change, so each is asked once. A dry run saves nothing.
+  // GitHub's answers about the past never change, so each is asked once. A read-only pass saves nothing.
   const remember = async (key: string, ask: () => Promise<string>) => {
     const known = deps.store.cursor(key);
     if (known !== null) return known;
     const answer = await ask();
-    if (!deps.dryRun) deps.store.setCursor(key, answer);
+    if (!readOnly) deps.store.setCursor(key, answer);
     return answer;
   };
   const members = new Set(team.map(lower));
@@ -183,7 +194,7 @@ async function countApprovals(deps: GateDeps, repo: string, pr: { number: number
         try {
           // The merge base stands in for the old base tip: the merge base of a merge base and its head is itself.
           same = String(await compare(pr.number, binding.headSha, read.headSha, governs, binding.mergeBase, read.baseRef, read.mergeBase));
-          if (!deps.dryRun) deps.store.setCursor(key, same);
+          if (!readOnly) deps.store.setCursor(key, same);
         } catch (error) {
           // A comparison that fails is not saved and counts for nothing.
           deps.log.info({ repo, number: pr.number, old: binding.headSha, head: read.headSha, err: String(error) }, 'merge gate: could not compare with an older approval');
@@ -197,7 +208,8 @@ async function countApprovals(deps: GateDeps, repo: string, pr: { number: number
 }
 
 /**
- * One pass over the open PRs into the default branch (only those requested in Chat, unless `requested` is null). It judges the ones that changed since the last pass, and
+ * One pass over the open PRs into the default branch, and with `stacks` the PRs of GitHub stacks on it (only those
+ * requested in Chat, unless `requested` is null). It judges the ones that changed since the last pass, and
  * all of them when the rules changed or half an hour has gone by, and posts the check when the decision differs
  * from the last one posted. Returns the number of checks posted.
  */
@@ -205,9 +217,37 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   const { github, store, log } = deps;
   const requested = deps.requested;
   const extra = deps.branches ?? [];
+  const stacks = deps.stacks ?? 'off';
+  const judgedBase = (baseRef: string, defaultBranch: string) => baseRef === defaultBranch || extra.includes(baseRef);
+  // R1: GitHub holds the PR in a stack on the default branch. A PR on another PR's branch without one is never judged.
+  // GitHub's stack is the authority, so a fork PR is judged only if GitHub puts it in a stack.
+  const inStack = (p: { baseRef: string; defaultBranch: string; stack: StackRef | null }) => p.stack?.baseRef === p.defaultBranch && !judgedBase(p.baseRef, p.defaultBranch);
+  const stacked = (p: { baseRef: string; defaultBranch: string; stack: StackRef | null }) => stacks !== 'off' && inStack(p);
+  const listed = await github.openPulls(repo);
+  let posted = 0;
+  // A required check must not keep a pass the gate no longer stands behind. With stacks off or in shadow, a stacked
+  // PR the gate judged before gets a wait on its head when its saved decision is a pass, and again on every new head:
+  // a push back to an older commit must not bring back the pass that commit got under `on`. The decision only:
+  // nothing is read, observed or cached. A PR the gate never judged has no pass to withdraw.
+  if (stacks !== 'on' && !deps.dryRun) {
+    for (const p of listed.filter(inStack)) {
+      const key = `gate:${repo}#${p.number}`;
+      const saved = decodeState(store.cursor(key));
+      if (!saved || (saved.verdict !== 'pass' && saved.headSha === p.headSha)) continue;
+      try {
+        await github.postGate(repo, p.headSha, false, 'Waiting: stacked PRs are not judged now', 'The gate does not judge stacked PRs now, so an earlier pass on this commit no longer counts.');
+        // No merge base and a detail no judged state has, so a later real decision always posts.
+        store.setCursor(key, encodeState({ headSha: p.headSha, baseRef: p.baseRef, mergeBase: '', verdict: 'wait', detail: 'withdrawn' }));
+        posted++;
+      } catch (error) {
+        // The saved pass stays, so the next pass tries again.
+        log.warn({ err: error, repo, number: p.number }, 'merge gate could not withdraw a stacked pass');
+      }
+    }
+  }
   // A PR that already has a check keeps being judged, so a pass is withdrawn even after the PR leaves the list.
-  const open = (await github.openPulls(repo)).filter((p) => (p.baseRef === p.defaultBranch || extra.includes(p.baseRef)) && (!requested || requested.has(p.number) || store.cursor(`gate:${repo}#${p.number}`) !== null));
-  if (!open.length) return 0;
+  const open = listed.filter((p) => (judgedBase(p.baseRef, p.defaultBranch) || stacked(p)) && (!requested || requested.has(p.number) || store.cursor(`gate:${repo}#${p.number}`) !== null));
+  if (!open.length) return posted;
   // The team list and the person-only paths come from the default branch, never from the PR being judged.
   const branch = open[0]!.defaultBranch;
   const pack = await github.fileAtRef(repo, branch, deps.repoPack);
@@ -224,7 +264,8 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   // A pass must not outlive the rule that gave it: a change to the pack re-judges every PR. `v3` marks the rule
   // itself (an approval counts only for the change it was given on), so the first pass after this change re-judges
   // every PR once.
-  const rules = createHash('sha256').update(['v3', pack ?? '', deps.falcon ?? ''].join('\0')).digest('hex');
+  // The `stacks` mode too: a switch re-judges every PR at once, so a return to `on` replaces each withdrawal straight away.
+  const rules = createHash('sha256').update(['v3', pack ?? '', deps.falcon ?? '', stacks].join('\0')).digest('hex');
   const fullKey = `gate:${repo}:full`;
   const [lastRules, lastAt] = (store.cursor(fullKey) ?? ':0').split(':');
   const full = lastRules !== rules || now - Number(lastAt) >= FULL_RECHECK_MS;
@@ -234,24 +275,32 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   const since = full ? '' : store.cursor(cursorKey) ?? '';
   // `>=`: a review can land in the same second as the newest PR already seen.
   // A request in Chat does not move a PR's update time, so a PR never judged before is always judged.
-  const pulls = open.filter((p) => p.updatedAt >= since || store.cursor(`gate:${repo}#${p.number}`) === null);
+  const chosen = open.filter((p) => p.updatedAt >= since || store.cursor(`gate:${repo}#${p.number}`) === null);
+  // R3: a push to a PR moves the base of the PR above it, but not that PR's update time, so the stacked PRs of a stack
+  // are judged together. The bottom PR has no parent in the stack: its own update time is enough.
+  const touched = new Set(chosen.flatMap((p) => (stacks !== 'off' && p.stack ? [p.stack.number] : [])));
+  const pulls = open.filter((p) => chosen.includes(p) || (p.stack !== null && stacked(p) && touched.has(p.stack.number)));
 
-  let posted = 0;
   let failed = false;
   let newest = since;
   for (const p of pulls) {
     try {
       const read = await readPull(github, repo, p.number);
-      if (!read.open || (read.baseRef !== branch && !extra.includes(read.baseRef))) continue; // Closed or retargeted since it was listed.
+      const asStack = stacked(p);
+      // Closed or retargeted since it was listed. A PR listed in a stack is judged on whatever base it has now.
+      if (!read.open || (!judgedBase(read.baseRef, branch) && !asStack)) continue;
+      // I5: shadow writes nothing for a stacked PR, as a dry run writes nothing at all.
+      const shadow = asStack && stacks === 'shadow';
+      const readOnly = deps.dryRun || shadow;
       // Recorded before the approvals are counted, so an approval given just now has an observation after it.
-      if (read.steady && !deps.dryRun) store.observeGate?.({ repo, number: p.number, atMs: clock(), headSha: read.headSha, baseRef: read.baseRef, baseSha: read.baseSha, mergeBase: read.mergeBase });
+      if (read.steady && !readOnly) store.observeGate?.({ repo, number: p.number, atMs: clock(), headSha: read.headSha, baseRef: read.baseRef, baseSha: read.baseSha, mergeBase: read.mergeBase });
       // A PR that will not hold still gets a wait, never a skip: an old pass must not survive because the PR keeps moving.
       let result: GateVerdict = { verdict: 'wait', uncovered: [] };
       let counted: Counted = { direct: [], carried: [], stale: [], unbound: [], others: [] };
       if (read.steady && read.files !== null) {
         const files = read.files;
         const judge = (approvers: string[]) => gateVerdict({ files, team, humanPaths, approvers, falcon: deps.falcon });
-        counted = await countApprovals(deps, repo, p, read, team, rules, governedBy(files, deps.repoPack, context), (approvers) => judge(approvers).verdict === 'pass');
+        counted = await countApprovals(deps, repo, p, read, team, rules, governedBy(files, deps.repoPack, context), (approvers) => judge(approvers).verdict === 'pass', readOnly);
         result = judge([...counted.direct, ...counted.carried.map((c) => c.login)]);
       }
       const approvers = [...counted.direct, ...counted.others].sort();
@@ -261,9 +310,11 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
       const key = `gate:${repo}#${p.number}`;
       if (store.cursor(key) !== state) {
         const outside = approvers.filter((a) => a.toLowerCase() !== deps.falcon?.toLowerCase() && !team.some((t) => t.toLowerCase() === a.toLowerCase()));
-        const { title, summary } = describe(result, approvers, outside, read.files === null, !read.steady, counted.carried, counted.stale, counted.unbound);
-        log.info({ repo, number: p.number, head: read.headSha, verdict: result.verdict, steady: read.steady, approvers, dryRun: deps.dryRun }, 'merge gate decided');
-        if (!deps.dryRun) {
+        const copy = describe(result, approvers, outside, read.files === null, !read.steady, counted.carried, counted.stale, counted.unbound);
+        const { title, summary } = asStack && read.baseRef !== branch ? forStack(copy, result.verdict === 'pass', read.baseRef) : copy;
+        // The base, the merge base and each older approval, so a shadow line can be checked against GitHub.
+        log.info({ repo, number: p.number, head: read.headSha, base: read.baseRef, mergeBase: read.mergeBase, verdict: result.verdict, steady: read.steady, approvers, carried: counted.carried, stale: counted.stale, unbound: counted.unbound, dryRun: deps.dryRun }, shadow ? 'merge gate decided (shadow)' : 'merge gate decided');
+        if (!readOnly) {
           await github.postGate(repo, read.headSha, result.verdict === 'pass', title, summary);
           store.setCursor(key, state);
           posted++;
@@ -278,7 +329,8 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   // Queue commits. GitHub tests a queued PR on a commit of its own, and that commit needs the check too. It
   // carries the decision on the PR's own commit: GitHub only queues a PR whose own commit passed, and a push
   // to the PR takes it out of the queue.
-  for (const base of new Set(open.map((p) => p.baseRef))) {
+  // Only the default branch and the extra branches: a stacked PR is queued on the stack's base, never on its own.
+  for (const base of new Set(open.filter((p) => judgedBase(p.baseRef, p.defaultBranch)).map((p) => p.baseRef))) {
     try {
       for (const entry of await github.queueEntries(repo, base)) {
         const saved = decodeState(store.cursor(`gate:${repo}#${entry.number}`));

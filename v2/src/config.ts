@@ -96,6 +96,8 @@ export const ConfigSchema = z.object({
     pollSeconds: z.number().int().min(10).default(30),
     /** Base branches judged besides the default branch, for example a branch that trials a merge queue. */
     branches: z.array(z.string()).default([]),
+    /** PRs in a GitHub stack on the default branch, each judged on its own change against its direct base. `shadow` judges and logs them, and posts and saves nothing for them except a wait that withdraws a pass left from `on`, as `off` does. */
+    stacks: z.enum(['off', 'shadow', 'on']).default('off'),
   }).prefault({}),
   notify: z.object({
     webhookUrlEnv: z.string().default('FALCON_NOTIFY_WEBHOOK'),

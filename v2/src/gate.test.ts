@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Octokit } from '@octokit/rest';
-import { sweepGate, type GateDeps, type GatePort } from './gate.ts';
+import { ConfigSchema } from './config.ts';
+import { sweepGate, type GateDeps, type GatePort, type StackRef } from './gate.ts';
 import { decodeState } from './gate-binding.ts';
 import { log } from './log.ts';
 import { OctokitGitHub } from './publisher/github.ts';
@@ -18,7 +19,7 @@ const approved = (login: string, sha: string, submittedAt = APPROVED_AT) => ({ l
 const couldNotTell = (login: string) => ` ${login} approved, but Falcon could not tell which change that approval was for, so it does not count here. Approve this commit again.`;
 
 type Verdict = { login: string; state: string; sha: string; submittedAt: string };
-interface Pull { number: number; headSha: string; baseRef: string; updatedAt: string; author: string; files: string[] | null; approvers: string[]; older?: Array<{ login: string; sha: string }>; open?: boolean; verdicts?: Verdict[]; baseSha?: string; mergeBase?: string; baseAt?: string }
+interface Pull { number: number; headSha: string; baseRef: string; updatedAt: string; author: string; files: string[] | null; approvers: string[]; older?: Array<{ login: string; sha: string }>; open?: boolean; verdicts?: Verdict[]; baseSha?: string; mergeBase?: string; baseAt?: string; stack?: StackRef | null }
 const pull = (number: number, over: Partial<Pull> = {}): Pull => ({ number, headSha: `sha${number}`, baseRef: 'main', updatedAt: `2026-11-10T10:00:0${number}Z`, author: 'sam', files: ['Orbit/a.py'], approvers: [], ...over });
 
 function fixture(pulls: Pull[], over: Partial<GateDeps> = {}, files: Record<string, string> = { '.github/CODEOWNERS': CODEOWNERS, '.falcon/policy.yaml': PACK }) {
@@ -33,7 +34,7 @@ function fixture(pulls: Pull[], over: Partial<GateDeps> = {}, files: Record<stri
   const db = new Store(':memory:');
   const clock = { at: T0 };
   const github: GatePort = {
-    openPulls: async () => pulls.map((p) => ({ ...p, headRef: `br${p.number}`, defaultBranch: 'main', stack: null })),
+    openPulls: async () => pulls.map((p) => ({ stack: null, ...p, headRef: `br${p.number}`, defaultBranch: 'main' })),
     pullState: async (_repo, number) => ({ ...find(number), baseSha: tip(find(number)), open: find(number).open ?? true }),
     changedPaths: async (_repo, number) => {
       const p = find(number);
@@ -598,4 +599,203 @@ test('an approval in the same second as a base change does not count, since the 
     assert.deepEqual(f.posts.at(-1), { sha: 'sha1', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' });
     assert.ok(f.summaries.at(-1)!.includes(couldNotTell('lee')), f.summaries.at(-1));
   }
+});
+
+// Stack 7: PR 1 into main at the bottom, PR 2 on feat-a above it.
+const inStack = (position: number): StackRef => ({ number: 7, baseRef: 'main', position });
+const STACK_PASS = ' This PR is in a stack. The gate judged its own change against `feat-a`. The stack merges only when every PR below it also passes.';
+const stackWait = (base: string) => ` The gate judges this PR on its own change against \`${base}\`.`;
+
+test('off: a stacked PR is not judged', async () => {
+  for (const stacks of [undefined, 'off'] as const) {
+    const f = fixture([pull(2, { baseRef: 'feat-a', stack: inStack(2), approvers: ['lee'] })], { stacks });
+    assert.equal(await sweepGate(f.deps, REPO, T0), 0);
+    assert.deepEqual(f.posts, []);
+    assert.equal(f.db.gateObservationsAround(REPO, 2, T0).before, null);
+  }
+});
+
+test('on: a stacked PR is judged on its own change and the pass names its base', async () => {
+  const f = fixture([
+    pull(1, { stack: inStack(1) }),
+    pull(2, { baseRef: 'feat-a', stack: inStack(2), verdicts: [approved('lee', 'sha2')] }),
+    pull(3, { baseRef: 'br2', stack: inStack(3) }),
+  ], { stacks: 'on' });
+  f.around('sha2', 'feat-a', 'mb-tip-feat-a', 2);
+  f.queue.push({ number: 2, headSha: 'q-feat', branch: 'feat-a' });
+  await sweepGate(f.deps, REPO, T0);
+  assert.deepEqual(f.posts, [
+    { sha: 'sha1', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' },
+    { sha: 'sha2', passed: true, title: 'Approved for its own change on feat-a' },
+    { sha: 'sha3', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' },
+  ], 'the queue of a stacked base is not read');
+  assert.doesNotMatch(f.summaries[0]!, /stack|own change/, 'a PR into main keeps its copy');
+  assert.ok(f.summaries[1]!.endsWith(STACK_PASS), f.summaries[1]);
+  assert.ok(f.summaries[2]!.endsWith(stackWait('br2')), f.summaries[2]);
+  const saved = decodeState(f.cursors.get(`gate:${REPO}#2`) ?? null);
+  assert.deepEqual(saved && [saved.baseRef, saved.mergeBase, saved.verdict], ['feat-a', 'mb-tip-feat-a', 'pass']);
+});
+
+test('shadow: a stacked PR is logged, not posted, and nothing is saved', async (t) => {
+  let compared = 0;
+  const f = fixture([
+    pull(1, { stack: inStack(1) }),
+    pull(2, { headSha: 'new2', baseRef: 'feat-a', stack: inStack(2), verdicts: [approved('lee', 'old2'), approved(FALCON, 'old2')] }),
+  ], { stacks: 'shadow', sameChange: async () => { compared++; return true; } });
+  // Every kind of lookup a real pass saves: where lee approved, the merge base of Falcon's review, the comparison.
+  f.deps.store.lastReview = () => ({ headSha: 'old2', baseSha: 'tip-old', baseRef: 'feat-a', event: 'APPROVE' });
+  f.around('old2', 'feat-a', 'mb-tip-feat-a', 2);
+  const info = t.mock.method(f.deps.log, 'info');
+  assert.equal(await sweepGate(f.deps, REPO, T0), 1);
+  assert.deepEqual(f.posts.map((x) => x.sha), ['sha1']);
+  assert.equal(compared, 2, 'judged in full');
+  const lines = info.mock.calls.map((c) => [c.arguments[1], (c.arguments[0] as { number?: number; verdict?: string }).number, (c.arguments[0] as { verdict?: string }).verdict]);
+  assert.deepEqual(lines.filter(([msg]) => String(msg).startsWith('merge gate decided')), [['merge gate decided', 1, 'wait'], ['merge gate decided (shadow)', 2, 'pass']]);
+  // The rollout compares these lines with GitHub, so they carry the base, the merge base and each older approval.
+  const shadowLine = info.mock.calls.find((c) => c.arguments[1] === 'merge gate decided (shadow)')!.arguments[0] as Record<string, unknown>;
+  assert.deepEqual([shadowLine['base'], shadowLine['mergeBase'], shadowLine['carried'], shadowLine['stale'], shadowLine['unbound']], ['feat-a', 'mb-tip-feat-a', [{ login: 'lee', sha: 'old2' }, { login: FALCON, sha: 'old2' }], [], []]);
+  assert.deepEqual([...f.cursors.keys()].sort(), [`gate:${REPO}`, `gate:${REPO}#1`, `gate:${REPO}:full`], 'no lookup, cache entry or decision for PR 2');
+  assert.equal(f.db.gateObservationsAround(REPO, 2, T0).after, null, 'no observation');
+});
+
+test('a push to the PR below judges the PRs above it in the same pass', async () => {
+  // PR 1 was touched after PR 2, so after the first pass only R3 brings PR 2 back.
+  const bottom = pull(1, { stack: inStack(1), updatedAt: '2026-11-10T10:06:00Z' });
+  const top = pull(2, { baseRef: 'br1', stack: inStack(2), updatedAt: APPROVED_AT, verdicts: [approved('lee', 'sha2')] });
+  const f = fixture([bottom, top], { stacks: 'on', sameChange: async () => false });
+  f.around('sha2', 'br1', 'mb-tip-br1', 2);
+  await sweepGate(f.deps, REPO, T0);
+  assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['sha1', false], ['sha2', true]]);
+  // A push to PR 1 moves its branch, the base of PR 2. Only PR 1's update time moves.
+  Object.assign(bottom, { headSha: 'sha1b', updatedAt: '2026-11-10T10:30:00Z' });
+  top.baseSha = 'tip-br1-2';
+  await sweepGate(f.deps, REPO, T0 + MINUTE);
+  assert.deepEqual(f.posts.slice(2).map((x) => [x.sha, x.passed]), [['sha1b', false], ['sha2', false]]);
+  assert.match(f.summaries.at(-1)!, /lee approved sha2, but the change is different on this commit/);
+});
+
+test("a PR on another PR's branch without a GitHub stack is not judged", async () => {
+  const f = fixture([pull(1), pull(2, { baseRef: 'br1', approvers: ['lee'] })], { stacks: 'on' });
+  await sweepGate(f.deps, REPO, T0);
+  assert.deepEqual(f.posts.map((x) => x.sha), ['sha1']);
+});
+
+test('a PR that leaves its stack and moves to main with the same head waits', async () => {
+  const p = pull(2, { baseRef: 'feat-a', baseAt: 'feat-a', stack: inStack(2), verdicts: [approved('lee', 'sha2')] });
+  const f = fixture([p], { stacks: 'on', sameChange: async () => false });
+  f.around('sha2', 'feat-a', 'mb-tip-feat-a', 2);
+  await sweepGate(f.deps, REPO, T0);
+  assert.deepEqual(f.posts.at(-1), { sha: 'sha2', passed: true, title: 'Approved for its own change on feat-a' });
+  Object.assign(p, { stack: null, baseRef: 'main', updatedAt: '2026-11-10T10:30:00Z' });
+  // No longer requested: its saved decision keeps it judged.
+  await sweepGate({ ...f.deps, requested: new Set() }, REPO, T0 + MINUTE);
+  assert.deepEqual(f.posts.at(-1), { sha: 'sha2', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' });
+  assert.doesNotMatch(f.summaries.at(-1)!, /own change against/);
+});
+
+test("I6 on a stack: a person's approval with no observations does not count", async () => {
+  const f = fixture([pull(2, { baseRef: 'feat-a', stack: inStack(2), verdicts: [approved('lee', 'sha2')] })], { stacks: 'on' });
+  await sweepGate(f.deps, REPO, T0);
+  assert.deepEqual(f.posts.at(-1), { sha: 'sha2', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' });
+  assert.ok(f.summaries.at(-1)!.includes(couldNotTell('lee')), f.summaries.at(-1));
+  assert.ok(f.summaries.at(-1)!.endsWith(stackWait('feat-a')), f.summaries.at(-1));
+});
+
+test('config: gate.stacks defaults to off and accepts shadow and on', () => {
+  assert.equal(ConfigSchema.parse({}).gate.stacks, 'off');
+  for (const stacks of ['shadow', 'on'] as const) assert.equal(ConfigSchema.parse({ gate: { stacks } }).gate.stacks, stacks);
+  assert.throws(() => ConfigSchema.parse({ gate: { stacks: 'yes' } }));
+});
+
+const WITHDRAWN = { title: 'Waiting: stacked PRs are not judged now', summary: 'The gate does not judge stacked PRs now, so an earlier pass on this commit no longer counts.' };
+
+test('on → off or shadow: a stacked PR that passed gets one wait and its decision becomes wait', async () => {
+  for (const stacks of ['off', 'shadow'] as const) {
+    const f = fixture([pull(2, { baseRef: 'feat-a', stack: inStack(2), verdicts: [approved('lee', 'sha2')] })], { stacks: 'on' });
+    f.around('sha2', 'feat-a', 'mb-tip-feat-a', 2);
+    await sweepGate(f.deps, REPO, T0);
+    assert.equal(f.posts.at(-1)?.passed, true);
+    const keys = [...f.cursors.keys()].sort();
+    f.clock.at = T0 + MINUTE;
+    assert.equal(await sweepGate({ ...f.deps, stacks }, REPO, T0 + MINUTE), 1, stacks);
+    assert.deepEqual(f.posts.at(-1), { sha: 'sha2', passed: false, title: WITHDRAWN.title });
+    assert.equal(f.summaries.at(-1), WITHDRAWN.summary);
+    assert.equal(decodeState(f.cursors.get(`gate:${REPO}#2`) ?? null)?.verdict, 'wait');
+    assert.deepEqual([...f.cursors.keys()].sort(), keys, 'the decision only: no new cache entry');
+    assert.equal(f.db.gateObservationsAround(REPO, 2, T0 + 1).after, null, 'no observation');
+    assert.equal(await sweepGate({ ...f.deps, stacks }, REPO, T0 + 2 * MINUTE), 0, `${stacks}: withdrawn once`);
+  }
+});
+
+test('a dry run does not withdraw a stacked pass', async () => {
+  const f = fixture([pull(2, { baseRef: 'feat-a', stack: inStack(2), verdicts: [approved('lee', 'sha2')] })], { stacks: 'on' });
+  f.around('sha2', 'feat-a', 'mb-tip-feat-a', 2);
+  await sweepGate(f.deps, REPO, T0);
+  const decision = f.cursors.get(`gate:${REPO}#2`);
+  assert.equal(await sweepGate({ ...f.deps, stacks: 'off', dryRun: true }, REPO, T0 + MINUTE), 0);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.cursors.get(`gate:${REPO}#2`), decision);
+});
+
+test('after a switch to off, a force-push back to a commit that passed under on gets a wait on that commit', async () => {
+  const p = pull(2, { headSha: 'h1', baseRef: 'feat-a', stack: inStack(2), verdicts: [approved('lee', 'h1')] });
+  const f = fixture([p], { stacks: 'on' });
+  f.around('h1', 'feat-a', 'mb-tip-feat-a', 2);
+  await sweepGate(f.deps, REPO, T0);
+  assert.deepEqual(f.posts.at(-1), { sha: 'h1', passed: true, title: 'Approved for its own change on feat-a' });
+  // A push under on: the gate judges h2, and the saved decision is h2's wait. h1 keeps its pass on GitHub.
+  Object.assign(p, { headSha: 'h2', updatedAt: '2026-11-10T10:30:00Z' });
+  await sweepGate(f.deps, REPO, T0 + MINUTE);
+  assert.deepEqual(f.posts.at(-1), { sha: 'h2', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' });
+  const off = { ...f.deps, stacks: 'off' as const };
+  assert.equal(await sweepGate(off, REPO, T0 + 2 * MINUTE), 0, 'h2 already waits');
+  Object.assign(p, { headSha: 'h1', updatedAt: '2026-11-10T10:40:00Z' });
+  assert.equal(await sweepGate(off, REPO, T0 + 3 * MINUTE), 1);
+  assert.deepEqual(f.posts.at(-1), { sha: 'h1', passed: false, title: WITHDRAWN.title });
+  assert.equal(await sweepGate(off, REPO, T0 + 4 * MINUTE), 0, 'no change, nothing posted');
+});
+
+test('a push between the last on pass and the first off pass: the new head waits, and so does the old one when it comes back', async () => {
+  const p = pull(2, { headSha: 'h1', baseRef: 'feat-a', stack: inStack(2), verdicts: [approved('lee', 'h1')] });
+  const f = fixture([p], { stacks: 'on' });
+  f.around('h1', 'feat-a', 'mb-tip-feat-a', 2);
+  await sweepGate(f.deps, REPO, T0);
+  assert.equal(f.posts.at(-1)?.passed, true);
+  const off = { ...f.deps, stacks: 'off' as const };
+  p.headSha = 'h2';
+  assert.equal(await sweepGate(off, REPO, T0 + MINUTE), 1);
+  assert.deepEqual(f.posts.at(-1), { sha: 'h2', passed: false, title: WITHDRAWN.title });
+  assert.equal(await sweepGate(off, REPO, T0 + 2 * MINUTE), 0, 'no change, nothing posted');
+  p.headSha = 'h1';
+  assert.equal(await sweepGate(off, REPO, T0 + 3 * MINUTE), 1);
+  assert.deepEqual(f.posts.at(-1), { sha: 'h1', passed: false, title: WITHDRAWN.title });
+});
+
+test('a shadow pass does not judge the bottom PR of a stack when nothing changed', async () => {
+  const f = fixture([pull(1, { stack: inStack(1) }), pull(2, { baseRef: 'br1', stack: inStack(2) })], { stacks: 'shadow' });
+  await sweepGate(f.deps, REPO, T0);
+  f.clock.at = T0 + MINUTE;
+  await sweepGate(f.deps, REPO, T0 + MINUTE); // PR 2 is judged again: shadow saves no decision for it.
+  assert.equal(f.db.gateObservationsAround(REPO, 1, T0 + MINUTE).before?.atMs, T0, 'PR 1 was not judged, so nothing was observed');
+});
+
+test('a switch of gate.stacks re-judges every PR at once', async () => {
+  // PR 3 is the newest, so after the first pass PR 2 is judged again only on a full pass.
+  const f = fixture([pull(2, { baseRef: 'feat-a', stack: inStack(2), updatedAt: APPROVED_AT, verdicts: [approved('lee', 'sha2')] }), pull(3, { updatedAt: '2026-11-10T10:07:00Z' })], { stacks: 'on' });
+  f.around('sha2', 'feat-a', 'mb-tip-feat-a', 2);
+  await sweepGate(f.deps, REPO, T0);
+  await sweepGate({ ...f.deps, stacks: 'off' }, REPO, T0 + MINUTE);
+  assert.deepEqual(f.posts.at(-1), { sha: 'sha2', passed: false, title: WITHDRAWN.title });
+  await sweepGate(f.deps, REPO, T0 + 2 * MINUTE);
+  assert.deepEqual(f.posts.at(-1), { sha: 'sha2', passed: true, title: 'Approved for its own change on feat-a' });
+});
+
+test('a stacked PR into a listed extra branch is judged as before under shadow, and is not withdrawn', async () => {
+  const f = fixture([pull(2, { baseRef: 'feat-a', stack: inStack(2), verdicts: [approved('lee', 'sha2')] })], { stacks: 'shadow', branches: ['feat-a'] });
+  f.around('sha2', 'feat-a', 'mb-tip-feat-a', 2);
+  assert.equal(await sweepGate(f.deps, REPO, T0), 1);
+  assert.deepEqual(f.posts.at(-1), { sha: 'sha2', passed: true, title: 'Approved by Launch Engineering or Falcon' });
+  assert.doesNotMatch(f.summaries.at(-1)!, /stack/);
+  assert.equal(await sweepGate(f.deps, REPO, T0 + MINUTE), 0);
+  assert.equal(decodeState(f.cursors.get(`gate:${REPO}#2`) ?? null)?.verdict, 'pass');
 });

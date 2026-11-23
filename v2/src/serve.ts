@@ -64,7 +64,7 @@ export async function serve(config: Config, signal: AbortSignal): Promise<void> 
           else mergeBase = await mirror.mergeBase(await mirror.fetchBranchTip(number, judgedRef ?? (await github.pullState(repo, number)).baseRef), headSha);
           return sameChange(mirror, { headSha: oldSha, baseSha: oldBase ?? mergeBase }, mergeBase, headSha, governs);
         };
-        await sweepGate({ github, store, log, falcon: await ctx.auth.botLogin(), repoPack: config.policy.repoPath, requested: config.gate.everyPull ? null : store.chatRequestedPulls(repo), branches: config.gate.branches, dryRun: config.dryRun, sameChange: same }, repo);
+        await sweepGate({ github, store, log, falcon: await ctx.auth.botLogin(), repoPack: config.policy.repoPath, requested: config.gate.everyPull ? null : store.chatRequestedPulls(repo), branches: config.gate.branches, stacks: config.gate.stacks, dryRun: config.dryRun, sameChange: same }, repo);
       }
     });
   }
