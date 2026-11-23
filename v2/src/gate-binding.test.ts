@@ -12,26 +12,31 @@ const obs = (o: Partial<GateObservation> = {}): GateObservation => ({
 const around = (b: Partial<GateObservation> = {}, a: Partial<GateObservation> = {}) => ({ before: obs(b), after: obs(a) });
 
 test('bindFromObservations: the same head, base and merge base on both sides binds', () => {
-  assert.deepEqual(bindFromObservations(around(), 'h1', 'h1'), { headSha: 'h1', baseRef: 'main', mergeBase: 'm1' });
+  assert.deepEqual(bindFromObservations(around(), 'h1', 'h1', 'main'), { headSha: 'h1', baseRef: 'main', mergeBase: 'm1' });
 });
 
 test('bindFromObservations: a base or merge base change between the two sides does not bind', () => {
-  assert.equal(bindFromObservations(around({}, { headSha: 'h2' }), 'h1', 'h1'), null);
-  assert.equal(bindFromObservations(around({}, { baseRef: 'feat-a' }), 'h1', 'h1'), null);
-  assert.equal(bindFromObservations(around({}, { mergeBase: 'm2' }), 'h1', 'h1'), null);
+  assert.equal(bindFromObservations(around({}, { headSha: 'h2' }), 'h1', 'h1', 'main'), null);
+  assert.equal(bindFromObservations(around({}, { baseRef: 'feat-a' }), 'h1', 'h1', 'main'), null);
+  assert.equal(bindFromObservations(around({}, { mergeBase: 'm2' }), 'h1', 'h1', 'main'), null);
+});
+
+test("bindFromObservations: observations that GitHub's timeline contradicts do not bind", () => {
+  assert.equal(bindFromObservations(around(), 'h1', 'h1', 'feat-a'), null);
+  assert.equal(bindFromObservations(around(), 'h1', 'h1', ''), null, 'an unknown base binds nothing');
 });
 
 test('bindFromObservations: a missing side does not bind', () => {
-  assert.equal(bindFromObservations({ before: null, after: obs() }, 'h1', 'h1'), null);
-  assert.equal(bindFromObservations({ before: obs(), after: null }, 'h1', 'h1'), null);
+  assert.equal(bindFromObservations({ before: null, after: obs() }, 'h1', 'h1', 'main'), null);
+  assert.equal(bindFromObservations({ before: obs(), after: null }, 'h1', 'h1', 'main'), null);
 });
 
 test('bindFromObservations: a review re-pointed to the current head binds to the observed head', () => {
-  assert.deepEqual(bindFromObservations(around(), 'h9', 'h9'), { headSha: 'h1', baseRef: 'main', mergeBase: 'm1' });
+  assert.deepEqual(bindFromObservations(around(), 'h9', 'h9', 'main'), { headSha: 'h1', baseRef: 'main', mergeBase: 'm1' });
 });
 
 test('bindFromObservations: a review of some other commit does not bind', () => {
-  assert.equal(bindFromObservations(around(), 'h7', 'h9'), null);
+  assert.equal(bindFromObservations(around(), 'h7', 'h9', 'main'), null);
 });
 
 const cur = { headSha: 'h1', baseRef: 'main', mergeBase: 'm1' };

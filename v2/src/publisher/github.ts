@@ -184,6 +184,10 @@ export class OctokitGitHub implements GitHubPort {
     // matches it, so no approval binds). Page the timeline if a PR is ever retargeted that often.
     if (pr.timelineItems.nodes.length >= 100) return '';
     const events = pr.timelineItems.nodes.map((e) => ({ at: Date.parse(e.createdAt), from: e.previousRefName ?? e.oldBase ?? '', to: e.currentRefName ?? e.newBase ?? '' })).sort((a, b) => a.at - b.at);
+    // GitHub gives whole seconds, so a base change in the second of `atMs` may be just before it or just after it. That
+    // base is unknown: '' binds nothing. An event with no readable time is unknown too.
+    const second = Math.floor(atMs / 1000);
+    if (events.some((e) => Number.isNaN(e.at) || Math.floor(e.at / 1000) === second)) return '';
     const before = events.filter((e) => e.at <= atMs).at(-1);
     if (before) return before.to;
     return events[0]?.from || pr.baseRefName;

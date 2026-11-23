@@ -53,14 +53,15 @@ export async function serve(config: Config, signal: AbortSignal): Promise<void> 
       for (const repo of config.github.repos) {
         const github = new OctokitGitHub(await ctx.auth.octokitFor(repo), await ctx.auth.botLogin());
         const mirror = new Mirror(config.stateDir, repo, `https://github.com/${repo}.git`, () => ctx.auth.gitTokenFor(repo));
-        // The same comparison the worker uses for Falcon's own approvals: the head from where it left its base now, the
-        // old commit from the base it was approved on (from today's base when that is unknown).
-        const same = async (number: number, oldSha: string, headSha: string, governs: (path: string) => boolean, oldBase?: string, judgedRef?: string) => {
+        // The same comparison the worker uses for Falcon's own approvals: the head from the merge base the gate read (from
+        // where it left its base now, when not given), the old commit from the base it was approved on.
+        const same = async (number: number, oldSha: string, headSha: string, governs: (path: string) => boolean, oldBase?: string, judgedRef?: string, judgedMergeBase?: string) => {
           await mirror.ensure();
           await mirror.fetchCommit(headSha);
-          // The base branch the gate judged, so the answer matches the key it is saved under.
-          const baseRef = judgedRef ?? (await github.pullState(repo, number)).baseRef;
-          const mergeBase = await mirror.mergeBase(await mirror.fetchBranchTip(number, baseRef), headSha);
+          // The merge base the gate read, as is, so the answer matches the key it is saved under even if the base moved since.
+          let mergeBase = judgedMergeBase;
+          if (mergeBase) await mirror.fetchCommit(mergeBase);
+          else mergeBase = await mirror.mergeBase(await mirror.fetchBranchTip(number, judgedRef ?? (await github.pullState(repo, number)).baseRef), headSha);
           return sameChange(mirror, { headSha: oldSha, baseSha: oldBase ?? mergeBase }, mergeBase, headSha, governs);
         };
         await sweepGate({ github, store, log, falcon: await ctx.auth.botLogin(), repoPack: config.policy.repoPath, requested: config.gate.everyPull ? null : store.chatRequestedPulls(repo), branches: config.gate.branches, dryRun: config.dryRun, sameChange: same }, repo);

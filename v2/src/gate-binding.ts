@@ -5,17 +5,21 @@ import type { GateObservation } from './types.ts';
 export interface Binding { headSha: string; baseRef: string; mergeBase: string }
 export type Current = Binding;
 
-// An approval binds only if the head, base and merge base were the same on both sides of it.
+// An approval binds only if the head, base and merge base were the same on both sides of it, and GitHub's
+// timeline puts the approval on that base. The gate does not observe a PR while it sits on a base it does not
+// judge, so two agreeing observations can hide a trip away and back; the timeline sees it.
 // ponytail: sampling gap. If the base is rewritten and rewritten back between two observations
 // and an approval lands inside that gap, it can bind to the wrong merge base. A faster poll shrinks the gap.
 export function bindFromObservations(
   around: { before: GateObservation | null; after: GateObservation | null },
   reviewSha: string,
   currentHead: string,
+  baseRefAtSubmit: string,
 ): Binding | null {
   const { before, after } = around;
   if (!before || !after) return null;
   if (before.headSha !== after.headSha || before.baseRef !== after.baseRef || before.mergeBase !== after.mergeBase) return null;
+  if (baseRefAtSubmit !== before.baseRef) return null;
   // GitHub re-points a review to the new head on a same-diff push, so the current head is also fine.
   if (reviewSha !== before.headSha && reviewSha !== currentHead) return null;
   return { headSha: before.headSha, baseRef: before.baseRef, mergeBase: before.mergeBase };

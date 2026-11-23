@@ -103,10 +103,25 @@ test('baseRefAt: the base in force at a time', async () => {
   const at = (h: string, nodes = events) => new OctokitGitHub({ graphql: graphql(nodes) } as unknown as Octokit, null).baseRefAt('acme/demo', 3, Date.parse(`2026-11-10T${h}:00Z`));
   assert.equal(await at('11:00'), 'feat-a');
   assert.equal(await at('12:30'), 'main');
-  assert.equal(await at('13:00'), 'feat-b');
+  assert.equal(await at('13:01'), 'feat-b');
   assert.equal(await at('11:00', []), 'feat-b');
   const many = Array.from({ length: 100 }, (_, i) => ({ __typename: 'BaseRefChangedEvent', createdAt: '2026-11-10T12:00:00Z', previousRefName: `p${i}`, currentRefName: `c${i}` }));
   assert.equal(await at('12:30', many), '', 'a read at the cap may be cut short, so no base is claimed');
+});
+
+test('baseRefAt: a base change in the same second leaves the base unknown', async () => {
+  // Away to feat-a, then back to main in the second of the approval: which came first is not known.
+  const nodes = [
+    { __typename: 'BaseRefChangedEvent', createdAt: '2026-11-10T10:01:00Z', previousRefName: 'main', currentRefName: 'feat-a' },
+    { __typename: 'BaseRefChangedEvent', createdAt: '2026-11-10T10:05:00Z', previousRefName: 'feat-a', currentRefName: 'main' },
+  ];
+  const github = new OctokitGitHub({ graphql: async () => ({ repository: { pullRequest: { baseRefName: 'main', timelineItems: { nodes } } } }) } as unknown as Octokit, null);
+  assert.equal(await github.baseRefAt('acme/demo', 3, Date.parse('2026-11-10T10:05:00Z')), '');
+  assert.equal(await github.baseRefAt('acme/demo', 3, Date.parse('2026-11-10T10:05:00.900Z')), '');
+  assert.equal(await github.baseRefAt('acme/demo', 3, Date.parse('2026-11-10T10:04:59Z')), 'feat-a', 'the second before is known');
+  assert.equal(await github.baseRefAt('acme/demo', 3, Date.parse('2026-11-10T10:05:01Z')), 'main', 'the second after is known');
+  const unreadable = [{ __typename: 'BaseRefChangedEvent', createdAt: 'soon', previousRefName: 'main', currentRefName: 'feat-a' }];
+  assert.equal(await new OctokitGitHub({ graphql: async () => ({ repository: { pullRequest: { baseRefName: 'feat-a', timelineItems: { nodes: unreadable } } } }) } as unknown as Octokit, null).baseRefAt('acme/demo', 3, Date.parse('2026-11-10T10:05:00Z')), '');
 });
 
 test('stackMembers: maps the stack entries and marks the open ones', async () => {

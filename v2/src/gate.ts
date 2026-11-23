@@ -1,10 +1,14 @@
 import { createHash } from 'node:crypto';
+import { approvalOutcome, bindFromObservations, bindFromTimeline, decodeState, encodeState, type Binding } from './gate-binding.ts';
 import type { Logger } from './log.ts';
 import { gateVerdict, governedBy, type GateVerdict } from './policy/gate.ts';
 import { parsePolicy } from './policy/load.ts';
+import type { GateObservation } from './types.ts';
 
 /** Every open PR is judged again this often, in case a change did not move its update time. */
 const FULL_RECHECK_MS = 30 * 60_000;
+/** How long observations are kept. An approval older than this binds only through GitHub's timeline, or not at all. */
+const OBSERVATION_RETENTION_MS = 14 * 24 * 3_600_000;
 
 export type StackRef = { number: number; baseRef: string; position: number };
 
@@ -15,9 +19,6 @@ export interface GatePort {
   pullState(repo: string, number: number): Promise<{ headSha: string; baseRef: string; baseSha: string; updatedAt: string; open: boolean }>;
   /** Every path the PR changes, or null when GitHub's list may be cut short. */
   changedPaths(repo: string, number: number): Promise<string[] | null>;
-  approvers(repo: string, number: number, headSha: string): Promise<string[]>;
-  /** People whose latest verdict is an approval of a commit older than `headSha`, with that commit. */
-  olderApprovals(repo: string, number: number, headSha: string): Promise<Array<{ login: string; sha: string }>>;
   /** Each reviewer's latest verdict on any commit, with its time. A person's comment keeps their verdict; the bot's comment replaces its own. */
   latestVerdicts(repo: string, number: number): Promise<Array<{ login: string; state: string; sha: string; submittedAt: string }>>;
   /** The newest commit both `baseSha` and `headSha` descend from. */
@@ -37,8 +38,12 @@ export interface GateDeps {
   store: {
     cursor(key: string): string | null;
     setCursor(key: string, value: string): void;
-    /** Falcon's latest review of a PR on any commit except `excludeHead`, with the base it saved. Absent: Falcon's own approvals never carry. */
-    lastReview?(repo: string, number: number, excludeHead: string): { headSha: string; baseSha: string; event: string } | null;
+    /** Falcon's latest review of a PR on any commit except `excludeHead`, with the base it saved. Absent: Falcon's approval binds only as a person's does on the default branch. */
+    lastReview?(repo: string, number: number, excludeHead: string): { headSha: string; baseSha: string; baseRef: string; event: string } | null;
+    /** Records what the gate saw of a PR at one moment. Absent: no person's approval binds from observations. */
+    observeGate?(o: GateObservation): void;
+    gateObservationsAround?(repo: string, number: number, atMs: number): { before: GateObservation | null; after: GateObservation | null };
+    pruneGateObservations?(beforeMs: number): number;
   };
   log: Logger;
   /** Falcon's own login, or null when it is unknown. */
@@ -52,21 +57,26 @@ export interface GateDeps {
   dryRun: boolean;
   /**
    * Whether `headSha` carries the same change as `oldSha` and the base did not move anything `governs` names. `oldBase`
-   * is the base `oldSha` was approved on, when known. Absent: only approvals on the current commit count. Throws when it
-   * cannot tell.
+   * is the merge base `oldSha` was approved on; `mergeBase` is the one the gate read for `headSha`, used as is. Absent:
+   * only approvals of the change as it is now count. Throws when it cannot tell.
    */
-  sameChange?: (number: number, oldSha: string, headSha: string, governs: (path: string) => boolean, oldBase?: string, baseRef?: string) => Promise<boolean>;
+  sameChange?: (number: number, oldSha: string, headSha: string, governs: (path: string) => boolean, oldBase?: string, baseRef?: string, mergeBase?: string) => Promise<boolean>;
+  /** The time an observation is recorded at. Default: `Date.now`. */
+  now?: (() => number) | undefined;
 }
 
 type Older = Array<{ login: string; sha: string }>;
+/** `others` approved this commit but are not eligible: they are named in the check and never counted. */
+type Counted = { direct: string[]; carried: Older; stale: Older; unbound: string[]; others: string[] };
 
-function describe({ verdict, uncovered }: GateVerdict, approvers: string[], outside: string[], tooMany: boolean, moved: boolean, carried: Older = [], stale: Older = []): { title: string; summary: string } {
+function describe({ verdict, uncovered }: GateVerdict, approvers: string[], outside: string[], tooMany: boolean, moved: boolean, carried: Older = [], stale: Older = [], unbound: string[] = []): { title: string; summary: string } {
   // An approval GitHub shows but the gate does not count is the first thing an author asks about.
   const notCounted = outside.length ? ` ${outside.join(' and ')} ${outside.length === 1 ? 'is' : 'are'} not in the team list of the policy file, so ${outside.length === 1 ? 'that' : 'their'} approval does not count here.` : '';
   const short = (sha: string) => sha.slice(0, 12);
   // An approval of an earlier commit is named with that commit, so nobody reads it as an approval of this one.
   const earlier = carried.map((c) => ` Approved by ${c.login} on ${short(c.sha)}, an earlier commit with the same change.`).join('')
-    + stale.map((c) => ` ${c.login} approved ${short(c.sha)}, but the change is different on this commit, so that approval does not count here. Approve this commit again.`).join('');
+    + stale.map((c) => ` ${c.login} approved ${short(c.sha)}, but the change is different on this commit, so that approval does not count here. Approve this commit again.`).join('')
+    + unbound.map((login) => ` ${login} approved, but Falcon could not tell which change that approval was for, so it does not count here. Approve this commit again.`).join('');
   const who = (approvers.length ? `Approved on this commit by ${approvers.join(', ')}.${notCounted}` : carried.length ? '' : 'Nobody has approved this commit yet.') + earlier;
   const list = uncovered.slice(0, 10).map((f) => `\`${f}\``).join(', ') + (uncovered.length > 10 ? ` and ${uncovered.length - 10} more` : '');
   if (verdict === 'pass') return { title: 'Approved by Launch Engineering or Falcon', summary: `${who.trim()} A team member or Falcon approved ${carried.length && !approvers.length ? 'this change' : 'this commit'}.` };
@@ -76,57 +86,114 @@ function describe({ verdict, uncovered }: GateVerdict, approvers: string[], outs
 }
 
 /**
- * Reads one PR, its files and its approvals, then the PR again. GitHub lists the files of "the PR now", so they
- * belong to the commit only if nothing about the PR moved in between. Tries twice; `steady` says whether it held.
+ * Reads one PR, its files and its reviewers' verdicts, then the PR again. GitHub lists the files of "the PR now", so they
+ * belong to the commit only if nothing about the PR moved in between. Tries twice; `steady` says whether it held. A
+ * steady read also gets the merge base the PR's own change starts from.
  */
-async function readPull(github: GatePort, repo: string, number: number, author: string) {
+async function readPull(github: GatePort, repo: string, number: number) {
   for (let attempt = 0; ; attempt++) {
     const before = await github.pullState(repo, number);
     const files = await github.changedPaths(repo, number);
-    // GitHub refuses a self-approval; this does not rely on it.
-    const approvers = (await github.approvers(repo, number, before.headSha)).filter((a) => a.toLowerCase() !== author.toLowerCase()).sort();
+    // Read inside the window: a review moves the update time, so a verdict given during the read makes it unsteady.
+    const verdicts = await github.latestVerdicts(repo, number);
     const after = await github.pullState(repo, number);
     // shortcut: two pushes inside one second of the update time go unseen; read the files with the compare API,
     // pinned to the commit, if that window ever matters.
-    const steady = after.headSha === before.headSha && after.baseRef === before.baseRef && after.updatedAt === before.updatedAt;
-    if (steady || attempt === 1) return { ...after, files, approvers, steady };
+    const steady = after.headSha === before.headSha && after.baseRef === before.baseRef && after.baseSha === before.baseSha && after.updatedAt === before.updatedAt;
+    if (steady || attempt === 1) return { ...after, files, verdicts, steady, mergeBase: steady ? await github.mergeBase(repo, after.baseSha, after.headSha) : '' };
   }
 }
 
 /**
- * Team members, other than the author, and Falcon, whose latest verdict approves an older commit that carries the same
- * change as `headSha`. Each answer is saved per pair of commits and base branch, so a retarget compares again. A
- * comparison that fails counts as not the same and is not saved.
+ * Sorts each approval by the change it was given on (spec R2). Eligible: Falcon, and team members other than the author
+ * who are not bots. `direct`: bound to the head, base and merge base now. `carried` or `stale`: bound to another change,
+ * then compared. `unbound`: a person's approval that nothing places on a change. The comparison runs git, so it runs
+ * only when the direct approvals are not `enough`; then the others are neither compared nor named, as before.
  */
-async function carriedApprovals(deps: GateDeps, repo: string, number: number, headSha: string, baseRef: string, author: string, team: string[], governs: (path: string) => boolean): Promise<{ carried: Older; stale: Older }> {
+async function countApprovals(deps: GateDeps, repo: string, pr: { number: number; author: string; defaultBranch: string }, read: Awaited<ReturnType<typeof readPull>>, team: string[], rules: string, governs: (path: string) => boolean, enough: (approvers: string[]) => boolean): Promise<Counted> {
   const lower = (s: string) => s.toLowerCase();
+  // GitHub's answers about the past never change, so each is asked once. A dry run saves nothing.
+  const remember = async (key: string, ask: () => Promise<string>) => {
+    const known = deps.store.cursor(key);
+    if (known !== null) return known;
+    const answer = await ask();
+    if (!deps.dryRun) deps.store.setCursor(key, answer);
+    return answer;
+  };
   const members = new Set(team.map(lower));
+  const current: Binding = { headSha: read.headSha, baseRef: read.baseRef, mergeBase: read.mergeBase };
+  // The head and base tip Falcon reviewed, saved with its review.
+  const last = deps.store.lastReview?.(repo, pr.number, '') ?? null;
+  const direct: string[] = [];
+  const unbound: string[] = [];
+  const others: string[] = [];
+  const pending: Array<{ login: string; binding: Binding }> = [];
+  for (const v of read.verdicts) {
+    const l = lower(v.login);
+    // GitHub refuses a self-approval; this does not rely on it.
+    if (v.state !== 'APPROVED' || l === lower(pr.author)) continue;
+    const falcon = l === deps.falcon?.toLowerCase();
+    if (!falcon && (l.endsWith('[bot]') || !members.has(l))) {
+      if (v.sha === read.headSha) others.push(v.login);
+      continue;
+    }
+    const at = Date.parse(v.submittedAt);
+    // A time that does not parse places the approval nowhere: only Falcon's saved review can bind it.
+    const timed = !Number.isNaN(at);
+    // The base branch GitHub's timeline gives for the moment of the approval, asked at most once.
+    let base: string | undefined;
+    const baseAt = async () => base ??= await remember(`gate-baseat:${repo}#${pr.number}:${v.submittedAt}`, () => deps.github.baseRefAt(repo, pr.number, at));
+    let binding: Binding | null = null;
+    try {
+      if (falcon) {
+        // The saved review speaks for this approval only when it is of the approved commit or of the head now.
+        if (last?.event === 'APPROVE' && (last.headSha === v.sha || last.headSha === read.headSha)) {
+          const { headSha, baseSha, baseRef } = last;
+          binding = { headSha, baseRef, mergeBase: await remember(`gate-mb:${repo}:${baseSha}:${headSha}`, () => deps.github.mergeBase(repo, baseSha, headSha)) };
+        }
+      } else if (timed) {
+        binding = bindFromObservations(deps.store.gateObservationsAround?.(repo, pr.number, at) ?? { before: null, after: null }, v.sha, read.headSha, await baseAt());
+      }
+      // Nothing better: an approval of this head, given on the default branch and still on it, binds to the change now.
+      // The default branch only moves forward, so the PR's own change can only have shrunk since.
+      if (!binding && timed && v.sha === read.headSha && read.baseRef === pr.defaultBranch) {
+        binding = bindFromTimeline(await baseAt(), v.sha, current, [pr.defaultBranch]);
+      }
+    } catch (error) {
+      // Not counted and not named, so the PR waits; the next pass looks again.
+      deps.log.info({ repo, number: pr.number, login: v.login, err: String(error) }, 'merge gate: could not look up which change an approval was for');
+      continue;
+    }
+    if (binding && approvalOutcome(binding, current) === 'direct') direct.push(v.login);
+    else if (binding) pending.push({ login: v.login, binding });
+    // R5 names a person's approval it cannot place. Falcon's simply does not count.
+    else if (!falcon) unbound.push(v.login);
+  }
+  if (enough(direct)) return { direct, carried: [], stale: [], unbound: [], others };
   const carried: Older = [];
   const stale: Older = [];
-  // GitHub lists Falcon only while its latest review on any commit is that approval: a later comment-only review ends
-  // it. The store gives the base Falcon reviewed against, which is the branch below for a stacked PR; with no record
-  // of that exact review, nothing carries.
-  const last = deps.store.lastReview?.(repo, number, '') ?? null;
-  for (const { login, sha } of await deps.github.olderApprovals(repo, number, headSha)) {
-    const l = lower(login);
-    const falcon = l === deps.falcon?.toLowerCase();
-    if (falcon ? !(last?.event === 'APPROVE' && last.headSha === sha) : l === lower(author) || l.endsWith('[bot]') || !members.has(l)) continue;
-    const base = falcon ? last!.baseSha : undefined;
-    // ponytail: one cursor per pair of commits, base branch and saved base, never removed; prune by age if the table ever matters.
-    const key = `gate-carry:${repo}:${sha}:${headSha}:${baseRef}${base ? `:${base}` : ''}`;
-    let same = deps.store.cursor(key);
-    if (same === null) {
-      try {
-        same = String(await deps.sameChange!(number, sha, headSha, governs, base, baseRef));
-        deps.store.setCursor(key, same);
-      } catch (error) {
-        deps.log.info({ repo, number, old: sha, head: headSha, err: String(error) }, 'merge gate: could not compare with an older approval');
-        continue;
+  const compare = deps.sameChange;
+  if (compare) {
+    for (const { login, binding } of pending) {
+      // I4: the PR, the binding, the change now and the rules. A move of any of them compares again.
+      // ponytail: one cursor per key, never removed; prune by age if the table ever matters.
+      const key = `gate-carry:${repo}#${pr.number}:${binding.headSha}:${binding.baseRef}:${binding.mergeBase}:${read.headSha}:${read.baseRef}:${read.mergeBase}:${rules}`;
+      let same = deps.store.cursor(key);
+      if (same === null) {
+        try {
+          // The merge base stands in for the old base tip: the merge base of a merge base and its head is itself.
+          same = String(await compare(pr.number, binding.headSha, read.headSha, governs, binding.mergeBase, read.baseRef, read.mergeBase));
+          if (!deps.dryRun) deps.store.setCursor(key, same);
+        } catch (error) {
+          // A comparison that fails is not saved and counts for nothing.
+          deps.log.info({ repo, number: pr.number, old: binding.headSha, head: read.headSha, err: String(error) }, 'merge gate: could not compare with an older approval');
+          continue;
+        }
       }
+      (same === 'true' ? carried : stale).push({ login, sha: binding.headSha });
     }
-    (same === 'true' ? carried : stale).push({ login, sha });
   }
-  return { carried, stale };
+  return { direct, carried, stale, unbound, others };
 }
 
 /**
@@ -154,12 +221,15 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
     log.warn({ err: error, repo }, 'merge gate: the policy pack is invalid, so no team member counts');
   }
 
-  // A pass must not outlive the rule that gave it: a change to the pack re-judges every PR. `v2` marks the rule
-  // itself (CODEOWNERS no longer counts), so the first pass after this change re-judges every PR once.
-  const rules = createHash('sha256').update(['v2', pack ?? '', deps.falcon ?? ''].join('\0')).digest('hex');
+  // A pass must not outlive the rule that gave it: a change to the pack re-judges every PR. `v3` marks the rule
+  // itself (an approval counts only for the change it was given on), so the first pass after this change re-judges
+  // every PR once.
+  const rules = createHash('sha256').update(['v3', pack ?? '', deps.falcon ?? ''].join('\0')).digest('hex');
   const fullKey = `gate:${repo}:full`;
   const [lastRules, lastAt] = (store.cursor(fullKey) ?? ':0').split(':');
   const full = lastRules !== rules || now - Number(lastAt) >= FULL_RECHECK_MS;
+  const clock = () => deps.now?.() ?? Date.now();
+  if (full && !deps.dryRun) store.pruneGateObservations?.(clock() - OBSERVATION_RETENTION_MS);
   const cursorKey = `gate:${repo}`;
   const since = full ? '' : store.cursor(cursorKey) ?? '';
   // `>=`: a review can land in the same second as the newest PR already seen.
@@ -171,25 +241,28 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   let newest = since;
   for (const p of pulls) {
     try {
-      const read = await readPull(github, repo, p.number, p.author);
+      const read = await readPull(github, repo, p.number);
       if (!read.open || (read.baseRef !== branch && !extra.includes(read.baseRef))) continue; // Closed or retargeted since it was listed.
+      // Recorded before the approvals are counted, so an approval given just now has an observation after it.
+      if (read.steady && !deps.dryRun) store.observeGate?.({ repo, number: p.number, atMs: clock(), headSha: read.headSha, baseRef: read.baseRef, baseSha: read.baseSha, mergeBase: read.mergeBase });
       // A PR that will not hold still gets a wait, never a skip: an old pass must not survive because the PR keeps moving.
-      let result: GateVerdict = !read.steady || read.files === null ? { verdict: 'wait', uncovered: [] } : gateVerdict({ files: read.files, team, humanPaths, approvers: read.approvers, falcon: deps.falcon });
-      // A team member's approval of an older commit counts when that commit carries the same change. Checked only
-      // when the gate would wait, because the comparison runs git.
-      let older: { carried: Older; stale: Older } = { carried: [], stale: [] };
-      if (result.verdict === 'wait' && read.steady && read.files !== null && deps.sameChange) {
-        older = await carriedApprovals(deps, repo, p.number, read.headSha, read.baseRef, p.author, team, governedBy(read.files, deps.repoPack, context));
-        if (older.carried.length) result = gateVerdict({ files: read.files, team, humanPaths, approvers: [...read.approvers, ...older.carried.map((c) => c.login)], falcon: deps.falcon });
+      let result: GateVerdict = { verdict: 'wait', uncovered: [] };
+      let counted: Counted = { direct: [], carried: [], stale: [], unbound: [], others: [] };
+      if (read.steady && read.files !== null) {
+        const files = read.files;
+        const judge = (approvers: string[]) => gateVerdict({ files, team, humanPaths, approvers, falcon: deps.falcon });
+        counted = await countApprovals(deps, repo, p, read, team, rules, governedBy(files, deps.repoPack, context), (approvers) => judge(approvers).verdict === 'pass');
+        result = judge([...counted.direct, ...counted.carried.map((c) => c.login)]);
       }
-      // `moved` never equals a judged state, so the next pass posts the real verdict.
-      const olderState = [...older.carried, ...older.stale.map((c) => ({ ...c, login: `-${c.login}` }))].map((c) => c.login).join(',');
-      const state = read.steady ? `${read.headSha}:${result.verdict}:${read.approvers.join(',')}:${result.uncovered.length}${olderState ? `:${olderState}` : ''}` : `${read.headSha}:moved`;
+      const approvers = [...counted.direct, ...counted.others].sort();
+      const older = [...counted.carried.map((c) => c.login), ...counted.stale.map((c) => `-${c.login}`), ...counted.unbound.map((l) => `?${l}`)].join(',');
+      // R3: the decision is for this head on this base. `moved` never equals a judged state, so the next pass posts the real verdict.
+      const state = encodeState({ headSha: read.headSha, baseRef: read.baseRef, mergeBase: read.mergeBase, verdict: read.steady ? result.verdict : 'moved', detail: read.steady ? `${approvers.join(',')}:${result.uncovered.length}${older ? `:${older}` : ''}` : '' });
       const key = `gate:${repo}#${p.number}`;
       if (store.cursor(key) !== state) {
-        const outside = read.approvers.filter((a) => a.toLowerCase() !== deps.falcon?.toLowerCase() && !team.some((t) => t.toLowerCase() === a.toLowerCase()));
-        const { title, summary } = describe(result, read.approvers, outside, read.files === null, !read.steady, older.carried, older.stale);
-        log.info({ repo, number: p.number, head: read.headSha, verdict: result.verdict, steady: read.steady, approvers: read.approvers, dryRun: deps.dryRun }, 'merge gate decided');
+        const outside = approvers.filter((a) => a.toLowerCase() !== deps.falcon?.toLowerCase() && !team.some((t) => t.toLowerCase() === a.toLowerCase()));
+        const { title, summary } = describe(result, approvers, outside, read.files === null, !read.steady, counted.carried, counted.stale, counted.unbound);
+        log.info({ repo, number: p.number, head: read.headSha, verdict: result.verdict, steady: read.steady, approvers, dryRun: deps.dryRun }, 'merge gate decided');
         if (!deps.dryRun) {
           await github.postGate(repo, read.headSha, result.verdict === 'pass', title, summary);
           store.setCursor(key, state);
@@ -208,7 +281,9 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   for (const base of new Set(open.map((p) => p.baseRef))) {
     try {
       for (const entry of await github.queueEntries(repo, base)) {
-        const passed = (store.cursor(`gate:${repo}#${entry.number}`) ?? '').split(':')[1] === 'pass';
+        const saved = decodeState(store.cursor(`gate:${repo}#${entry.number}`));
+        // A pass judged on another base branch says nothing about this queue's branch.
+        const passed = saved?.verdict === 'pass' && saved.baseRef === base;
         // ponytail: one cursor per queue commit, never removed; prune by age if the table ever matters.
         const key = `gateq:${repo}:${entry.headSha}`;
         if (store.cursor(key) === String(passed)) continue;
