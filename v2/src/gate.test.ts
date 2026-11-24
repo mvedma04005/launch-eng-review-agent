@@ -187,9 +187,9 @@ test('a PR closed or retargeted while it is being read gets no check', async () 
   assert.deepEqual([...closed.posts, ...moved.posts], []);
 });
 
-// Seven PRs into main, so a pass judges some and not others. PR 7 is the newest, so `>=` reads it on every pass.
-function seven(approvers: (n: number) => string[]) {
-  const pulls = [1, 2, 3, 4, 5, 6, 7].map((n) => pull(n, { approvers: approvers(n) }));
+// PRs 1 to `count` into main, so a pass judges some and not others. The last is the newest, so `>=` reads it on every pass.
+function several(count: number, approvers: (n: number) => string[] = () => []) {
+  const pulls = Array.from({ length: count }, (_, i) => pull(i + 1, { approvers: approvers(i + 1), updatedAt: new Date(Date.parse('2026-11-10T10:00:00Z') + (i + 1) * 1000).toISOString() }));
   const f = fixture(pulls);
   const reads: number[] = [];
   const { pullState } = f.deps.github;
@@ -200,26 +200,55 @@ function seven(approvers: (n: number) => string[]) {
 }
 
 test('a pass does not outlive a change to the rules on the default branch: every PR is judged again in one pass', async () => {
-  const { f, pass } = seven((n) => (n === 1 ? ['lee'] : []));
+  const { f, pass } = several(7, (n) => (n === 1 ? ['lee'] : []));
   await pass(T0);
   assert.equal(f.posts[0]!.passed, true);
   f.files['.falcon/policy.yaml'] = 'version: 1\nname: repo\nteam: { members: [kim] }\n'; // lee leaves the team; PR 1 is not touched.
-  // PR 1's turn is not due (this pass would roll 4, 5 and 6), so only the rule change judges it.
+  // PR 1's turn is not due (this pass would roll PR 2), so only the rule change judges it.
   assert.deepEqual(await pass(T0 + MINUTE), { posted: 1, read: [1, 2, 3, 4, 5, 6, 7] });
   assert.deepEqual(f.posts.at(-1), { sha: 'sha1', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' });
 });
 
-test('each pass also judges the next three PRs by number, wrapping around, so a silent change is caught in its turn', async () => {
-  const { f, pulls, pass } = seven(() => ['lee']);
+test('each pass also judges the next PRs by number, wrapping around, so a silent change is caught in its turn', async () => {
+  const { f, pulls, pass } = several(7, () => ['lee']);
   assert.equal((await pass(T0)).posted, 7, 'every PR is new');
-  assert.equal(f.cursors.get(`gate-roll:${REPO}`), '3');
-  pulls[1]!.approvers = []; // PR 2's approval is withdrawn without moving its update time.
-  assert.deepEqual(await pass(T0 + MINUTE), { posted: 0, read: [4, 5, 6, 7] }, 'PRs 4, 5 and 6, and the newest');
-  assert.equal(f.cursors.get(`gate-roll:${REPO}`), '6');
-  // Past PR 7 the turn wraps to PRs 1 and 2, and PR 2's withdrawn approval is caught.
-  assert.deepEqual(await pass(T0 + 2 * MINUTE), { posted: 1, read: [1, 2, 7] });
-  assert.deepEqual(f.posts.at(-1), { sha: 'sha2', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' });
-  assert.equal(f.cursors.get(`gate-roll:${REPO}`), '2');
+  assert.equal(f.cursors.get(`gate-roll:${REPO}`), `1:${T0}`, 'no turn time saved yet counts as 30 s ago: 1 PR');
+  pulls[0]!.approvers = []; // PR 1's approval is withdrawn without moving its update time.
+  // 5 minutes apart: 7 PRs × 5 / 25 = 1.4, so 2 PRs a pass, besides the newest (PR 7).
+  const reads: number[][] = [];
+  for (let i = 1; i <= 4; i++) reads.push((await pass(T0 + i * 5 * MINUTE)).read);
+  assert.deepEqual(reads, [[2, 3, 7], [4, 5, 7], [6, 7], [1, 2, 7]]);
+  // Past PR 7 the turn wraps to PR 1, and its withdrawn approval is caught then, not before.
+  assert.equal(f.posts.length, 8);
+  assert.deepEqual(f.posts.at(-1), { sha: 'sha1', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' });
+  assert.equal(f.cursors.get(`gate-roll:${REPO}`), `2:${T0 + 20 * MINUTE}`);
+});
+
+test('a pass takes a share of the open PRs sized by the time since the last turn, up to 5 minutes', async () => {
+  const { f, pass } = several(60);
+  const turn = () => f.cursors.get(`gate-roll:${REPO}`);
+  await pass(T0);
+  assert.equal(turn(), `2:${T0}`, 'no turn time saved yet counts as 30 s ago: 60 × 30 s / 25 min = 1.2, so 2 PRs');
+  await pass(T0 + 25_000);
+  assert.equal(turn(), `3:${T0 + 25_000}`, '25 s later: 1 PR');
+  await pass(T0 + 25_000 + 5 * MINUTE);
+  assert.equal(turn(), `15:${T0 + 25_000 + 5 * MINUTE}`, '5 minutes later: 12 PRs');
+  await pass(T0 + 25_000 + 15 * MINUTE);
+  assert.equal(turn(), `27:${T0 + 25_000 + 15 * MINUTE}`, '10 minutes later counts as 5: 12 PRs, not 24');
+  // A cursor without a time (written before the time was saved) is one pass ago too, so a deploy is not a full pass.
+  f.cursors.set(`gate-roll:${REPO}`, '27');
+  await pass(T0 + 20 * MINUTE);
+  assert.equal(turn(), `29:${T0 + 20 * MINUTE}`);
+});
+
+test('the turns reach every open PR within 25 minutes, at any pass rate', async () => {
+  for (const gap of [25_000, MINUTE, 90_000, 5 * MINUTE]) {
+    const { pass } = several(60);
+    await pass(T0); // Every PR is new.
+    const judged = new Set<number>();
+    for (let at = T0 + gap; at <= T0 + 25 * MINUTE; at += gap) for (const n of (await pass(at)).read) judged.add(n);
+    assert.equal(judged.size, 60, `a pass every ${gap / 1000} s`);
+  }
 });
 
 test('only PRs requested in Chat get a check, and a request for an old PR is picked up on the next pass', async () => {
@@ -315,9 +344,9 @@ test('the gate compares only when it would wait, and only for team members other
   await sweepGate(f.deps, REPO, T0);
   assert.deepEqual(calls, []);
   assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['sha1', true], ['sha2', false]]);
-  // Without lee the gate would wait, so kim's older approval is compared. PR 1 is judged again in its turn.
+  // Without lee the gate would wait, so kim's older approval is compared. PR 1 is judged again in its turn, after PR 2's.
   p.verdicts = [kim];
-  await sweepGate(f.deps, REPO, T0 + MINUTE);
+  for (const at of [T0 + MINUTE, T0 + 2 * MINUTE]) await sweepGate(f.deps, REPO, at);
   assert.deepEqual(calls, ['a']);
 });
 
@@ -845,6 +874,20 @@ test('a shadow pass does not judge the bottom PR of a stack when nothing changed
   f.clock.at = T0 + MINUTE;
   await sweepGate(f.deps, REPO, T0 + MINUTE); // PR 2, the newest, is read again by `>=`; it did not change.
   assert.equal(f.db.gateObservationsAround(REPO, 1, T0 + MINUTE).before?.atMs, T0, 'PR 1 was not judged, so nothing was observed');
+});
+
+test('shadow: a stacked PR that did not change is judged in its rolled turn, and not on every pass', async () => {
+  // PR 1, at the bottom, is the newest, so `>=` reads it on every pass. Shadow saves nothing for PR 2.
+  const f = fixture([pull(1, { stack: inStack(1), updatedAt: '2026-11-10T10:06:00Z' }), pull(2, { baseRef: 'br1', stack: inStack(2) })], { stacks: 'shadow' });
+  const reads: number[] = [];
+  const { pullState } = f.deps.github;
+  f.deps.github.pullState = async (repo, number) => { reads.push(number); return pullState(repo, number); };
+  const judged = async (at: number) => { reads.length = 0; await sweepGate(f.deps, REPO, at); return [...new Set(reads)].sort((a, b) => a - b); };
+  await judged(T0); // PR 1's turn; PR 1 is new, so its stack is judged too.
+  assert.deepEqual(await judged(T0 + MINUTE), [1, 2], "PR 2's turn");
+  assert.deepEqual(await judged(T0 + 2 * MINUTE), [1], "PR 1's turn: PR 2 is not read");
+  assert.deepEqual(await judged(T0 + 3 * MINUTE), [1, 2], "PR 2's turn again");
+  assert.equal(f.cursors.has(`gate:${REPO}#2`), false, 'nothing saved for PR 2');
 });
 
 test('a switch of gate.stacks re-judges every PR at once', async () => {

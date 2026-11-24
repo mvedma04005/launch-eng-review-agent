@@ -68,23 +68,14 @@ export async function serve(config: Config, signal: AbortSignal): Promise<void> 
     };
     const pollMs = config.gate.pollSeconds * 1000;
     if (config.gate.probeSeconds > 0) {
-      // One loop, so the probe and a pass never run at the same time. Per repository: what the probe saw before the last
-      // pass, and when that pass ended.
-      const last = new Map<string, { probe: GateProbe | null; at: number }>();
-      every(config.gate.probeSeconds * 1000, 'gate_sweep', async () => {
-        for (const repo of config.github.repos) {
-          const github = await gitHubFor(repo);
-          let probe: GateProbe | null = null;
-          try { probe = await probeGate(github, repo, config.gate.branches); } catch (error) { metrics.errors.inc({ component: 'gate_probe' }); log.warn({ err: error, repo }, 'merge gate probe failed; the gate runs a pass'); }
-          const seen = last.get(repo);
-          if (!shouldSweep(seen?.probe ?? null, probe, seen?.at ?? 0, Date.now(), pollMs)) continue;
-          await sweep(repo, github);
-          // Saved only after a pass that ran to the end, so a pass that threw runs again on the next tick.
-          last.set(repo, { probe, at: Date.now() });
-        }
-      });
+      // One loop, so the probe and a pass never run at the same time.
+      const last = new Map<string, GateLast>();
+      every(config.gate.probeSeconds * 1000, 'gate_sweep', () => eachRepo(config.github.repos, async (repo) => {
+        const github = await gitHubFor(repo);
+        await gateTick(last, repo, () => probeGate(github, repo, config.gate.branches), () => sweep(repo, github), pollMs);
+      }));
     } else {
-      every(pollMs, 'gate_sweep', async () => { for (const repo of config.github.repos) await sweep(repo, await gitHubFor(repo)); });
+      every(pollMs, 'gate_sweep', () => eachRepo(config.github.repos, async (repo) => sweep(repo, await gitHubFor(repo))));
     }
   }
 
@@ -173,12 +164,33 @@ export async function probeGate(github: Pick<OctokitGitHub, 'newestPull' | 'queu
 }
 
 /**
- * Whether a tick of the gate loop runs a pass: on the first tick, when the probe saw a change, when the probe failed
- * (`current` null: fail toward judging, never toward skipping), and when `pollMs` went by since the last pass, so PRs
- * judged in turn and retries still run.
+ * Whether a tick of the gate loop runs a pass: when `pollMs` went by since the last pass (always true on the first tick,
+ * at 0), so PRs judged in turn and retries still run; and when the probe saw a change. A failed probe (`current` null)
+ * is no change: the timer pass still comes, and a GitHub outage does not start a pass on every tick.
  */
 export function shouldSweep(previous: GateProbe | null, current: GateProbe | null, lastSweepAt: number, now: number, pollMs: number): boolean {
-  return previous === null || current === null || !isDeepStrictEqual(previous, current) || now - lastSweepAt >= pollMs;
+  return now - lastSweepAt >= pollMs || (current !== null && !isDeepStrictEqual(previous, current));
+}
+
+/** Per repository: what the probe saw before the last pass, and when that pass ended. */
+export type GateLast = { probe: GateProbe | null; at: number };
+
+/** One tick of the gate loop for one repository: the probe, then a pass when `shouldSweep` says so. A failed pass throws. */
+export async function gateTick(last: Map<string, GateLast>, repo: string, look: () => Promise<GateProbe>, pass: () => Promise<unknown>, pollMs: number, clock: () => number = Date.now): Promise<void> {
+  let probe: GateProbe | null = null;
+  try { probe = await look(); } catch (error) { metrics.errors.inc({ component: 'gate_probe' }); log.warn({ err: error, repo }, 'merge gate probe failed; the next pass waits for gate.pollSeconds'); }
+  const seen = last.get(repo);
+  if (!shouldSweep(seen?.probe ?? null, probe, seen?.at ?? 0, clock(), pollMs)) return;
+  // Recorded even when the pass throws: it moved no cursor, so the next timer pass judges the same PRs again, at the
+  // pollSeconds pace and not on every tick.
+  try { await pass(); } finally { last.set(repo, { probe, at: clock() }); }
+}
+
+/** Runs `fn` for each repository. One that fails is logged, and the others still run. */
+export async function eachRepo(repos: string[], fn: (repo: string) => Promise<unknown>): Promise<void> {
+  for (const repo of repos) {
+    try { await fn(repo); } catch (error) { metrics.errors.inc({ component: 'gate_sweep' }); log.warn({ err: error, repo }, 'merge gate failed for one repository'); }
+  }
 }
 
 /** Runs one leased job in a child process. The parent only waits, enforces the deadline, and tidies up if the child died. */

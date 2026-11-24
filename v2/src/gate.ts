@@ -6,11 +6,17 @@ import { parsePolicy } from './policy/load.ts';
 import type { GateObservation } from './types.ts';
 
 /**
- * Unchanged open PRs judged again on each pass, in turn by number, in case a change did not move a PR's update time.
- * ponytail: with a pass at least every 30 s and about 180 PRs, the cycle is about 30 minutes; raise this if the open
- * PR count grows.
+ * Every open PR is judged again in turn within this time, in case a change did not move its update time. Each pass takes
+ * a share of the open PRs sized by the time since the last turn, so the cycle holds at any pass rate.
  */
-const ROLL_PER_PASS = 3;
+const ROLL_CYCLE_MS = 25 * 60_000;
+/**
+ * The longest gap a turn is sized for. ponytail: after a stop longer than this the turns catch up over the next passes,
+ * not in one pass that judges every PR, so a few PRs wait up to one stop longer for their recheck.
+ */
+const ROLL_GAP_MAX_MS = 5 * 60_000;
+/** The gap assumed when no turn time is saved yet (the default `gate.pollSeconds`), so a deploy is not a full pass. */
+const ROLL_GAP_UNKNOWN_MS = 30_000;
 /** How long observations are kept. An approval older than this binds only through GitHub's timeline, or not at all. */
 const OBSERVATION_RETENTION_MS = 14 * 24 * 3_600_000;
 /** Observations past the retention are deleted this often. */
@@ -74,7 +80,7 @@ export interface GateDeps {
   sameChange?: (number: number, oldSha: string, headSha: string, governs: (path: string) => boolean, oldBase?: string, baseRef?: string, mergeBase?: string) => Promise<boolean>;
   /** The time an observation is recorded at. Default: `Date.now`. */
   now?: (() => number) | undefined;
-  /** Unchanged PRs judged again in turn on each pass. Default: `ROLL_PER_PASS`. Tests set 0 to see the other choices alone. */
+  /** Unchanged PRs judged again in turn on each pass. Default: a share sized by time. Tests set 0 to see the other choices alone. */
   roll?: number | undefined;
 }
 
@@ -321,12 +327,15 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   }
   const cursorKey = `gate:${repo}`;
   const since = full ? '' : store.cursor(cursorKey) ?? '';
-  // The next few PRs by number after the last one rolled, wrapping around, so a change that did not move a PR's update
-  // time is still caught within one cycle.
+  // The next PRs by number after the last one rolled, wrapping around, so a change that did not move a PR's update time
+  // is still caught within one cycle. The cursor is `number:time`; a missing time (an older cursor) is one pass ago.
   const rollKey = `gate-roll:${repo}`;
-  const after = Number(store.cursor(rollKey) ?? 0);
+  const [lastRolled, rolledAt] = (store.cursor(rollKey) ?? '').split(':');
+  const after = Number(lastRolled) || 0;
+  const gap = Math.min(now - (Number(rolledAt) || now - ROLL_GAP_UNKNOWN_MS), ROLL_GAP_MAX_MS);
+  const share = deps.roll ?? Math.max(1, Math.ceil((open.length * gap) / ROLL_CYCLE_MS));
   const byNumber = [...open].sort((a, b) => a.number - b.number);
-  const rolled = [...byNumber.filter((p) => p.number > after), ...byNumber.filter((p) => p.number <= after)].slice(0, deps.roll ?? ROLL_PER_PASS);
+  const rolled = [...byNumber.filter((p) => p.number > after), ...byNumber.filter((p) => p.number <= after)].slice(0, share);
   // `>=`: a review can land in the same second as the newest PR already seen.
   // A request in Chat does not move a PR's update time, so a PR never judged before is always judged. Not a stacked PR
   // in shadow: shadow saves no decision, so it would be read on every pass. It is judged in its rolled turn.
@@ -449,7 +458,7 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
     store.setCursor(retryKey, prs.length ? JSON.stringify({ prs, stacks: stackNumbers }) : '');
   }
   // The turn moves on even after a failure: a PR that failed is carried by the retry cursor above.
-  if (!deps.dryRun && rolled.length) store.setCursor(rollKey, String(rolled.at(-1)!.number));
+  if (!deps.dryRun && rolled.length) store.setCursor(rollKey, `${rolled.at(-1)!.number}:${now}`);
   if (!failed && !deps.dryRun) {
     store.setCursor(cursorKey, newest);
     if (full) store.setCursor(fullKey, `${rules}:${now}`);
