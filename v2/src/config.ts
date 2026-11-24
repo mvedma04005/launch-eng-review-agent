@@ -92,8 +92,10 @@ export const ConfigSchema = z.object({
     enabled: z.boolean().default(false),
     /** Judge every open PR into the default branch, not only the ones requested in Chat. Turn it on before the check is required to merge: a PR nobody posted in Chat still needs its check. */
     everyPull: z.boolean().default(false),
-    /** Seconds between passes. */
+    /** Seconds between passes. With the probe on, the longest time between passes. */
     pollSeconds: z.number().int().min(10).default(30),
+    /** Seconds between cheap looks at GitHub (the open PR updated last, and the merge queue branches). A pass runs when they change. 0 turns the probe off: a pass every `pollSeconds`. */
+    probeSeconds: z.number().int().min(0).default(5),
     /** Base branches judged besides the default branch, for example a branch that trials a merge queue. */
     branches: z.array(z.string()).default([]),
     /** PRs in a GitHub stack on the default branch, each judged on its own change against its direct base. `shadow` judges and logs them, and posts and saves nothing for them except a wait that withdraws a pass left from `on`, as `off` does. */

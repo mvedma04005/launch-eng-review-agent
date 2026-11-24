@@ -152,6 +152,13 @@ export class OctokitGitHub implements GitHubPort {
     });
   }
 
+  /** The open PR updated last, or null when none is open. One call, so the merge gate can ask every few seconds. */
+  async newestPull(repo: string): Promise<{ number: number; updatedAt: string; headSha: string; defaultBranch: string } | null> {
+    const { data } = await this.octokit.pulls.list({ ...split(repo), state: 'open', sort: 'updated', direction: 'desc', per_page: 1 });
+    const p = data[0];
+    return p ? { number: p.number, updatedAt: p.updated_at, headSha: p.head.sha, defaultBranch: p.base.repo.default_branch } : null;
+  }
+
   /** One PR's head, base and update time, read fresh. */
   async pullState(repo: string, number: number) {
     const { data } = await this.octokit.pulls.get({ ...split(repo), pull_number: number });
