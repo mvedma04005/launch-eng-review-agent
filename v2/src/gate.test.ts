@@ -907,7 +907,7 @@ test('I1: a queue commit for the top of a stack waits while a PR below has no cu
   const f = await queueStack({ states: { 2: { verdict: 'wait' } } });
   await sweepGate(f.deps, REPO, T0 + MINUTE);
   assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['q3', false]]);
-  assert.equal(f.summaries[0], 'Merge queue commit for #3. A PR below it in the stack has no current pass: #2.');
+  assert.equal(f.summaries[0], 'Merge queue commit for #3. A PR in its stack has no current pass: #2.');
 });
 
 test('a queue commit for the top of a stack passes when the whole chain passes and closes on main', async () => {
@@ -978,7 +978,19 @@ test('a queue commit named after the bottom of a stack waits while a PR above it
   Object.assign(top, { updatedAt: '2026-11-10T10:30:00Z', verdicts: [{ login: 'lee', state: 'CHANGES_REQUESTED', sha: 'sha2', submittedAt: '2026-11-10T10:30:00Z' }] });
   await sweepGate(f.deps, REPO, T0 + MINUTE);
   assert.deepEqual(f.posts.slice(3).map((x) => [x.sha, x.passed]), [['sha2', false], ['q1', false]]);
-  assert.equal(f.summaries.at(-1), 'Merge queue commit for #1. A PR below it in the stack has no current pass: #2.');
+  assert.equal(f.summaries.at(-1), 'Merge queue commit for #1. A PR in its stack has no current pass: #2.');
+});
+
+test('off or shadow: the bottom PR of a stack passes its own queue commit while the PR above it is open and not judged', async () => {
+  for (const stacks of [undefined, 'off', 'shadow'] as const) {
+    const pulls = [pull(1, { stack: inStack(1), approvers: [FALCON] }), pull(2, { baseRef: 'br1', stack: inStack(2) })];
+    const f = fixture(pulls, { stacks });
+    f.deps.github.stackMembers = membersOf(pulls);
+    f.queue.push({ number: 1, headSha: 'q1', branch: 'main' });
+    await sweepGate(f.deps, REPO, T0);
+    assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['sha1', true], ['q1', true]], String(stacks));
+    assert.equal(f.cursors.has(`gate:${REPO}#2`), false, `${stacks}: PR 2 has no saved decision`);
+  }
 });
 
 test('a queue commit waits when its PR is not an open member of the stack GitHub lists', async () => {

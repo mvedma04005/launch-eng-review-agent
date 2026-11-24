@@ -356,13 +356,15 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   }
   // Queue commits. GitHub tests a queued PR on a commit of its own, and that commit needs the check too. For a PR alone
   // it carries the decision on the PR's own commit: GitHub only queues a PR whose own commit passed, and a push to the
-  // PR takes it out of the queue. GitHub queues a stack as one group and may name it after any member, so the commit
-  // of a stacked PR may carry the whole open stack, and every open PR of the stack must pass.
+  // PR takes it out of the queue. GitHub queues a stack as one group and may name it after any member, so with stacks
+  // on the commit of a stacked PR may carry the whole open stack, and every open PR of the stack must pass. With stacks
+  // off or in shadow the chain stops at the entry, so a stack still merges one PR at a time: GitHub requires the check
+  // on every PR of a merge group, and no PR above the bottom has a current pass then.
   // Only the default branch and the extra branches: a stacked PR is queued on the stack's base, never on its own.
   for (const base of new Set(open.filter((p) => judgedBase(p.baseRef, p.defaultBranch)).map((p) => p.baseRef))) {
     try {
       for (const entry of await github.queueEntries(repo, base)) {
-        // R4: the commit passes only when every open member of the stack passes now. An entry whose PR is not listed,
+        // R4: the commit passes only when every open member of its chain passes now. An entry whose PR is not listed,
         // is not an open member of its stack, or whose stack cannot be read, waits: this check is required.
         const row = open.find((p) => p.number === entry.number);
         let chain: ReturnType<typeof queueChain> = { passed: false, blocker: entry.number };
@@ -372,9 +374,10 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
               ? (await github.stackMembers(repo, entry.number)).filter((m) => m.open).map(({ number, position, baseRef, headRef, headSha }) => ({ number, position, baseRef, headRef, headSha }))
               : [{ number: row.number, position: 1, baseRef: row.baseRef, headRef: row.headRef, headSha: row.headSha }];
             const states = new Map(members.map((m) => [m.number, broken.has(m.number) ? null : decodeState(store.cursor(`gate:${repo}#${m.number}`))] as const));
-            // The chain runs to the top open member: the highest position, whatever order GitHub lists them in.
+            // With stacks on, the chain runs to the top open member: the highest position, whatever order GitHub lists
+            // them in. Otherwise it runs to the entry.
             if (members.some((m) => m.number === entry.number)) {
-              const top = row.stack ? members.reduce((a, b) => (b.position > a.position ? b : a)).number : entry.number;
+              const top = row.stack && stacks === 'on' ? members.reduce((a, b) => (b.position > a.position ? b : a)).number : entry.number;
               chain = queueChain(top, members, states, base);
             }
           } catch (error) {
@@ -388,7 +391,7 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
         if (store.cursor(key) === String(passed)) continue;
         log.info({ repo, number: entry.number, head: entry.headSha, passed, dryRun: deps.dryRun }, 'merge gate decided for a queue commit');
         if (deps.dryRun) continue;
-        await github.postGate(repo, entry.headSha, passed, passed ? 'Approved by Launch Engineering or Falcon' : 'Waiting for Launch Engineering or Falcon to approve', chain.passed || chain.blocker === entry.number ? `Merge queue commit for #${entry.number}. It carries the decision on the pull request's own commit.` : `Merge queue commit for #${entry.number}. A PR below it in the stack has no current pass: #${chain.blocker}.`);
+        await github.postGate(repo, entry.headSha, passed, passed ? 'Approved by Launch Engineering or Falcon' : 'Waiting for Launch Engineering or Falcon to approve', chain.passed || chain.blocker === entry.number ? `Merge queue commit for #${entry.number}. It carries the decision on the pull request's own commit.` : `Merge queue commit for #${entry.number}. A PR in its stack has no current pass: #${chain.blocker}.`);
         store.setCursor(key, String(passed));
         posted++;
       }
