@@ -93,8 +93,8 @@ test('mergeBase: reads the compare API\'s merge base', async () => {
   assert.equal(await new OctokitGitHub(octokit, null).mergeBase('acme/demo', base, HEAD), 'm'.repeat(40));
   assert.equal(seen[0]!['basehead'], `${base}...${HEAD}`);
   // The gate passes the base branch, so the merge base is against its tip now. Octokit encodes the slash.
-  await new OctokitGitHub(octokit, null).mergeBase('acme/demo', 'feat/a', HEAD);
-  assert.equal(seen[1]!['basehead'], `feat/a...${HEAD}`);
+  await new OctokitGitHub(octokit, null).mergeBase('acme/demo', 'heads/feat/a', HEAD);
+  assert.equal(seen[1]!['basehead'], `heads/feat/a...${HEAD}`);
 });
 
 test('baseRefAt: the base in force at a time', async () => {

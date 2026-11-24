@@ -48,8 +48,9 @@ function fixture(pulls: Pull[], over: Partial<GateDeps> = {}, files: Record<stri
     },
     // The gate asks with the base branch for the change now, and with a saved base tip for Falcon's review.
     mergeBase: async (_repo, base, headSha) => {
-      const p = pulls.find((x) => x.headSha === headSha && (x.baseRef === base || tip(x) === base));
-      return p?.mergeBase ?? `mb-${p ? tip(p) : base}`;
+      const branch = base.replace(/^heads\//, '');
+      const p = pulls.find((x) => x.headSha === headSha && (x.baseRef === branch || tip(x) === base));
+      return p?.mergeBase ?? `mb-${p ? tip(p) : branch}`;
     },
     // The base GitHub's timeline gives at an approval: `baseAt`, else the base now.
     baseRefAt: async (_repo, number) => find(number).baseAt ?? find(number).baseRef,
@@ -845,10 +846,12 @@ test('the merge base of the change now is read against the base branch, not a ba
   const f = fixture([pull(2, { baseRef: 'feat-a', stack: inStack(2), verdicts: [approved('lee', 'sha2')] })], { stacks: 'on', sameChange: async () => false });
   // lee approved on merge base m1. Then feat-a was force-pushed: its tip now gives m2, but the PR still shows the old tip.
   f.around('sha2', 'feat-a', 'm1', 2);
-  f.deps.github.mergeBase = async (_repo, base) => (base === 'feat-a' ? 'm2' : 'm1');
+  const bases: string[] = [];
+  f.deps.github.mergeBase = async (_repo, base) => { bases.push(base); return base === 'heads/feat-a' ? 'm2' : 'm1'; };
   await sweepGate(f.deps, REPO, T0);
   assert.deepEqual(f.posts.at(-1), { sha: 'sha2', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' });
   assert.equal(decodeState(f.cursors.get(`gate:${REPO}#2`) ?? null)?.mergeBase, 'm2');
+  assert.deepEqual(bases, ['heads/feat-a'], 'the branch is named as heads/<name>, so a tag of that name cannot stand in for it');
 });
 
 test('a pass with nothing changed reads no stacked PR, under on and under shadow; a push in the same second still does', async () => {
@@ -869,6 +872,57 @@ test('a pass with nothing changed reads no stacked PR, under on and under shadow
     await sweepGate(f.deps, REPO, T0 + 2 * MINUTE);
     assert.deepEqual([...new Set(reads)], [1, 2, 3], `${stacks}: the PRs above are judged again`);
   }
+});
+
+// A parent pushed in the same second as its last update, then the child's read fails: the next pass has nothing but the
+// retry cursor to choose the child, and its queue commit must not pass on the child's decision for the old merge base.
+async function failedChildFixture(stacks: 'on' = 'on', dryRun = false) {
+  const bottom = pull(1, { stack: inStack(1), approvers: [FALCON], updatedAt: '2026-11-10T10:06:00Z' });
+  const pulls = [bottom, pull(2, { baseRef: 'br1', stack: inStack(2), verdicts: [approved('lee', 'sha2')] })];
+  const f = fixture(pulls, { stacks, dryRun });
+  f.deps.github.stackMembers = membersOf(pulls);
+  f.around('sha2', 'br1', 'mb-tip-br1', 2);
+  f.queue.push({ number: 2, headSha: 'q2', branch: 'main' });
+  const reads: number[] = [];
+  const state = { down: false };
+  const { pullState } = f.deps.github;
+  f.deps.github.pullState = async (repo, number) => { reads.push(number); if (state.down && number === 2) throw new Error('GitHub is down'); return pullState(repo, number); };
+  return { f, bottom, reads, state };
+}
+
+test('a child whose read failed is judged again on the next pass, and its queue commit waits until then', async () => {
+  const { f, bottom, reads, state } = await failedChildFixture();
+  await sweepGate(f.deps, REPO, T0);
+  assert.deepEqual(f.posts.filter((x) => x.sha === 'q2').map((x) => x.passed), [true]);
+  // Pass N: PR 1 is pushed inside the second of its update time, and PR 2's read throws.
+  bottom.headSha = 'sha1b';
+  state.down = true;
+  await sweepGate(f.deps, REPO, T0 + MINUTE);
+  assert.deepEqual(f.posts.filter((x) => x.sha === 'q2').map((x) => x.passed), [true, false]);
+  assert.deepEqual(JSON.parse(f.cursors.get(`gate-retry:${REPO}`) ?? 'null'), { prs: [2], stacks: [7] });
+  // Pass N+1: PR 1 is no longer changed, and nothing else would choose PR 2. The cursor does, so PR 2 is read again
+  // and its queue commit keeps waiting.
+  reads.length = 0;
+  await sweepGate(f.deps, REPO, T0 + 2 * MINUTE);
+  assert.ok(reads.includes(2), 'PR 2 is read again');
+  assert.deepEqual(f.posts.filter((x) => x.sha === 'q2').map((x) => x.passed), [true, false]);
+  assert.ok(f.cursors.get(`gate-retry:${REPO}`), 'still carried while it fails');
+  // Pass N+2: PR 2 reads fine, gets judged on the new merge base, the cursor clears and the commit passes.
+  state.down = false;
+  await sweepGate(f.deps, REPO, T0 + 3 * MINUTE);
+  assert.equal(f.cursors.get(`gate-retry:${REPO}`), '');
+  assert.deepEqual(f.posts.filter((x) => x.sha === 'q2').map((x) => x.passed), [true, false, true]);
+  // Nothing is carried now, so a quiet pass reads no PR above the bottom.
+  reads.length = 0;
+  await sweepGate(f.deps, REPO, T0 + 4 * MINUTE);
+  assert.deepEqual([...new Set(reads)], [1]);
+});
+
+test('a dry run writes no retry cursor', async () => {
+  const { f, state } = await failedChildFixture('on', true);
+  state.down = true;
+  await sweepGate(f.deps, REPO, T0);
+  assert.equal(f.cursors.has(`gate-retry:${REPO}`), false);
 });
 
 test('a fork PR in a stack is never judged as stacked', async () => {

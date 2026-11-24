@@ -96,6 +96,18 @@ function forStack({ title, summary }: { title: string; summary: string }, passed
   return { title, summary: `${summary} The gate judges this PR on its own change against \`${base}\`.` };
 }
 
+/** The PRs a failed pass left to judge again, and the stacks they belong to. */
+function parseRetry(raw: string | null): { prs: number[]; stacks: number[] } {
+  try {
+    const v = JSON.parse(raw || 'null') as { prs?: unknown; stacks?: unknown } | null;
+    const nums = (x: unknown) => (Array.isArray(x) ? x.filter((n): n is number => Number.isInteger(n)) : []);
+    return { prs: nums(v?.prs), stacks: nums(v?.stacks) };
+  } catch {
+    // ponytail: only this code writes the cursor, so an unreadable one is treated as empty; it is rewritten at the next failure.
+    return { prs: [], stacks: [] };
+  }
+}
+
 /**
  * Reads one PR, its files and its reviewers' verdicts, then the PR again. GitHub lists the files of "the PR now", so they
  * belong to the commit only if nothing about the PR moved in between. Tries twice; `steady` says whether it held. `at`
@@ -115,7 +127,8 @@ async function readPull(github: GatePort, repo: string, number: number, clock: (
     // pinned to the commit, if that window ever matters.
     const steady = after.headSha === before.headSha && after.baseRef === before.baseRef && after.baseSha === before.baseSha && after.updatedAt === before.updatedAt;
     // Against the base branch, not `baseSha`: GitHub can show an old base tip for a while after a push to the base.
-    if (steady || attempt === 1) return { ...after, files, verdicts, steady, at, mergeBase: steady ? await github.mergeBase(repo, after.baseRef, after.headSha) : '' };
+    // `heads/` names the branch: a tag of the same name could be pointed at an old commit by anyone who can push tags.
+    if (steady || attempt === 1) return { ...after, files, verdicts, steady, at, mergeBase: steady ? await github.mergeBase(repo, `heads/${after.baseRef}`, after.headSha) : '' };
   }
 }
 
@@ -242,6 +255,10 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   // PRs whose judgment or withdrawal failed in this pass. Their saved decision may be an old pass, so the queue chain
   // does not trust it.
   const broken = new Set<number>();
+  // PRs that failed in an earlier pass and have not been judged without error since: see `retryKey` below.
+  const retryKey = `gate-retry:${repo}`;
+  const carried = parseRetry(store.cursor(retryKey));
+  const unresolved = new Set(carried.prs);
   // A required check must not keep a pass the gate no longer stands behind. With stacks off or in shadow, a stacked
   // PR the gate judged before gets a wait on its head when its saved decision is a pass, and again on every new head:
   // a push back to an older commit must not bring back the pass that commit got under `on`. The decision only:
@@ -249,6 +266,7 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   if (stacks !== 'on' && !deps.dryRun) {
     for (const p of listed.filter(inStack)) {
       const key = `gate:${repo}#${p.number}`;
+      unresolved.delete(p.number);
       const saved = decodeState(store.cursor(key));
       if (!saved || (saved.verdict !== 'pass' && saved.headSha === p.headSha)) continue;
       try {
@@ -295,7 +313,7 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   // A request in Chat does not move a PR's update time, so a PR never judged before is always judged. Not a stacked PR
   // in shadow: shadow saves no decision, so it would be read on every pass. A full pass judges it.
   const saved = (p: { number: number }) => store.cursor(`gate:${repo}#${p.number}`);
-  const chosen = open.filter((p) => p.updatedAt >= since || (saved(p) === null && !(stacks === 'shadow' && stacked(p))));
+  const chosen = open.filter((p) => p.updatedAt >= since || carried.prs.includes(p.number) || (saved(p) === null && !(stacks === 'shadow' && stacked(p))));
   // R3: a push to a PR moves the base of the PR above it, but not that PR's update time, so the stacked PRs of a stack
   // are judged together. The bottom PR has no parent in the stack: its own update time is enough. Only a PR that really
   // changed moves its stack: a newer update time, or a head its saved decision is not for. A PR chosen only by `>=` or
@@ -305,7 +323,7 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
     const head = decodeState(saved(p))?.headSha;
     return p.updatedAt > since || (head !== undefined && head !== p.headSha);
   };
-  const touched = new Set(chosen.filter(changed).flatMap((p) => (stacks !== 'off' && p.stack ? [p.stack.number] : [])));
+  const touched = new Set([...carried.stacks, ...chosen.filter(changed).flatMap((p) => (stacks !== 'off' && p.stack ? [p.stack.number] : []))]);
   const pulls = open.filter((p) => chosen.includes(p) || (p.stack !== null && stacked(p) && touched.has(p.stack.number)));
 
   let failed = false;
@@ -313,6 +331,8 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   for (const p of pulls) {
     try {
       const read = await readPull(github, repo, p.number, clock);
+      // Put back in `broken` by the catch below if posting the decision fails.
+      unresolved.delete(p.number);
       const asStack = stacked(p);
       // Closed or retargeted since it was listed. A PR listed in a stack is judged on whatever base it has now.
       if (!read.open || (!judgedBase(read.baseRef, branch) && !asStack)) continue;
@@ -373,7 +393,7 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
             const members: ChainMember[] = row.stack
               ? (await github.stackMembers(repo, entry.number)).filter((m) => m.open).map(({ number, position, baseRef, headRef, headSha }) => ({ number, position, baseRef, headRef, headSha }))
               : [{ number: row.number, position: 1, baseRef: row.baseRef, headRef: row.headRef, headSha: row.headSha }];
-            const states = new Map(members.map((m) => [m.number, broken.has(m.number) ? null : decodeState(store.cursor(`gate:${repo}#${m.number}`))] as const));
+            const states = new Map(members.map((m) => [m.number, broken.has(m.number) || unresolved.has(m.number) ? null : decodeState(store.cursor(`gate:${repo}#${m.number}`))] as const));
             // With stacks on, the chain runs to the top open member: the highest position, whatever order GitHub lists
             // them in. Otherwise it runs to the entry.
             if (members.some((m) => m.number === entry.number)) {
@@ -402,6 +422,14 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   }
   // After a failure the cursors stay, so the next pass judges the same PRs again; the ones already posted are skipped.
   // A dry run posts nothing, so it must not mark anything as seen either.
+  // A failed PR is judged again with its stack until a pass reads it without error, even when `since` has moved on:
+  // a push inside the same second of the update time leaves nothing else to choose it, and its child would keep a pass
+  // for the old merge base. The cursor is cleared once nothing is left. A dry run saves nothing.
+  if (!deps.dryRun && (broken.size || unresolved.size || carried.prs.length || carried.stacks.length)) {
+    const prs = [...new Set([...broken, ...unresolved])].sort((a, b) => a - b);
+    const stackNumbers = [...new Set(prs.flatMap((n) => listed.find((l) => l.number === n)?.stack?.number ?? []))].sort((a, b) => a - b);
+    store.setCursor(retryKey, prs.length ? JSON.stringify({ prs, stacks: stackNumbers }) : '');
+  }
   if (!failed && !deps.dryRun) {
     store.setCursor(cursorKey, newest);
     if (full) store.setCursor(fullKey, `${rules}:${now}`);

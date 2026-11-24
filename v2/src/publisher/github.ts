@@ -169,7 +169,7 @@ export class OctokitGitHub implements GitHubPort {
     return [...latest.values()];
   }
 
-  /** The newest commit both `base` (a commit, or a branch at its tip now) and `headSha` descend from. */
+  /** The newest commit both `base` (a commit, or `heads/<branch>` at its tip now) and `headSha` descend from. */
   async mergeBase(repo: string, base: string, headSha: string): Promise<string> {
     // Octokit encodes the whole `basehead`, so a branch name with a slash is passed as it is.
     const { data } = await this.octokit.repos.compareCommitsWithBasehead({ ...split(repo), basehead: `${base}...${headSha}`, per_page: 1 });
