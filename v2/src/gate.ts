@@ -5,10 +5,16 @@ import { gateVerdict, governedBy, type GateVerdict } from './policy/gate.ts';
 import { parsePolicy } from './policy/load.ts';
 import type { GateObservation } from './types.ts';
 
-/** Every open PR is judged again this often, in case a change did not move its update time. */
-const FULL_RECHECK_MS = 30 * 60_000;
+/**
+ * Unchanged open PRs judged again on each pass, in turn by number, in case a change did not move a PR's update time.
+ * ponytail: with a pass at least every 30 s and about 180 PRs, the cycle is about 30 minutes; raise this if the open
+ * PR count grows.
+ */
+const ROLL_PER_PASS = 3;
 /** How long observations are kept. An approval older than this binds only through GitHub's timeline, or not at all. */
 const OBSERVATION_RETENTION_MS = 14 * 24 * 3_600_000;
+/** Observations past the retention are deleted this often. */
+const PRUNE_EVERY_MS = 30 * 60_000;
 
 export type StackRef = { number: number; baseRef: string; position: number };
 
@@ -68,6 +74,8 @@ export interface GateDeps {
   sameChange?: (number: number, oldSha: string, headSha: string, governs: (path: string) => boolean, oldBase?: string, baseRef?: string, mergeBase?: string) => Promise<boolean>;
   /** The time an observation is recorded at. Default: `Date.now`. */
   now?: (() => number) | undefined;
+  /** Unchanged PRs judged again in turn on each pass. Default: `ROLL_PER_PASS`. Tests set 0 to see the other choices alone. */
+  roll?: number | undefined;
 }
 
 type Older = Array<{ login: string; sha: string }>;
@@ -235,9 +243,9 @@ async function countApprovals(deps: GateDeps, repo: string, pr: { number: number
 
 /**
  * One pass over the open PRs into the default branch, and with `stacks` the PRs of GitHub stacks on it (only those
- * requested in Chat, unless `requested` is null). It judges the ones that changed since the last pass, and
- * all of them when the rules changed or half an hour has gone by, and posts the check when the decision differs
- * from the last one posted. Returns the number of checks posted.
+ * requested in Chat, unless `requested` is null). It judges the ones that changed since the last pass and the next few
+ * in turn, and all of them when the rules changed, and posts the check when the decision differs from the last one
+ * posted. Returns the number of checks posted.
  */
 export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()): Promise<number> {
   const { github, store, log } = deps;
@@ -302,23 +310,33 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   // every PR once.
   // The `stacks` mode too: a switch re-judges every PR at once, so a return to `on` replaces each withdrawal straight away.
   const rules = createHash('sha256').update(['v3', pack ?? '', deps.falcon ?? '', stacks].join('\0')).digest('hex');
+  // The cursor is `rules:time`; only the rules decide. Unchanged PRs are judged again in turn below.
   const fullKey = `gate:${repo}:full`;
-  const [lastRules, lastAt] = (store.cursor(fullKey) ?? ':0').split(':');
-  const full = lastRules !== rules || now - Number(lastAt) >= FULL_RECHECK_MS;
+  const full = (store.cursor(fullKey) ?? '').split(':')[0] !== rules;
   const clock = () => deps.now?.() ?? Date.now();
-  if (full && !deps.dryRun) store.pruneGateObservations?.(clock() - OBSERVATION_RETENTION_MS);
+  const pruneKey = `gate-prune:${repo}`;
+  if (!deps.dryRun && now - Number(store.cursor(pruneKey) ?? 0) >= PRUNE_EVERY_MS) {
+    store.pruneGateObservations?.(clock() - OBSERVATION_RETENTION_MS);
+    store.setCursor(pruneKey, String(now));
+  }
   const cursorKey = `gate:${repo}`;
   const since = full ? '' : store.cursor(cursorKey) ?? '';
+  // The next few PRs by number after the last one rolled, wrapping around, so a change that did not move a PR's update
+  // time is still caught within one cycle.
+  const rollKey = `gate-roll:${repo}`;
+  const after = Number(store.cursor(rollKey) ?? 0);
+  const byNumber = [...open].sort((a, b) => a.number - b.number);
+  const rolled = [...byNumber.filter((p) => p.number > after), ...byNumber.filter((p) => p.number <= after)].slice(0, deps.roll ?? ROLL_PER_PASS);
   // `>=`: a review can land in the same second as the newest PR already seen.
   // A request in Chat does not move a PR's update time, so a PR never judged before is always judged. Not a stacked PR
-  // in shadow: shadow saves no decision, so it would be read on every pass. A full pass judges it.
+  // in shadow: shadow saves no decision, so it would be read on every pass. It is judged in its rolled turn.
   const saved = (p: { number: number }) => store.cursor(`gate:${repo}#${p.number}`);
-  const chosen = open.filter((p) => p.updatedAt >= since || carried.prs.includes(p.number) || (saved(p) === null && !(stacks === 'shadow' && stacked(p))));
+  const chosen = open.filter((p) => p.updatedAt >= since || carried.prs.includes(p.number) || rolled.includes(p) || (saved(p) === null && !(stacks === 'shadow' && stacked(p))));
   // R3: a push to a PR moves the base of the PR above it, but not that PR's update time, so the stacked PRs of a stack
   // are judged together. The bottom PR has no parent in the stack: its own update time is enough. Only a PR that really
-  // changed moves its stack: a newer update time, or a head its saved decision is not for. A PR chosen only by `>=` or
-  // for a missing decision does not, or every pass would read the whole stack. A failed pass leaves `since` where it
-  // was, so the stack of a changed PR is judged again on the next pass.
+  // changed moves its stack: a newer update time, or a head its saved decision is not for. A PR chosen only by `>=`, for
+  // a missing decision or in its rolled turn does not, or every pass would read the whole stack. A failed pass leaves
+  // `since` where it was, so the stack of a changed PR is judged again on the next pass.
   const changed = (p: { number: number; headSha: string; updatedAt: string }) => {
     const head = decodeState(saved(p))?.headSha;
     return p.updatedAt > since || (head !== undefined && head !== p.headSha);
@@ -430,6 +448,8 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
     const stackNumbers = [...new Set(prs.flatMap((n) => listed.find((l) => l.number === n)?.stack?.number ?? []))].sort((a, b) => a - b);
     store.setCursor(retryKey, prs.length ? JSON.stringify({ prs, stacks: stackNumbers }) : '');
   }
+  // The turn moves on even after a failure: a PR that failed is carried by the retry cursor above.
+  if (!deps.dryRun && rolled.length) store.setCursor(rollKey, String(rolled.at(-1)!.number));
   if (!failed && !deps.dryRun) {
     store.setCursor(cursorKey, newest);
     if (full) store.setCursor(fullKey, `${rules}:${now}`);

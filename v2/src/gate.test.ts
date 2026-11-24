@@ -127,6 +127,7 @@ test('a dry run posts nothing and marks nothing as seen', async () => {
   assert.equal(await sweepGate(f.deps, REPO, T0), 0);
   assert.deepEqual(f.posts, []);
   assert.equal(f.cursors.size, 0);
+  assert.ok(!f.cursors.has(`gate-roll:${REPO}`) && !f.cursors.has(`gate-prune:${REPO}`), 'no turn of the rolling recheck and no prune time');
   assert.equal(await sweepGate({ ...f.deps, dryRun: false }, REPO, T0), 1, 'the first real pass still posts');
 });
 
@@ -186,30 +187,46 @@ test('a PR closed or retargeted while it is being read gets no check', async () 
   assert.deepEqual([...closed.posts, ...moved.posts], []);
 });
 
-test('a pass does not outlive a change to the rules on the default branch', async () => {
-  const f = fixture([pull(1, { approvers: ['lee'] }), pull(2)]);
-  await sweepGate(f.deps, REPO, T0);
+// Seven PRs into main, so a pass judges some and not others. PR 7 is the newest, so `>=` reads it on every pass.
+function seven(approvers: (n: number) => string[]) {
+  const pulls = [1, 2, 3, 4, 5, 6, 7].map((n) => pull(n, { approvers: approvers(n) }));
+  const f = fixture(pulls);
+  const reads: number[] = [];
+  const { pullState } = f.deps.github;
+  f.deps.github.pullState = async (repo, number) => { reads.push(number); return pullState(repo, number); };
+  // The checks posted and the PRs read by one pass.
+  const pass = async (at: number) => { reads.length = 0; const posted = await sweepGate(f.deps, REPO, at); return { posted, read: [...new Set(reads)].sort((a, b) => a - b) }; };
+  return { f, pulls, pass };
+}
+
+test('a pass does not outlive a change to the rules on the default branch: every PR is judged again in one pass', async () => {
+  const { f, pass } = seven((n) => (n === 1 ? ['lee'] : []));
+  await pass(T0);
   assert.equal(f.posts[0]!.passed, true);
   f.files['.falcon/policy.yaml'] = 'version: 1\nname: repo\nteam: { members: [kim] }\n'; // lee leaves the team; PR 1 is not touched.
-  assert.equal(await sweepGate(f.deps, REPO, T0 + MINUTE), 1);
+  // PR 1's turn is not due (this pass would roll 4, 5 and 6), so only the rule change judges it.
+  assert.deepEqual(await pass(T0 + MINUTE), { posted: 1, read: [1, 2, 3, 4, 5, 6, 7] });
   assert.deepEqual(f.posts.at(-1), { sha: 'sha1', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' });
 });
 
-test('every open PR is judged again after half an hour, so a silent change is still caught', async () => {
-  const p = pull(1, { approvers: ['lee'] });
-  const f = fixture([p, pull(2)]);
-  await sweepGate(f.deps, REPO, T0);
-  p.approvers = []; // Withdrawn without moving the PR's update time.
-  assert.equal(await sweepGate(f.deps, REPO, T0 + MINUTE), 0);
-  assert.equal(await sweepGate(f.deps, REPO, T0 + 31 * MINUTE), 1);
-  assert.deepEqual(f.posts.at(-1), { sha: 'sha1', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' });
+test('each pass also judges the next three PRs by number, wrapping around, so a silent change is caught in its turn', async () => {
+  const { f, pulls, pass } = seven(() => ['lee']);
+  assert.equal((await pass(T0)).posted, 7, 'every PR is new');
+  assert.equal(f.cursors.get(`gate-roll:${REPO}`), '3');
+  pulls[1]!.approvers = []; // PR 2's approval is withdrawn without moving its update time.
+  assert.deepEqual(await pass(T0 + MINUTE), { posted: 0, read: [4, 5, 6, 7] }, 'PRs 4, 5 and 6, and the newest');
+  assert.equal(f.cursors.get(`gate-roll:${REPO}`), '6');
+  // Past PR 7 the turn wraps to PRs 1 and 2, and PR 2's withdrawn approval is caught.
+  assert.deepEqual(await pass(T0 + 2 * MINUTE), { posted: 1, read: [1, 2, 7] });
+  assert.deepEqual(f.posts.at(-1), { sha: 'sha2', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' });
+  assert.equal(f.cursors.get(`gate-roll:${REPO}`), '2');
 });
 
 test('only PRs requested in Chat get a check, and a request for an old PR is picked up on the next pass', async () => {
-  const f = fixture([pull(1, { approvers: ['lee'] }), pull(2, { approvers: ['lee'] })], { requested: new Set([2]) });
+  const f = fixture([pull(1, { approvers: ['lee'] }), pull(2, { approvers: ['lee'] })], { requested: new Set([2]), roll: 0 });
   assert.equal(await sweepGate(f.deps, REPO, T0), 1);
   assert.deepEqual(f.posts.map((p) => p.sha), ['sha2']);
-  // PR 1 is requested later. Its update time is older than the cursor, and the half-hour pass is not due.
+  // PR 1 is requested later. Its update time is older than the cursor, and no PR is judged in turn here.
   assert.equal(await sweepGate({ ...f.deps, requested: new Set([1, 2]) }, REPO, T0 + MINUTE), 1);
   assert.deepEqual(f.posts.map((p) => p.sha), ['sha2', 'sha1']);
   // No list at all (gate.everyPull): every open PR into the default branch is judged.
@@ -271,7 +288,7 @@ test('an approval on an older commit counts when the change is the same, and the
   f.around('old1');
   assert.equal(await sweepGate(f.deps, REPO, T0), 1);
   assert.deepEqual(f.posts.at(-1), { sha: 'new1', passed: true, title: 'Approved by Launch Engineering or Falcon' });
-  await sweepGate(f.deps, REPO, T0 + 31 * MINUTE); // A full recheck reads the saved result.
+  await sweepGate(f.deps, REPO, T0 + 31 * MINUTE); // Judged again, it reads the saved result.
   assert.deepEqual(calls, ['1:old1:new1']);
 
   same = false;
@@ -298,9 +315,9 @@ test('the gate compares only when it would wait, and only for team members other
   await sweepGate(f.deps, REPO, T0);
   assert.deepEqual(calls, []);
   assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['sha1', true], ['sha2', false]]);
-  // Without lee the gate would wait, so kim's older approval is compared.
+  // Without lee the gate would wait, so kim's older approval is compared. PR 1 is judged again in its turn.
   p.verdicts = [kim];
-  await sweepGate(f.deps, REPO, T0 + 31 * MINUTE);
+  await sweepGate(f.deps, REPO, T0 + MINUTE);
   assert.deepEqual(calls, ['a']);
 });
 
@@ -469,7 +486,7 @@ test('I5: a dry run writes no observations, no cache entries and no decisions', 
   let compared = 0;
   const f = fixture([pull(1, { baseAt: 'feat-a', verdicts: [approved('lee', 'sha1'), approved(FALCON, 'sha1')] })], { dryRun: true, sameChange: async () => { compared++; return true; } });
   f.deps.store.lastReview = () => ({ headSha: 'sha1', baseSha: 'tip-feat-a', baseRef: 'feat-a', event: 'APPROVE' });
-  const old = '2026-10-01T00:00:00Z'; // Past the retention, so a real full recheck would delete it.
+  const old = '2026-10-01T00:00:00Z'; // Past the retention, so a real pass would delete it.
   f.observe(old, 'sha1', 'feat-a');
   f.around('sha1', 'feat-a', 'mb-feat');
   assert.equal(await sweepGate(f.deps, REPO, T0), 0);
@@ -524,7 +541,7 @@ test('a failed lookup of where an approval was given waits and is tried again on
   assert.equal(f.posts.at(-1)?.passed, true);
 });
 
-test('a full recheck deletes observations older than 14 days', async () => {
+test('observations older than 14 days are deleted, at most once every 30 minutes', async () => {
   const f = fixture([pull(1)]);
   const day = 24 * 3_600_000;
   const iso = (ms: number) => new Date(ms).toISOString();
@@ -533,6 +550,14 @@ test('a full recheck deletes observations older than 14 days', async () => {
   await sweepGate(f.deps, REPO, T0);
   assert.equal(f.db.gateObservationsAround(REPO, 1, T0 - 14 * day).before, null);
   assert.equal(f.db.gateObservationsAround(REPO, 1, T0 - 14 * day).after?.atMs, T0 - 13 * day);
+  assert.equal(f.cursors.get(`gate-prune:${REPO}`), String(T0));
+  // Another observation past the retention. It stays until 30 minutes after the last prune.
+  f.observe(iso(T0 - 15 * day), 'sha1');
+  await sweepGate(f.deps, REPO, T0 + 29 * MINUTE);
+  assert.equal(f.db.gateObservationsAround(REPO, 1, T0 - 14 * day).before?.atMs, T0 - 15 * day, 'not due yet');
+  await sweepGate(f.deps, REPO, T0 + 30 * MINUTE);
+  assert.equal(f.db.gateObservationsAround(REPO, 1, T0 - 14 * day).before, null);
+  assert.equal(f.cursors.get(`gate-prune:${REPO}`), String(T0 + 30 * MINUTE));
 });
 
 test('an approval the gate saw given on another base does not count on main, even when the timeline says main', async () => {
@@ -558,7 +583,7 @@ test('an approval whose observations were pruned still binds from the pair saved
   await sweepGate(f.deps, REPO, T0);
   assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['sha2', true]]);
   assert.equal(f.cursors.get(`gate-obs:${REPO}#2:${APPROVED_AT}`), JSON.stringify({ headSha: 'sha2', baseRef: 'feat-a', mergeBase: 'mb-tip-feat-a' }));
-  // 15 days on: the full recheck deletes every observation around the approval, then judges the PR again.
+  // 15 days on: the prune deletes every observation around the approval, then the pass judges the PR again.
   const later = T0 + 15 * 24 * 60 * MINUTE;
   f.clock.at = later;
   await sweepGate(f.deps, REPO, later);
@@ -605,7 +630,7 @@ test("a second pass does not ask GitHub again where an approval was given or whe
   f.deps.github.baseRefAt = async (repo, number, atMs) => { asked.push('baseRefAt'); return baseRefAt(repo, number, atMs); };
   f.deps.github.mergeBase = async (repo, baseSha, headSha) => { if (baseSha === 'tip-old') asked.push('mergeBase'); return mergeBase(repo, baseSha, headSha); };
   await sweepGate(f.deps, REPO, T0);
-  await sweepGate(f.deps, REPO, T0 + 31 * MINUTE); // A full recheck judges the PR again.
+  await sweepGate(f.deps, REPO, T0 + 31 * MINUTE); // The PR is judged again.
   assert.deepEqual(asked, ['baseRefAt', 'mergeBase']);
   assert.equal(f.posts.at(-1)?.passed, true);
 });
@@ -696,7 +721,7 @@ test('shadow: a stacked PR is logged, not posted, and nothing is saved', async (
   // The rollout compares these lines with GitHub, so they carry the base, the merge base and each older approval.
   const shadowLine = info.mock.calls.find((c) => c.arguments[1] === 'merge gate decided (shadow)')!.arguments[0] as Record<string, unknown>;
   assert.deepEqual([shadowLine['base'], shadowLine['mergeBase'], shadowLine['carried'], shadowLine['stale'], shadowLine['unbound']], ['feat-a', 'mb-tip-feat-a', [{ login: 'lee', sha: 'old2' }, { login: FALCON, sha: 'old2' }], [], []]);
-  assert.deepEqual([...f.cursors.keys()].sort(), [`gate:${REPO}`, `gate:${REPO}#1`, `gate:${REPO}:full`], 'no lookup, cache entry or decision for PR 2');
+  assert.deepEqual([...f.cursors.keys()].sort(), [`gate-prune:${REPO}`, `gate-roll:${REPO}`, `gate:${REPO}`, `gate:${REPO}#1`, `gate:${REPO}:full`], 'no lookup, cache entry or decision for PR 2');
   assert.equal(f.db.gateObservationsAround(REPO, 2, T0).after, null, 'no observation');
 });
 
@@ -814,7 +839,8 @@ test('a push between the last on pass and the first off pass: the new head waits
 });
 
 test('a shadow pass does not judge the bottom PR of a stack when nothing changed', async () => {
-  const f = fixture([pull(1, { stack: inStack(1) }), pull(2, { baseRef: 'br1', stack: inStack(2) })], { stacks: 'shadow' });
+  // No PR is judged in turn here, or both would be judged on every pass.
+  const f = fixture([pull(1, { stack: inStack(1) }), pull(2, { baseRef: 'br1', stack: inStack(2) })], { stacks: 'shadow', roll: 0 });
   await sweepGate(f.deps, REPO, T0);
   f.clock.at = T0 + MINUTE;
   await sweepGate(f.deps, REPO, T0 + MINUTE); // PR 2, the newest, is read again by `>=`; it did not change.
@@ -822,8 +848,8 @@ test('a shadow pass does not judge the bottom PR of a stack when nothing changed
 });
 
 test('a switch of gate.stacks re-judges every PR at once', async () => {
-  // PR 3 is the newest, so after the first pass PR 2 is judged again only on a full pass.
-  const f = fixture([pull(2, { baseRef: 'feat-a', stack: inStack(2), updatedAt: APPROVED_AT, verdicts: [approved('lee', 'sha2')] }), pull(3, { updatedAt: '2026-11-10T10:07:00Z' })], { stacks: 'on' });
+  // PR 3 is the newest, and no PR is judged in turn, so after the first pass PR 2 is judged again only on a full pass.
+  const f = fixture([pull(2, { baseRef: 'feat-a', stack: inStack(2), updatedAt: APPROVED_AT, verdicts: [approved('lee', 'sha2')] }), pull(3, { updatedAt: '2026-11-10T10:07:00Z' })], { stacks: 'on', roll: 0 });
   f.around('sha2', 'feat-a', 'mb-tip-feat-a', 2);
   await sweepGate(f.deps, REPO, T0);
   await sweepGate({ ...f.deps, stacks: 'off' }, REPO, T0 + MINUTE);
@@ -858,7 +884,7 @@ test('a pass with nothing changed reads no stacked PR, under on and under shadow
   for (const stacks of ['on', 'shadow'] as const) {
     // PR 1, at the bottom, is the newest, so `>=` reads it on every pass.
     const bottom = pull(1, { stack: inStack(1), updatedAt: '2026-11-10T10:06:00Z' });
-    const f = fixture([bottom, pull(2, { baseRef: 'br1', stack: inStack(2) }), pull(3, { baseRef: 'br2', stack: inStack(3) })], { stacks });
+    const f = fixture([bottom, pull(2, { baseRef: 'br1', stack: inStack(2) }), pull(3, { baseRef: 'br2', stack: inStack(3) })], { stacks, roll: 0 });
     const reads: number[] = [];
     const { pullState } = f.deps.github;
     f.deps.github.pullState = async (repo, number) => { reads.push(number); return pullState(repo, number); };
@@ -879,7 +905,8 @@ test('a pass with nothing changed reads no stacked PR, under on and under shadow
 async function failedChildFixture(stacks: 'on' = 'on', dryRun = false) {
   const bottom = pull(1, { stack: inStack(1), approvers: [FALCON], updatedAt: '2026-11-10T10:06:00Z' });
   const pulls = [bottom, pull(2, { baseRef: 'br1', stack: inStack(2), verdicts: [approved('lee', 'sha2')] })];
-  const f = fixture(pulls, { stacks, dryRun });
+  // No PR is judged in turn: only the retry cursor brings PR 2 back.
+  const f = fixture(pulls, { stacks, dryRun, roll: 0 });
   f.deps.github.stackMembers = membersOf(pulls);
   f.around('sha2', 'br1', 'mb-tip-br1', 2);
   f.queue.push({ number: 2, headSha: 'q2', branch: 'main' });
@@ -932,9 +959,11 @@ test('a fork PR in a stack is never judged as stacked', async () => {
 });
 
 // Queue commits for a stack: PR 1 into main, PR 2 on br1, PR 3 on br2. One real sweep sets every cursor of the pass;
-// then the decisions are overwritten by hand, and the later sweeps are incremental, so they leave them alone.
+// then the decisions are overwritten by hand, and the later sweeps are incremental and judge no PR in turn, so they
+// leave them alone.
 const settle = async (f: ReturnType<typeof fixture>, pulls: Pull[], states: Record<number, Partial<Parameters<typeof encodeState>[0]>> = {}) => {
   await sweepGate(f.deps, REPO, T0);
+  f.deps.roll = 0;
   // The incremental cursor sits after every update time (the newest PR itself is judged again at `>=`).
   f.cursors.set(`gate:${REPO}`, '2026-11-10T11:00:00Z');
   f.posts.length = 0;
