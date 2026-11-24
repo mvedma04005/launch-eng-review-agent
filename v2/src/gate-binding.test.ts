@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { GateObservation } from './types.ts';
 import {
-  approvalOutcome, bindFromObservations, bindFromTimeline, decodeState, encodeState, queueChain,
+  agreeingPair, approvalOutcome, bindFromObservations, bindFromTimeline, decodeState, encodeState, queueChain,
   type ChainMember, type GateState,
 } from './gate-binding.ts';
 
@@ -10,33 +10,35 @@ const obs = (o: Partial<GateObservation> = {}): GateObservation => ({
   repo: 'acme/demo', number: 1, atMs: 1, headSha: 'h1', baseRef: 'main', baseSha: 'b1', mergeBase: 'm1', ...o,
 });
 const around = (b: Partial<GateObservation> = {}, a: Partial<GateObservation> = {}) => ({ before: obs(b), after: obs(a) });
+// Binds an approval from the observations around it, as the gate does.
+const bindAround = (a: Parameters<typeof agreeingPair>[0], reviewSha: string, currentHead: string, baseRefAtSubmit: string) => bindFromObservations(agreeingPair(a), reviewSha, currentHead, baseRefAtSubmit);
 
 test('bindFromObservations: the same head, base and merge base on both sides binds', () => {
-  assert.deepEqual(bindFromObservations(around(), 'h1', 'h1', 'main'), { headSha: 'h1', baseRef: 'main', mergeBase: 'm1' });
+  assert.deepEqual(bindAround(around(), 'h1', 'h1', 'main'), { headSha: 'h1', baseRef: 'main', mergeBase: 'm1' });
 });
 
 test('bindFromObservations: a base or merge base change between the two sides does not bind', () => {
-  assert.equal(bindFromObservations(around({}, { headSha: 'h2' }), 'h1', 'h1', 'main'), null);
-  assert.equal(bindFromObservations(around({}, { baseRef: 'feat-a' }), 'h1', 'h1', 'main'), null);
-  assert.equal(bindFromObservations(around({}, { mergeBase: 'm2' }), 'h1', 'h1', 'main'), null);
+  assert.equal(bindAround(around({}, { headSha: 'h2' }), 'h1', 'h1', 'main'), null);
+  assert.equal(bindAround(around({}, { baseRef: 'feat-a' }), 'h1', 'h1', 'main'), null);
+  assert.equal(bindAround(around({}, { mergeBase: 'm2' }), 'h1', 'h1', 'main'), null);
 });
 
 test("bindFromObservations: observations that GitHub's timeline contradicts do not bind", () => {
-  assert.equal(bindFromObservations(around(), 'h1', 'h1', 'feat-a'), null);
-  assert.equal(bindFromObservations(around(), 'h1', 'h1', ''), null, 'an unknown base binds nothing');
+  assert.equal(bindAround(around(), 'h1', 'h1', 'feat-a'), null);
+  assert.equal(bindAround(around(), 'h1', 'h1', ''), null, 'an unknown base binds nothing');
 });
 
 test('bindFromObservations: a missing side does not bind', () => {
-  assert.equal(bindFromObservations({ before: null, after: obs() }, 'h1', 'h1', 'main'), null);
-  assert.equal(bindFromObservations({ before: obs(), after: null }, 'h1', 'h1', 'main'), null);
+  assert.equal(bindAround({ before: null, after: obs() }, 'h1', 'h1', 'main'), null);
+  assert.equal(bindAround({ before: obs(), after: null }, 'h1', 'h1', 'main'), null);
 });
 
 test('bindFromObservations: a review re-pointed to the current head binds to the observed head', () => {
-  assert.deepEqual(bindFromObservations(around(), 'h9', 'h9', 'main'), { headSha: 'h1', baseRef: 'main', mergeBase: 'm1' });
+  assert.deepEqual(bindAround(around(), 'h9', 'h9', 'main'), { headSha: 'h1', baseRef: 'main', mergeBase: 'm1' });
 });
 
 test('bindFromObservations: a review of some other commit does not bind', () => {
-  assert.equal(bindFromObservations(around(), 'h7', 'h9', 'main'), null);
+  assert.equal(bindAround(around(), 'h7', 'h9', 'main'), null);
 });
 
 const cur = { headSha: 'h1', baseRef: 'main', mergeBase: 'm1' };
@@ -108,6 +110,12 @@ test('queueChain: an entry with a non-finite position never passes', () => {
     const bad: ChainMember = { ...m1, position };
     assert.deepEqual(queueChain(1, [bad], new Map(), 'main'), { passed: false, blocker: 1 });
   }
+});
+
+test('queueChain: a member with a non-finite position never passes, since the chain would leave it out', () => {
+  const lost: ChainMember = { number: 3, position: NaN, baseRef: 'br2', headRef: 'br3', headSha: 'h3' };
+  const states = new Map([[1, pass('h1', 'main')], [2, pass('h2', 'br1')]]);
+  assert.deepEqual(queueChain(2, [m1, m2, lost], states, 'main'), { passed: false, blocker: 2 });
 });
 
 test('queueChain: a break in the middle link blames the middle member', () => {

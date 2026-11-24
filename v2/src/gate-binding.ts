@@ -5,24 +5,25 @@ import type { GateObservation } from './types.ts';
 export interface Binding { headSha: string; baseRef: string; mergeBase: string }
 export type Current = Binding;
 
-// An approval binds only if the head, base and merge base were the same on both sides of it, and GitHub's
+// The head, base and merge base the gate saw on both sides of an approval, or null when a side is missing or the
+// two sides differ.
+export function agreeingPair(around: { before: GateObservation | null; after: GateObservation | null }): Binding | null {
+  const { before, after } = around;
+  if (!before || !after) return null;
+  if (before.headSha !== after.headSha || before.baseRef !== after.baseRef || before.mergeBase !== after.mergeBase) return null;
+  return { headSha: before.headSha, baseRef: before.baseRef, mergeBase: before.mergeBase };
+}
+
+// An approval binds only if the head, base and merge base were the same on both sides of it (`pair`), and GitHub's
 // timeline puts the approval on that base. The gate does not observe a PR while it sits on a base it does not
 // judge, so two agreeing observations can hide a trip away and back; the timeline sees it.
 // ponytail: sampling gap. If the base is rewritten and rewritten back between two observations
 // and an approval lands inside that gap, it can bind to the wrong merge base. A faster poll shrinks the gap.
-export function bindFromObservations(
-  around: { before: GateObservation | null; after: GateObservation | null },
-  reviewSha: string,
-  currentHead: string,
-  baseRefAtSubmit: string,
-): Binding | null {
-  const { before, after } = around;
-  if (!before || !after) return null;
-  if (before.headSha !== after.headSha || before.baseRef !== after.baseRef || before.mergeBase !== after.mergeBase) return null;
-  if (baseRefAtSubmit !== before.baseRef) return null;
+export function bindFromObservations(pair: Binding | null, reviewSha: string, currentHead: string, baseRefAtSubmit: string): Binding | null {
+  if (!pair || baseRefAtSubmit !== pair.baseRef) return null;
   // GitHub re-points a review to the new head on a same-diff push, so the current head is also fine.
-  if (reviewSha !== before.headSha && reviewSha !== currentHead) return null;
-  return { headSha: before.headSha, baseRef: before.baseRef, mergeBase: before.mergeBase };
+  if (reviewSha !== pair.headSha && reviewSha !== currentHead) return null;
+  return pair;
 }
 
 // With no observations, trust the timeline only for an approval given on a protected base of the current head.
@@ -75,9 +76,10 @@ export function queueChain(
   queueBranch: string,
 ): { passed: true } | { passed: false; blocker: number } {
   const top = members.find((m) => m.number === entry);
-  if (!top) return { passed: false, blocker: entry };
+  // A non-finite position (bad GitHub JSON) leaves its member out of the chain; never pass on that.
+  if (!top || members.some((m) => !Number.isFinite(m.position))) return { passed: false, blocker: entry };
   const chain = members.filter((m) => m.position <= top.position).sort((a, b) => a.position - b.position);
-  // A non-finite position (bad GitHub JSON) leaves the entry out of the chain; never pass on that.
+  // The entry must end its own chain.
   if (chain.at(-1) !== top) return { passed: false, blocker: entry };
   let expectedBase = queueBranch;
   for (const m of chain) {

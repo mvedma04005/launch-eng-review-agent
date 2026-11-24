@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { approvalOutcome, bindFromObservations, bindFromTimeline, decodeState, encodeState, queueChain, type Binding, type ChainMember } from './gate-binding.ts';
+import { agreeingPair, approvalOutcome, bindFromObservations, bindFromTimeline, decodeState, encodeState, queueChain, type Binding, type ChainMember } from './gate-binding.ts';
 import type { Logger } from './log.ts';
 import { gateVerdict, governedBy, type GateVerdict } from './policy/gate.ts';
 import { parsePolicy } from './policy/load.ts';
@@ -14,15 +14,15 @@ export type StackRef = { number: number; baseRef: string; position: number };
 
 /** The GitHub surface the merge gate needs; a fake implements this in tests. */
 export interface GatePort {
-  openPulls(repo: string): Promise<Array<{ number: number; headSha: string; headRef: string; baseRef: string; defaultBranch: string; updatedAt: string; author: string; stack: StackRef | null }>>;
+  openPulls(repo: string): Promise<Array<{ number: number; headSha: string; headRef: string; baseRef: string; defaultBranch: string; updatedAt: string; author: string; fromFork: boolean; stack: StackRef | null }>>;
   /** One PR's head, base and update time, read fresh. */
   pullState(repo: string, number: number): Promise<{ headSha: string; baseRef: string; baseSha: string; updatedAt: string; open: boolean }>;
   /** Every path the PR changes, or null when GitHub's list may be cut short. */
   changedPaths(repo: string, number: number): Promise<string[] | null>;
   /** Each reviewer's latest verdict on any commit, with its time. A person's comment keeps their verdict; the bot's comment replaces its own. */
   latestVerdicts(repo: string, number: number): Promise<Array<{ login: string; state: string; sha: string; submittedAt: string }>>;
-  /** The newest commit both `baseSha` and `headSha` descend from. */
-  mergeBase(repo: string, baseSha: string, headSha: string): Promise<string>;
+  /** The newest commit both `base` (a commit, or a branch at its tip now) and `headSha` descend from. */
+  mergeBase(repo: string, base: string, headSha: string): Promise<string>;
   /** The base branch the PR had at `atMs`. */
   baseRefAt(repo: string, number: number, atMs: number): Promise<string>;
   /** The PRs in this PR's stack, bottom first; empty when it is in none. */
@@ -98,20 +98,24 @@ function forStack({ title, summary }: { title: string; summary: string }, passed
 
 /**
  * Reads one PR, its files and its reviewers' verdicts, then the PR again. GitHub lists the files of "the PR now", so they
- * belong to the commit only if nothing about the PR moved in between. Tries twice; `steady` says whether it held. A
- * steady read also gets the merge base the PR's own change starts from.
+ * belong to the commit only if nothing about the PR moved in between. Tries twice; `steady` says whether it held. `at`
+ * is the time of the second read, when the PR was last seen as it is. A steady read also gets the merge base the PR's
+ * own change starts from.
  */
-async function readPull(github: GatePort, repo: string, number: number) {
+async function readPull(github: GatePort, repo: string, number: number, clock: () => number) {
   for (let attempt = 0; ; attempt++) {
     const before = await github.pullState(repo, number);
     const files = await github.changedPaths(repo, number);
     // Read inside the window: a review moves the update time, so a verdict given during the read makes it unsteady.
     const verdicts = await github.latestVerdicts(repo, number);
     const after = await github.pullState(repo, number);
+    // Taken now, not after the merge-base call: an observation must not claim a time the gate did not see the PR at.
+    const at = clock();
     // shortcut: two pushes inside one second of the update time go unseen; read the files with the compare API,
     // pinned to the commit, if that window ever matters.
     const steady = after.headSha === before.headSha && after.baseRef === before.baseRef && after.baseSha === before.baseSha && after.updatedAt === before.updatedAt;
-    if (steady || attempt === 1) return { ...after, files, verdicts, steady, mergeBase: steady ? await github.mergeBase(repo, after.baseSha, after.headSha) : '' };
+    // Against the base branch, not `baseSha`: GitHub can show an old base tip for a while after a push to the base.
+    if (steady || attempt === 1) return { ...after, files, verdicts, steady, at, mergeBase: steady ? await github.mergeBase(repo, after.baseRef, after.headSha) : '' };
   }
 }
 
@@ -155,6 +159,8 @@ async function countApprovals(deps: GateDeps, repo: string, pr: { number: number
     let base: string | undefined;
     const baseAt = async () => base ??= await remember(`gate-baseat:${repo}#${pr.number}:${v.submittedAt}`, () => deps.github.baseRefAt(repo, pr.number, at));
     let binding: Binding | null = null;
+    // What the gate saw on both sides of a person's approval, when the two sides agree.
+    let pair: Binding | null = null;
     try {
       if (falcon) {
         // The saved review speaks for this approval only when it is of the approved commit or of the head now.
@@ -163,11 +169,18 @@ async function countApprovals(deps: GateDeps, repo: string, pr: { number: number
           binding = { headSha, baseRef, mergeBase: await remember(`gate-mb:${repo}:${baseSha}:${headSha}`, () => deps.github.mergeBase(repo, baseSha, headSha)) };
         }
       } else if (timed) {
-        binding = bindFromObservations(deps.store.gateObservationsAround?.(repo, pr.number, at) ?? { before: null, after: null }, v.sha, read.headSha, await baseAt());
+        // Observations are only added at the current time, so once both sides exist the pair never changes. It is saved
+        // then, and outlives the 14-day prune. A missing side is not saved: a later observation can still arrive.
+        const pairKey = `gate-obs:${repo}#${pr.number}:${v.submittedAt}`;
+        const saved = deps.store.cursor(pairKey);
+        pair = saved !== null ? JSON.parse(saved) as Binding : agreeingPair(deps.store.gateObservationsAround?.(repo, pr.number, at) ?? { before: null, after: null });
+        if (saved === null && pair && !readOnly) deps.store.setCursor(pairKey, JSON.stringify(pair));
+        binding = bindFromObservations(pair, v.sha, read.headSha, await baseAt());
       }
       // Nothing better: an approval of this head, given on the default branch and still on it, binds to the change now.
-      // The default branch only moves forward, so the PR's own change can only have shrunk since.
-      if (!binding && timed && v.sha === read.headSha && read.baseRef === pr.defaultBranch) {
+      // The default branch only moves forward, so the PR's own change can only have shrunk since. Not when the gate saw
+      // the PR on another base on both sides of the approval: the timeline and the gate disagree, so it waits.
+      if (!binding && timed && v.sha === read.headSha && read.baseRef === pr.defaultBranch && (!pair || pair.baseRef === pr.defaultBranch)) {
         binding = bindFromTimeline(await baseAt(), v.sha, current, [pr.defaultBranch]);
       }
     } catch (error) {
@@ -219,12 +232,16 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   const extra = deps.branches ?? [];
   const stacks = deps.stacks ?? 'off';
   const judgedBase = (baseRef: string, defaultBranch: string) => baseRef === defaultBranch || extra.includes(baseRef);
-  // R1: GitHub holds the PR in a stack on the default branch. A PR on another PR's branch without one is never judged.
-  // GitHub's stack is the authority, so a fork PR is judged only if GitHub puts it in a stack.
-  const inStack = (p: { baseRef: string; defaultBranch: string; stack: StackRef | null }) => p.stack?.baseRef === p.defaultBranch && !judgedBase(p.baseRef, p.defaultBranch);
-  const stacked = (p: { baseRef: string; defaultBranch: string; stack: StackRef | null }) => stacks !== 'off' && inStack(p);
+  // R1: GitHub holds the PR in a stack on the default branch. A PR on another PR's branch without one is never judged,
+  // and neither is a PR from a fork, even in a stack.
+  type Listed = { baseRef: string; defaultBranch: string; fromFork: boolean; stack: StackRef | null };
+  const inStack = (p: Listed) => !p.fromFork && p.stack?.baseRef === p.defaultBranch && !judgedBase(p.baseRef, p.defaultBranch);
+  const stacked = (p: Listed) => stacks !== 'off' && inStack(p);
   const listed = await github.openPulls(repo);
   let posted = 0;
+  // PRs whose judgment or withdrawal failed in this pass. Their saved decision may be an old pass, so the queue chain
+  // does not trust it.
+  const broken = new Set<number>();
   // A required check must not keep a pass the gate no longer stands behind. With stacks off or in shadow, a stacked
   // PR the gate judged before gets a wait on its head when its saved decision is a pass, and again on every new head:
   // a push back to an older commit must not bring back the pass that commit got under `on`. The decision only:
@@ -241,6 +258,7 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
         posted++;
       } catch (error) {
         // The saved pass stays, so the next pass tries again.
+        broken.add(p.number);
         log.warn({ err: error, repo, number: p.number }, 'merge gate could not withdraw a stacked pass');
       }
     }
@@ -274,18 +292,27 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
   const cursorKey = `gate:${repo}`;
   const since = full ? '' : store.cursor(cursorKey) ?? '';
   // `>=`: a review can land in the same second as the newest PR already seen.
-  // A request in Chat does not move a PR's update time, so a PR never judged before is always judged.
-  const chosen = open.filter((p) => p.updatedAt >= since || store.cursor(`gate:${repo}#${p.number}`) === null);
+  // A request in Chat does not move a PR's update time, so a PR never judged before is always judged. Not a stacked PR
+  // in shadow: shadow saves no decision, so it would be read on every pass. A full pass judges it.
+  const saved = (p: { number: number }) => store.cursor(`gate:${repo}#${p.number}`);
+  const chosen = open.filter((p) => p.updatedAt >= since || (saved(p) === null && !(stacks === 'shadow' && stacked(p))));
   // R3: a push to a PR moves the base of the PR above it, but not that PR's update time, so the stacked PRs of a stack
-  // are judged together. The bottom PR has no parent in the stack: its own update time is enough.
-  const touched = new Set(chosen.flatMap((p) => (stacks !== 'off' && p.stack ? [p.stack.number] : [])));
+  // are judged together. The bottom PR has no parent in the stack: its own update time is enough. Only a PR that really
+  // changed moves its stack: a newer update time, or a head its saved decision is not for. A PR chosen only by `>=` or
+  // for a missing decision does not, or every pass would read the whole stack. A failed pass leaves `since` where it
+  // was, so the stack of a changed PR is judged again on the next pass.
+  const changed = (p: { number: number; headSha: string; updatedAt: string }) => {
+    const head = decodeState(saved(p))?.headSha;
+    return p.updatedAt > since || (head !== undefined && head !== p.headSha);
+  };
+  const touched = new Set(chosen.filter(changed).flatMap((p) => (stacks !== 'off' && p.stack ? [p.stack.number] : [])));
   const pulls = open.filter((p) => chosen.includes(p) || (p.stack !== null && stacked(p) && touched.has(p.stack.number)));
 
   let failed = false;
   let newest = since;
   for (const p of pulls) {
     try {
-      const read = await readPull(github, repo, p.number);
+      const read = await readPull(github, repo, p.number, clock);
       const asStack = stacked(p);
       // Closed or retargeted since it was listed. A PR listed in a stack is judged on whatever base it has now.
       if (!read.open || (!judgedBase(read.baseRef, branch) && !asStack)) continue;
@@ -293,7 +320,7 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
       const shadow = asStack && stacks === 'shadow';
       const readOnly = deps.dryRun || shadow;
       // Recorded before the approvals are counted, so an approval given just now has an observation after it.
-      if (read.steady && !readOnly) store.observeGate?.({ repo, number: p.number, atMs: clock(), headSha: read.headSha, baseRef: read.baseRef, baseSha: read.baseSha, mergeBase: read.mergeBase });
+      if (read.steady && !readOnly) store.observeGate?.({ repo, number: p.number, atMs: read.at, headSha: read.headSha, baseRef: read.baseRef, baseSha: read.baseSha, mergeBase: read.mergeBase });
       // A PR that will not hold still gets a wait, never a skip: an old pass must not survive because the PR keeps moving.
       let result: GateVerdict = { verdict: 'wait', uncovered: [] };
       let counted: Counted = { direct: [], carried: [], stale: [], unbound: [], others: [] };
@@ -323,18 +350,20 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
       if (p.updatedAt > newest) newest = p.updatedAt;
     } catch (error) {
       failed = true;
+      broken.add(p.number);
       log.warn({ err: error, repo, number: p.number }, 'merge gate failed for one PR');
     }
   }
-  // Queue commits. GitHub tests a queued PR on a commit of its own, and that commit needs the check too. It
-  // carries the decision on the PR's own commit: GitHub only queues a PR whose own commit passed, and a push
-  // to the PR takes it out of the queue.
+  // Queue commits. GitHub tests a queued PR on a commit of its own, and that commit needs the check too. For a PR alone
+  // it carries the decision on the PR's own commit: GitHub only queues a PR whose own commit passed, and a push to the
+  // PR takes it out of the queue. GitHub queues a stack as one group and may name it after any member, so the commit
+  // of a stacked PR may carry the whole open stack, and every open PR of the stack must pass.
   // Only the default branch and the extra branches: a stacked PR is queued on the stack's base, never on its own.
   for (const base of new Set(open.filter((p) => judgedBase(p.baseRef, p.defaultBranch)).map((p) => p.baseRef))) {
     try {
       for (const entry of await github.queueEntries(repo, base)) {
-        // R4: the commit carries the whole chain below the entry, so it passes only when every open member passes now.
-        // An entry whose PR is not listed, or whose chain cannot be read, waits: this check is required.
+        // R4: the commit passes only when every open member of the stack passes now. An entry whose PR is not listed,
+        // is not an open member of its stack, or whose stack cannot be read, waits: this check is required.
         const row = open.find((p) => p.number === entry.number);
         let chain: ReturnType<typeof queueChain> = { passed: false, blocker: entry.number };
         if (row) {
@@ -342,8 +371,12 @@ export async function sweepGate(deps: GateDeps, repo: string, now = Date.now()):
             const members: ChainMember[] = row.stack
               ? (await github.stackMembers(repo, entry.number)).filter((m) => m.open).map(({ number, position, baseRef, headRef, headSha }) => ({ number, position, baseRef, headRef, headSha }))
               : [{ number: row.number, position: 1, baseRef: row.baseRef, headRef: row.headRef, headSha: row.headSha }];
-            const states = new Map(members.map((m) => [m.number, decodeState(store.cursor(`gate:${repo}#${m.number}`))] as const));
-            chain = queueChain(entry.number, members, states, base);
+            const states = new Map(members.map((m) => [m.number, broken.has(m.number) ? null : decodeState(store.cursor(`gate:${repo}#${m.number}`))] as const));
+            // The chain runs to the top open member: the highest position, whatever order GitHub lists them in.
+            if (members.some((m) => m.number === entry.number)) {
+              const top = row.stack ? members.reduce((a, b) => (b.position > a.position ? b : a)).number : entry.number;
+              chain = queueChain(top, members, states, base);
+            }
           } catch (error) {
             // Fail closed: the commit gets a wait, so a pass posted earlier on it does not stay.
             log.warn({ err: error, repo, number: entry.number }, 'merge gate could not read the stack for a queue commit; it waits');

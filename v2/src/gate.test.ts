@@ -19,7 +19,7 @@ const approved = (login: string, sha: string, submittedAt = APPROVED_AT) => ({ l
 const couldNotTell = (login: string) => ` ${login} approved, but Falcon could not tell which change that approval was for, so it does not count here. Approve this commit again.`;
 
 type Verdict = { login: string; state: string; sha: string; submittedAt: string };
-interface Pull { number: number; headSha: string; baseRef: string; updatedAt: string; author: string; files: string[] | null; approvers: string[]; older?: Array<{ login: string; sha: string }>; open?: boolean; verdicts?: Verdict[]; baseSha?: string; mergeBase?: string; baseAt?: string; stack?: StackRef | null }
+interface Pull { number: number; headSha: string; baseRef: string; updatedAt: string; author: string; files: string[] | null; approvers: string[]; older?: Array<{ login: string; sha: string }>; open?: boolean; verdicts?: Verdict[]; baseSha?: string; mergeBase?: string; baseAt?: string; stack?: StackRef | null; fromFork?: boolean }
 const pull = (number: number, over: Partial<Pull> = {}): Pull => ({ number, headSha: `sha${number}`, baseRef: 'main', updatedAt: `2026-11-10T10:00:0${number}Z`, author: 'sam', files: ['Orbit/a.py'], approvers: [], ...over });
 
 function fixture(pulls: Pull[], over: Partial<GateDeps> = {}, files: Record<string, string> = { '.github/CODEOWNERS': CODEOWNERS, '.falcon/policy.yaml': PACK }) {
@@ -34,7 +34,7 @@ function fixture(pulls: Pull[], over: Partial<GateDeps> = {}, files: Record<stri
   const db = new Store(':memory:');
   const clock = { at: T0 };
   const github: GatePort = {
-    openPulls: async () => pulls.map((p) => ({ stack: null, ...p, headRef: `br${p.number}`, defaultBranch: 'main' })),
+    openPulls: async () => pulls.map((p) => ({ stack: null, fromFork: false, ...p, headRef: `br${p.number}`, defaultBranch: 'main' })),
     pullState: async (_repo, number) => ({ ...find(number), baseSha: tip(find(number)), open: find(number).open ?? true }),
     changedPaths: async (_repo, number) => {
       const p = find(number);
@@ -46,7 +46,11 @@ function fixture(pulls: Pull[], over: Partial<GateDeps> = {}, files: Record<stri
       const p = find(number);
       return p.verdicts ?? [...p.approvers.map((login) => ({ login, sha: p.headSha })), ...(p.older ?? [])].map(({ login, sha }) => ({ login, state: 'APPROVED', sha, submittedAt: p.updatedAt }));
     },
-    mergeBase: async (_repo, baseSha, headSha) => pulls.find((p) => p.headSha === headSha && tip(p) === baseSha)?.mergeBase ?? `mb-${baseSha}`,
+    // The gate asks with the base branch for the change now, and with a saved base tip for Falcon's review.
+    mergeBase: async (_repo, base, headSha) => {
+      const p = pulls.find((x) => x.headSha === headSha && (x.baseRef === base || tip(x) === base));
+      return p?.mergeBase ?? `mb-${p ? tip(p) : base}`;
+    },
     // The base GitHub's timeline gives at an approval: `baseAt`, else the base now.
     baseRefAt: async (_repo, number) => find(number).baseAt ?? find(number).baseRef,
     stackMembers: async () => [],
@@ -530,6 +534,43 @@ test('a full recheck deletes observations older than 14 days', async () => {
   assert.equal(f.db.gateObservationsAround(REPO, 1, T0 - 14 * day).after?.atMs, T0 - 13 * day);
 });
 
+test('an approval the gate saw given on another base does not count on main, even when the timeline says main', async () => {
+  // On main now, and GitHub's timeline says main at the approval, but the gate saw feat-a on both sides of it.
+  const f = fixture([pull(1, { verdicts: [approved('lee', 'sha1')] })]);
+  f.around('sha1', 'feat-a', 'mb-feat');
+  await sweepGate(f.deps, REPO, T0);
+  assert.deepEqual(f.posts.at(-1), { sha: 'sha1', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' });
+  assert.ok(f.summaries.at(-1)!.includes(couldNotTell('lee')), f.summaries.at(-1));
+});
+
+test('an observation is stamped when the PR was read, not when the merge base came back', async () => {
+  const f = fixture([pull(1)]);
+  const { mergeBase } = f.deps.github;
+  f.deps.github.mergeBase = async (repo, base, headSha) => { f.clock.at = T0 + 5 * MINUTE; return mergeBase(repo, base, headSha); };
+  await sweepGate(f.deps, REPO, T0);
+  assert.equal(f.db.gateObservationsAround(REPO, 1, T0 + MINUTE).before?.atMs, T0);
+});
+
+test('an approval whose observations were pruned still binds from the pair saved when both sides existed', async () => {
+  const f = fixture([pull(2, { baseRef: 'feat-a', stack: inStack(2), verdicts: [approved('lee', 'sha2')] })], { stacks: 'on' });
+  f.around('sha2', 'feat-a', 'mb-tip-feat-a', 2);
+  await sweepGate(f.deps, REPO, T0);
+  assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['sha2', true]]);
+  assert.equal(f.cursors.get(`gate-obs:${REPO}#2:${APPROVED_AT}`), JSON.stringify({ headSha: 'sha2', baseRef: 'feat-a', mergeBase: 'mb-tip-feat-a' }));
+  // 15 days on: the full recheck deletes every observation around the approval, then judges the PR again.
+  const later = T0 + 15 * 24 * 60 * MINUTE;
+  f.clock.at = later;
+  await sweepGate(f.deps, REPO, later);
+  assert.equal(f.db.gateObservationsAround(REPO, 2, Date.parse(APPROVED_AT)).before, null, 'pruned');
+  assert.equal(f.posts.length, 1, 'nothing new to post');
+  assert.equal(decodeState(f.cursors.get(`gate:${REPO}#2`) ?? null)?.verdict, 'pass');
+  // Seen only before the approval so far: nothing is saved, since a later observation can still arrive.
+  const g = fixture([pull(2, { baseRef: 'feat-a', stack: inStack(2), verdicts: [approved('lee', 'sha2')] })], { stacks: 'on' });
+  g.clock.at = Date.parse('2026-11-10T10:00:00Z');
+  await sweepGate(g.deps, REPO, T0);
+  assert.equal(g.cursors.has(`gate-obs:${REPO}#2:${APPROVED_AT}`), false);
+});
+
 test("a queue commit waits when its PR's pass is for another branch", async () => {
   const f = fixture([pull(1, { baseRef: 'release', verdicts: [approved('lee', 'sha1')] }), pull(2)], { branches: ['release'] });
   f.around('sha1', 'release');
@@ -775,7 +816,7 @@ test('a shadow pass does not judge the bottom PR of a stack when nothing changed
   const f = fixture([pull(1, { stack: inStack(1) }), pull(2, { baseRef: 'br1', stack: inStack(2) })], { stacks: 'shadow' });
   await sweepGate(f.deps, REPO, T0);
   f.clock.at = T0 + MINUTE;
-  await sweepGate(f.deps, REPO, T0 + MINUTE); // PR 2 is judged again: shadow saves no decision for it.
+  await sweepGate(f.deps, REPO, T0 + MINUTE); // PR 2, the newest, is read again by `>=`; it did not change.
   assert.equal(f.db.gateObservationsAround(REPO, 1, T0 + MINUTE).before?.atMs, T0, 'PR 1 was not judged, so nothing was observed');
 });
 
@@ -800,6 +841,42 @@ test('a stacked PR into a listed extra branch is judged as before under shadow, 
   assert.equal(decodeState(f.cursors.get(`gate:${REPO}#2`) ?? null)?.verdict, 'pass');
 });
 
+test('the merge base of the change now is read against the base branch, not a base tip GitHub has not moved yet', async () => {
+  const f = fixture([pull(2, { baseRef: 'feat-a', stack: inStack(2), verdicts: [approved('lee', 'sha2')] })], { stacks: 'on', sameChange: async () => false });
+  // lee approved on merge base m1. Then feat-a was force-pushed: its tip now gives m2, but the PR still shows the old tip.
+  f.around('sha2', 'feat-a', 'm1', 2);
+  f.deps.github.mergeBase = async (_repo, base) => (base === 'feat-a' ? 'm2' : 'm1');
+  await sweepGate(f.deps, REPO, T0);
+  assert.deepEqual(f.posts.at(-1), { sha: 'sha2', passed: false, title: 'Waiting for Launch Engineering or Falcon to approve' });
+  assert.equal(decodeState(f.cursors.get(`gate:${REPO}#2`) ?? null)?.mergeBase, 'm2');
+});
+
+test('a pass with nothing changed reads no stacked PR, under on and under shadow; a push in the same second still does', async () => {
+  for (const stacks of ['on', 'shadow'] as const) {
+    // PR 1, at the bottom, is the newest, so `>=` reads it on every pass.
+    const bottom = pull(1, { stack: inStack(1), updatedAt: '2026-11-10T10:06:00Z' });
+    const f = fixture([bottom, pull(2, { baseRef: 'br1', stack: inStack(2) }), pull(3, { baseRef: 'br2', stack: inStack(3) })], { stacks });
+    const reads: number[] = [];
+    const { pullState } = f.deps.github;
+    f.deps.github.pullState = async (repo, number) => { reads.push(number); return pullState(repo, number); };
+    await sweepGate(f.deps, REPO, T0);
+    reads.length = 0;
+    await sweepGate(f.deps, REPO, T0 + MINUTE);
+    assert.deepEqual([...new Set(reads)], [1], stacks);
+    // A push to PR 1 in the second the gate last saw: the update time does not move, the head does.
+    bottom.headSha = 'sha1b';
+    reads.length = 0;
+    await sweepGate(f.deps, REPO, T0 + 2 * MINUTE);
+    assert.deepEqual([...new Set(reads)], [1, 2, 3], `${stacks}: the PRs above are judged again`);
+  }
+});
+
+test('a fork PR in a stack is never judged as stacked', async () => {
+  const f = fixture([pull(1, { stack: inStack(1) }), pull(2, { baseRef: 'br1', stack: inStack(2), fromFork: true, approvers: ['lee'] })], { stacks: 'on' });
+  await sweepGate(f.deps, REPO, T0);
+  assert.deepEqual(f.posts.map((x) => x.sha), ['sha1']);
+});
+
 // Queue commits for a stack: PR 1 into main, PR 2 on br1, PR 3 on br2. One real sweep sets every cursor of the pass;
 // then the decisions are overwritten by hand, and the later sweeps are incremental, so they leave them alone.
 const settle = async (f: ReturnType<typeof fixture>, pulls: Pull[], states: Record<number, Partial<Parameters<typeof encodeState>[0]>> = {}) => {
@@ -814,8 +891,8 @@ const settle = async (f: ReturnType<typeof fixture>, pulls: Pull[], states: Reco
   }
 };
 
-async function queueStack(over: { states?: Record<number, Partial<Parameters<typeof encodeState>[0]>>; closed?: number[]; throws?: boolean } = {}) {
-  const pulls = [1, 2, 3].map((n) => pull(n, { baseRef: n === 1 ? 'main' : `br${n - 1}`, stack: inStack(n) }));
+async function queueStack(over: { states?: Record<number, Partial<Parameters<typeof encodeState>[0]>>; closed?: number[]; throws?: boolean; bottom?: Partial<Pull> } = {}) {
+  const pulls = [1, 2, 3].map((n) => pull(n, { baseRef: n === 1 ? 'main' : `br${n - 1}`, stack: inStack(n), ...(n === 1 ? over.bottom : {}) }));
   const f = fixture(pulls, { stacks: 'on' });
   f.deps.github.stackMembers = async () => {
     if (over.throws) throw new Error('GitHub is down');
@@ -882,6 +959,74 @@ test('a queue commit waits, and a pass it had stops, when the stack cannot be re
   assert.equal(f.summaries[0], "Merge queue commit for #1. It carries the decision on the pull request's own commit.");
   assert.equal(f.cursors.get(`gateq:${REPO}:q1`), 'false');
   assert.equal(asked, 1, 'a PR with no stack never asks for one');
+});
+
+// The members of a stack as GitHub lists them, bottom first, read live from the PRs.
+const membersOf = (pulls: Pull[], closed: number[] = []) => async () => pulls.map((p, i) => ({ number: p.number, position: i + 1, open: !closed.includes(p.number), baseRef: p.baseRef, headRef: `br${p.number}`, headSha: p.headSha }));
+
+test('a queue commit named after the bottom of a stack waits while a PR above it has no current pass', async () => {
+  const top = pull(2, { baseRef: 'br1', stack: inStack(2), verdicts: [approved('lee', 'sha2')] });
+  const pulls = [pull(1, { stack: inStack(1), approvers: [FALCON] }), top];
+  const f = fixture(pulls, { stacks: 'on' });
+  f.deps.github.stackMembers = membersOf(pulls);
+  f.around('sha2', 'br1', 'mb-tip-br1', 2);
+  // GitHub may name the merge group of the whole stack after its bottom PR.
+  f.queue.push({ number: 1, headSha: 'q1', branch: 'main' });
+  await sweepGate(f.deps, REPO, T0);
+  assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['sha1', true], ['sha2', true], ['q1', true]]);
+  // lee asks for changes on PR 2. A review moves the PR's update time.
+  Object.assign(top, { updatedAt: '2026-11-10T10:30:00Z', verdicts: [{ login: 'lee', state: 'CHANGES_REQUESTED', sha: 'sha2', submittedAt: '2026-11-10T10:30:00Z' }] });
+  await sweepGate(f.deps, REPO, T0 + MINUTE);
+  assert.deepEqual(f.posts.slice(3).map((x) => [x.sha, x.passed]), [['sha2', false], ['q1', false]]);
+  assert.equal(f.summaries.at(-1), 'Merge queue commit for #1. A PR below it in the stack has no current pass: #2.');
+});
+
+test('a queue commit waits when its PR is not an open member of the stack GitHub lists', async () => {
+  // GitHub lists PR 1 as merged and PR 2, retargeted to main, as the only open member. PR 2 has a pass on main.
+  const pulls = [pull(1, { stack: inStack(1) }), pull(2, { baseRef: 'main', stack: inStack(2) })];
+  const f = fixture(pulls, { stacks: 'on' });
+  f.deps.github.stackMembers = membersOf(pulls, [1]);
+  await settle(f, pulls);
+  f.queue.push({ number: 1, headSha: 'q1', branch: 'main' });
+  await sweepGate(f.deps, REPO, T0 + MINUTE);
+  assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['q1', false]]);
+});
+
+test('off or shadow: a queue commit for the top of a stack waits, even with passes saved under on', async () => {
+  for (const stacks of ['off', 'shadow'] as const) {
+    const f = await queueStack({ bottom: { approvers: [FALCON] } });
+    await sweepGate({ ...f.deps, stacks }, REPO, T0 + MINUTE);
+    assert.deepEqual(f.posts.filter((x) => x.sha === 'q3').map((x) => x.passed), [false], stacks);
+    assert.deepEqual(f.posts.filter((x) => x.sha === 'sha1').map((x) => x.passed), [true], `${stacks}: the bottom PR itself passes`);
+  }
+});
+
+test('a queue commit waits when a PR of its stack fails to be judged again after its parent moved', async () => {
+  const bottom = pull(1, { stack: inStack(1), approvers: [FALCON] });
+  const top = pull(2, { baseRef: 'br1', stack: inStack(2) });
+  const pulls = [bottom, top];
+  const f = fixture(pulls, { stacks: 'on' });
+  f.deps.github.stackMembers = membersOf(pulls);
+  await settle(f, pulls);
+  f.queue.push({ number: 2, headSha: 'q2', branch: 'main' });
+  // A force-push to PR 1 moves the base of PR 2, and the read of PR 2 fails in the same pass. PR 2's saved pass is
+  // for its head and base, but not for the base tip now.
+  Object.assign(bottom, { headSha: 'sha1b', updatedAt: '2026-11-10T11:30:00Z' });
+  top.files = ['boom'];
+  await sweepGate(f.deps, REPO, T0 + MINUTE);
+  assert.deepEqual(f.posts.map((x) => [x.sha, x.passed]), [['sha1b', true], ['q2', false]]);
+});
+
+test('shadow: a stacked pass that could not be withdrawn does not let its queue commit pass', async () => {
+  const f = await queueStack({ bottom: { approvers: [FALCON] } });
+  const { postGate } = f.deps.github;
+  f.deps.github.postGate = async (repo, sha, passed, title, summary) => {
+    if (title === WITHDRAWN.title) throw new Error('GitHub is down');
+    return postGate(repo, sha, passed, title, summary);
+  };
+  await sweepGate({ ...f.deps, stacks: 'shadow' }, REPO, T0 + MINUTE);
+  assert.equal(decodeState(f.cursors.get(`gate:${REPO}#2`) ?? null)?.verdict, 'pass', 'the old pass is still saved');
+  assert.deepEqual(f.posts.filter((x) => x.sha === 'q3').map((x) => x.passed), [false]);
 });
 
 test('a dry run posts no queue commit and saves no queue cursor', async () => {

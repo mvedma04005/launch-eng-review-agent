@@ -140,13 +140,15 @@ export class OctokitGitHub implements GitHubPort {
     }
   }
 
-  /** Every open PR, with its head branch and its place in a stack. */
+  /** Every open PR, with its head branch, its place in a stack, and whether it comes from a fork. */
   async openPulls(repo: string) {
     const rows = await this.octokit.paginate(this.octokit.pulls.list, { ...split(repo), state: 'open', per_page: 100 });
     return rows.map((p) => {
       // Octokit's types do not declare `stack`, so it is read through a narrow cast.
       const s = (p as { stack?: { base: { ref: string }; number: number; position: number } | null }).stack;
-      return { number: p.number, headSha: p.head.sha, headRef: p.head.ref, baseRef: p.base.ref, defaultBranch: p.base.repo.default_branch, updatedAt: p.updated_at, author: p.user?.login ?? '', stack: s ? { number: s.number, baseRef: s.base.ref, position: s.position } : null };
+      // A deleted head repository (null) counts as a fork: nothing shows it is this repository.
+      const fromFork = p.head.repo?.full_name !== p.base.repo.full_name;
+      return { number: p.number, headSha: p.head.sha, headRef: p.head.ref, baseRef: p.base.ref, defaultBranch: p.base.repo.default_branch, updatedAt: p.updated_at, author: p.user?.login ?? '', fromFork, stack: s ? { number: s.number, baseRef: s.base.ref, position: s.position } : null };
     });
   }
 
@@ -167,9 +169,10 @@ export class OctokitGitHub implements GitHubPort {
     return [...latest.values()];
   }
 
-  /** The newest commit both `baseSha` and `headSha` descend from. */
-  async mergeBase(repo: string, baseSha: string, headSha: string): Promise<string> {
-    const { data } = await this.octokit.repos.compareCommitsWithBasehead({ ...split(repo), basehead: `${baseSha}...${headSha}`, per_page: 1 });
+  /** The newest commit both `base` (a commit, or a branch at its tip now) and `headSha` descend from. */
+  async mergeBase(repo: string, base: string, headSha: string): Promise<string> {
+    // Octokit encodes the whole `basehead`, so a branch name with a slash is passed as it is.
+    const { data } = await this.octokit.repos.compareCommitsWithBasehead({ ...split(repo), basehead: `${base}...${headSha}`, per_page: 1 });
     return data.merge_base_commit.sha;
   }
 

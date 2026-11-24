@@ -92,6 +92,9 @@ test('mergeBase: reads the compare API\'s merge base', async () => {
   const octokit = { repos: { compareCommitsWithBasehead: async (a: Record<string, unknown>) => { seen.push(a); return { data: { merge_base_commit: { sha: 'm'.repeat(40) } } }; } } } as unknown as Octokit;
   assert.equal(await new OctokitGitHub(octokit, null).mergeBase('acme/demo', base, HEAD), 'm'.repeat(40));
   assert.equal(seen[0]!['basehead'], `${base}...${HEAD}`);
+  // The gate passes the base branch, so the merge base is against its tip now. Octokit encodes the slash.
+  await new OctokitGitHub(octokit, null).mergeBase('acme/demo', 'feat/a', HEAD);
+  assert.equal(seen[1]!['basehead'], `feat/a...${HEAD}`);
 });
 
 test('baseRefAt: the base in force at a time', async () => {
@@ -135,9 +138,14 @@ test('stackMembers: maps the stack entries and marks the open ones', async () =>
   assert.deepEqual(await new OctokitGitHub({ graphql: reply(null) } as unknown as Octokit, null).stackMembers('acme/demo', 6), []);
 });
 
-test('openPulls: carries the stack and the head branch', async () => {
-  const pr = (number: number, stack?: unknown) => ({ number, head: { sha: `s${number}`, ref: `feat-${number}` }, base: { ref: 'main', repo: { default_branch: 'main' } }, updated_at: 't', user: { login: 'sam' }, ...(stack ? { stack } : {}) });
-  const octokit = { paginate: async () => [pr(7, { base: { ref: 'main', sha: 's' }, number: 7, position: 2 }), pr(8)], pulls: { list: {} } } as unknown as Octokit;
+test('openPulls: carries the stack, the head branch and whether the PR comes from a fork', async () => {
+  const pr = (number: number, stack?: unknown, headRepo: { full_name: string } | null = { full_name: 'acme/demo' }) => ({ number, head: { sha: `s${number}`, ref: `feat-${number}`, repo: headRepo }, base: { ref: 'main', repo: { default_branch: 'main', full_name: 'acme/demo' } }, updated_at: 't', user: { login: 'sam' }, ...(stack ? { stack } : {}) });
+  const octokit = { paginate: async () => [pr(7, { base: { ref: 'main', sha: 's' }, number: 7, position: 2 }), pr(8), pr(9, undefined, { full_name: 'lee/demo' }), pr(10, undefined, null)], pulls: { list: {} } } as unknown as Octokit;
   const rows = await new OctokitGitHub(octokit, null).openPulls('acme/demo');
-  assert.deepEqual(rows.map((r) => [r.headRef, r.stack]), [['feat-7', { number: 7, baseRef: 'main', position: 2 }], ['feat-8', null]]);
+  assert.deepEqual(rows.map((r) => [r.headRef, r.stack, r.fromFork]), [
+    ['feat-7', { number: 7, baseRef: 'main', position: 2 }, false],
+    ['feat-8', null, false],
+    ['feat-9', null, true],
+    ['feat-10', null, true],
+  ], 'a head repository that is gone counts as a fork');
 });
